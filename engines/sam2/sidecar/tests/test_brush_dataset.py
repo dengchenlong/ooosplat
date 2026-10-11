@@ -6,13 +6,9 @@ land as Brush-compatible PNGs (grayscale, white=keep, one per frame, named
 after the frame id) plus a resumable state.json.
 """
 
-import struct
 import subprocess
 import sys
-import zlib
 from pathlib import Path
-
-import pytest
 
 from conftest import make_png
 
@@ -43,6 +39,7 @@ class TestBrushDatasetLayout:
             encoding="utf-8",
         )
         try:
+
             def send(msg):
                 proc.stdin.write(_json(msg) + "\n")
                 proc.stdin.flush()

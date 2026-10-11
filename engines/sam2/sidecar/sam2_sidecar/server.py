@@ -18,6 +18,12 @@ from pathlib import Path
 
 from . import (
     PROTOCOL_VERSION,
+    REQ_ADD_PROMPT,
+    REQ_HELLO,
+    REQ_INIT_SESSION,
+    REQ_PING,
+    REQ_PROPAGATE,
+    REQ_SHUTDOWN,
     RES_BYE,
     RES_ERROR,
     RES_HELLO,
@@ -26,12 +32,6 @@ from . import (
     RES_PROMPT_ACCEPTED,
     RES_PROPAGATE_DONE,
     RES_SESSION_READY,
-    REQ_ADD_PROMPT,
-    REQ_HELLO,
-    REQ_INIT_SESSION,
-    REQ_PING,
-    REQ_PROPAGATE,
-    REQ_SHUTDOWN,
 )
 from .backends import BackendError
 from .mask_io import coverage_of_rows, write_mask_png
@@ -140,14 +140,11 @@ class SidecarServer:
             seen.add(frame_id)
             prepared.append(dict(entry))
         session = {"frames": prepared, "prompts": {}}
-        try:
-            for frame in prepared:
-                width, height = self.backend.frame_size(frame)
-                frame["width"] = width
-                frame["height"] = height
-            self.backend.on_init_session(session)
-        except BackendError:
-            raise
+        for frame in prepared:
+            width, height = self.backend.frame_size(frame)
+            frame["width"] = width
+            frame["height"] = height
+        self.backend.on_init_session(session)
         self.sessions[session_id] = session
         return {
             "type": RES_SESSION_READY,
@@ -171,9 +168,7 @@ class SidecarServer:
             if not isinstance(points, list) or not points:
                 raise RequestError("invalid_request", "points must be a non-empty list")
             if not isinstance(labels, list) or len(labels) != len(points):
-                raise RequestError(
-                    "invalid_request", "pointLabels must match points in length"
-                )
+                raise RequestError("invalid_request", "pointLabels must match points in length")
             for label in labels:
                 if label not in (0, 1):
                     raise RequestError("invalid_request", "point labels must be 0 or 1")
@@ -305,9 +300,7 @@ def _state_path(masks_dir: Path) -> Path:
     return masks_dir / "state.json"
 
 
-def _load_state(
-    masks_dir: Path, session_id: str, object_id: str, frames_hash: str
-) -> dict:
+def _load_state(masks_dir: Path, session_id: str, object_id: str, frames_hash: str) -> dict:
     """Load a compatible checkpoint, or an empty one when absent/mismatched."""
     path = _state_path(masks_dir)
     if path.is_file():

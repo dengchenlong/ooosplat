@@ -2,7 +2,6 @@
 
 import struct
 import zlib
-
 from pathlib import Path
 
 
@@ -10,9 +9,7 @@ def make_png(path, width=8, height=8, fill=(255, 0, 0)):
     """Write a minimal 8-bit RGB PNG at `path` filled with `fill`."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = b"".join(
-        b"\x00" + bytes(fill) * width for _ in range(height)
-    )
+    raw = b"".join(b"\x00" + bytes(fill) * width for _ in range(height))
 
     def chunk(tag, data):
         payload = tag + data

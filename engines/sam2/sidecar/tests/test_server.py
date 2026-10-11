@@ -5,12 +5,11 @@ import json
 import os
 
 import pytest
+from conftest import make_png
 
 from sam2_sidecar.backends import SyntheticBackend
-from sam2_sidecar.server import SidecarServer
 from sam2_sidecar.protocol import decode_message, encode_message
-
-from conftest import make_png
+from sam2_sidecar.server import SidecarServer
 
 
 class Harness:
@@ -60,10 +59,7 @@ def frame_dir(tmp_path):
 
 
 def frames_payload(frame_dir, count=4):
-    return [
-        {"frameId": f"{i:04d}", "path": str(frame_dir / f"{i:04d}.png")}
-        for i in range(count)
-    ]
+    return [{"frameId": f"{i:04d}", "path": str(frame_dir / f"{i:04d}.png")} for i in range(count)]
 
 
 def init_session(h, frame_dir, session_id="s1"):
@@ -376,7 +372,7 @@ class TestPropagate:
             {"type": "propagate", "sessionId": "s1", "objectId": "obj1", "masksDir": str(masks_dir)}
         )
         masks = [r for r in resp if r["type"] == "mask"]
-        done = [r for r in resp if r["type"] == "propagate_done"][0]
+        done = next(r for r in resp if r["type"] == "propagate_done")
         assert [m["frameId"] for m in masks] == ["0002", "0003"]
         assert done["completed"] == 2
         assert done["skipped"] == 2
@@ -421,7 +417,7 @@ class TestPropagate:
         resp = h.request(
             {"type": "propagate", "sessionId": "s1", "objectId": "obj1", "masksDir": str(masks_dir)}
         )
-        done = [r for r in resp if r["type"] == "propagate_done"][0]
+        done = next(r for r in resp if r["type"] == "propagate_done")
         assert done["completed"] == 2
         assert done["skipped"] == 0
 

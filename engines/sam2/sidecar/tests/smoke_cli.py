@@ -74,8 +74,7 @@ def main() -> int:
             "type": "init_session",
             "sessionId": "smoke",
             "frames": [
-                {"frameId": f"{i:04d}", "path": str(frames / f"{i:04d}.png")}
-                for i in range(3)
+                {"frameId": f"{i:04d}", "path": str(frames / f"{i:04d}.png")} for i in range(3)
             ],
         }
     )

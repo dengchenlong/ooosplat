@@ -1,0 +1,43 @@
+name: SAM2 Sidecar
+
+on:
+  push:
+    paths:
+      - 'engines/sam2/sidecar/**'
+      - '.github/workflows/sam2-sidecar.yml'
+  pull_request:
+    paths:
+      - 'engines/sam2/sidecar/**'
+      - '.github/workflows/sam2-sidecar.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: engines/sam2/sidecar
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: Sync dependencies (including dev group)
+        run: uv sync --dev
+
+      - name: Lint (ruff check + format check)
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Run tests
+        run: uv run pytest -q

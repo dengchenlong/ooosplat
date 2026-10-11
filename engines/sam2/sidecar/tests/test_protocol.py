@@ -56,7 +56,7 @@ class TestDecode:
 
     def test_rejects_json_arrays(self):
         with pytest.raises(ProtocolError):
-            decode_message('[1, 2, 3]\n')
+            decode_message("[1, 2, 3]\n")
 
     def test_rejects_missing_type(self):
         with pytest.raises(ProtocolError):

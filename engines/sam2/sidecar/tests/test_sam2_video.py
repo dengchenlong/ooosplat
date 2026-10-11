@@ -70,9 +70,7 @@ def _state():
 def test_logits_thresholded_at_zero_not_bool():
     """Negative-logit background must stay False; only logits > 0 are mask."""
     state = _state()
-    mask = sam2_video.segment_frame(
-        _FakePredictor(), state, {"objectId": "obj"}, 0
-    )
+    mask = sam2_video.segment_frame(_FakePredictor(), state, {"objectId": "obj"}, 0)
     assert mask.dtype == np.bool_
     assert mask.shape == (8, 8)
     assert int(mask.sum()) == 9, "expected exactly the 3x3 positive-logit square"

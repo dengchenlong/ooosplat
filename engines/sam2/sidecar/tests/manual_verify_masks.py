@@ -1,6 +1,8 @@
 """Verify real-SAM2 smoke masks track the drifting red square (CPU run)."""
+
 import sys
 from pathlib import Path
+
 from PIL import Image
 
 masks_dir = Path(sys.argv[1])

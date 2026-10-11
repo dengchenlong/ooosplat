@@ -48,14 +48,12 @@ def init_video_state(predictor, session: dict) -> dict:
         if not dst.is_file():
             _png_to_jpeg(Path(frame["path"]), dst)
 
-    state = predictor.init_state(
-        video_path=str(frames_dir), offload_video_to_cpu=True
-    )
+    state = predictor.init_state(video_path=str(frames_dir), offload_video_to_cpu=True)
     return {
         "inference_state": state,
         "staged_dir": str(frames_dir),
-        "prompts": {},       # objectId -> prompt dict
-        "propagated": {},    # objectId -> {frame_index: bool ndarray}
+        "prompts": {},  # objectId -> prompt dict
+        "propagated": {},  # objectId -> {frame_index: bool ndarray}
         "propagated_upto": {},  # objectId -> last frame index drained
     }
 
@@ -72,9 +70,7 @@ def _register_prompt(predictor, sam2_state: dict, object_id: str, prompt: dict) 
         kwargs["labels"] = [int(l) for l in prompt.get("pointLabels", [])]
     if prompt.get("box"):
         kwargs["box"] = [float(v) for v in prompt["box"]]
-    predictor.add_new_points_or_box(
-        state, obj_id=object_id, frame_idx=frame_idx, **kwargs
-    )
+    predictor.add_new_points_or_box(state, obj_id=object_id, frame_idx=frame_idx, **kwargs)
     sam2_state["prompts"][object_id] = prompt
 
 

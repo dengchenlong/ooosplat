@@ -9,11 +9,9 @@ import json
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest
-
 from conftest import make_png
 
 SIDECAR_ROOT = Path(__file__).resolve().parent.parent
@@ -45,12 +43,10 @@ class SidecarProcess:
         self.proc.stdin.flush()
 
     def recv(self, timeout=30.0):
-        deadline = time.monotonic() + timeout
         line = self.proc.stdout.readline()  # blocking read; parent driven
         if not line:
             raise AssertionError(
-                "sidecar closed stdout unexpectedly; stderr: "
-                + "".join(self._stderr_lines[-20:])
+                "sidecar closed stdout unexpectedly; stderr: " + "".join(self._stderr_lines[-20:])
             )
         return json.loads(line)
 
@@ -90,10 +86,7 @@ def frame_dir(tmp_path):
 
 
 def frames_payload(frame_dir, count):
-    return [
-        {"frameId": f"{i:04d}", "path": str(frame_dir / f"{i:04d}.png")}
-        for i in range(count)
-    ]
+    return [{"frameId": f"{i:04d}", "path": str(frame_dir / f"{i:04d}.png")} for i in range(count)]
 
 
 class TestLifecycle:
@@ -185,9 +178,7 @@ class TestSmoke:
             assert Path(m["maskPath"]).is_file()
             assert 0.0 < m["coverage"] <= 1.0
 
-    def test_resume_after_simulated_crash_does_not_deadlock(
-        self, tmp_path, frame_dir
-    ):
+    def test_resume_after_simulated_crash_does_not_deadlock(self, tmp_path, frame_dir):
         """Kill mid-propagate, restart, resume: completes without hanging."""
         masks_dir = tmp_path / "masks"
 
@@ -232,7 +223,7 @@ class TestSmoke:
         # Second process: resume must finish quickly (no deadlock, no hang).
         sc2 = SidecarProcess(tmp_path)
         try:
-            sc2.proc  # alive
+            assert sc2.proc is not None  # alive
             sc2.request(
                 {
                     "type": "init_session",
