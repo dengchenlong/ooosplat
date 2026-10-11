@@ -10,7 +10,25 @@ anchor frame, and ``propagate_in_video`` fills a per-object mask cache that
 """
 
 from pathlib import Path
-import shutil
+
+import numpy as np  # torch runtime dep; sam2_video is only imported by the real backend
+
+
+def _png_to_jpeg(src: Path, dst: Path) -> None:
+    """Re-encode a PNG frame to JPEG for the SAM2 video loader.
+
+    SAM2's frame loader only accepts JPEG files; decoding is done with
+    torchvision (already a SAM2 runtime dependency) so no extra packages
+    are needed. Quality 95 keeps mask-relevant detail intact.
+    """
+    import io
+
+    from PIL import Image
+
+    img = Image.open(src).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    dst.write_bytes(buf.getvalue())
 
 
 def init_video_state(predictor, session: dict) -> dict:
@@ -20,16 +38,19 @@ def init_video_state(predictor, session: dict) -> dict:
     zero-padded names because the SAM2 video loader reads a directory of
     sequentially numbered images.
     """
-    from sam2.sam2_video_predictor import init_state
+    import tempfile
 
-    frames_dir = Path(session["_frames_dir"]) / "sam2-input"
+    staging_root = Path(tempfile.mkdtemp(prefix="sam2-session-"))
+    frames_dir = staging_root / "sam2-input"
     frames_dir.mkdir(parents=True, exist_ok=True)
     for i, frame in enumerate(session["frames"]):
-        dst = frames_dir / f"{i:07d}.png"
+        dst = frames_dir / f"{i:07d}.jpg"
         if not dst.is_file():
-            shutil.copyfile(frame["path"], dst)
+            _png_to_jpeg(Path(frame["path"]), dst)
 
-    state = init_state(predictor, video_path=str(frames_dir))
+    state = predictor.init_state(
+        video_path=str(frames_dir), offload_video_to_cpu=True
+    )
     return {
         "inference_state": state,
         "staged_dir": str(frames_dir),
@@ -70,8 +91,20 @@ def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
     upto = sam2_state["propagated_upto"].get(object_id, -1)
     if frame_index > upto:
         state = sam2_state["inference_state"]
-        for idx, _obj_id, masks in predictor.propagate_in_video(state, start_frame_idx=upto + 1):
-            cache[int(idx)] = masks[0].bool().cpu().numpy()
+        for idx, _obj_ids, video_res_masks in predictor.propagate_in_video(
+            state, start_frame_idx=upto + 1
+        ):
+            # SAM2 emits float32 *logits* (pre-sigmoid) at video resolution.
+            # Threshold at 0 (as in the official SAM2 reference code): a
+            # plain ``.bool()`` maps every nonzero logit to True, and real
+            # logits are ~±10..±20 and never exactly 0, which yielded
+            # full-frame foreground masks (coverage == 1.0, issue #1).
+            raw = video_res_masks[0]
+            if hasattr(raw, "cpu"):
+                raw = raw.cpu()
+            if hasattr(raw, "numpy"):
+                raw = raw.numpy()
+            cache[int(idx)] = np.asarray(raw) > 0.0
         sam2_state["propagated_upto"][object_id] = frame_index
 
     if frame_index not in cache:

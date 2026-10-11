@@ -103,7 +103,9 @@ class Sam2Backend:
                 "SAM2 runtime (torch + sam2 package) is not installed in this "
                 "Python environment; see engines/sam2/README.md."
             ) from exc
-        self._predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint)
+        self._predictor = build_sam2_video_predictor(
+            self.model_cfg, self.checkpoint, device="cpu"
+        )
 
     def on_init_session(self, session: dict) -> None:
         """Stage frames into a sequentially numbered directory and start SAM2."""
@@ -131,6 +133,8 @@ class Sam2Backend:
         from .sam2_video import segment_frame
 
         mask = segment_frame(self._predictor, session["_sam2"], prompt, frame_index)
+        if mask.ndim == 3:  # [1, H, W] from the video predictor
+            mask = mask[0]
         height, width = mask.shape
         return [bytes(255 if v else 0 for v in row) for row in mask.tolist()]
 

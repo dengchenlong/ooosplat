@@ -30,3 +30,6 @@ engines/linux/colmap/**
 dist-engines/
 engines/macos/arm64/**
 !engines/macos/arm64/README.md
+
+__pycache__/
+*.pyc
