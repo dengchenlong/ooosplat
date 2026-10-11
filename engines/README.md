@@ -4,6 +4,9 @@ Native binaries are not stored in Git. Exact upstream URLs, archive hashes,
 installation rules, reported versions, and executable hashes are pinned in
 `manifest.json` (Windows), `manifest.linux.json` (Ubuntu 24.04 Alpha,
 x86_64 only), and `manifest.macos.json` (macOS 15+ Apple Silicon Alpha).
+The SAM2 sidecar engine is described separately in `sam2/README.md` with its
+own `sam2/manifest.json` weight pins (installed outside the repository) and
+`scripts/verify-sam2.ps1` verification.
 
 Restore the pinned release inputs before normal release packaging. For manually
 placed development COLMAP packages, use the local commands described below:
