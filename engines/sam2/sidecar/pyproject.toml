@@ -1,0 +1,13 @@
+[project]
+name = "sam2-sidecar"
+version = "0.1.0"
+description = "OOOSplat SAM2 sidecar: JSON-lines subprocess protocol (local-only inference, no cloud APIs)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pillow>=10.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
