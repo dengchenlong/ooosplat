@@ -9,6 +9,7 @@ anchor frame, and ``propagate_in_video`` fills a per-object mask cache that
 ``segment_frame`` drains up to the requested frame index.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np  # torch runtime dep; sam2_video is only imported by the real backend
@@ -53,6 +54,8 @@ def init_video_state(predictor, session: dict) -> dict:
         "inference_state": state,
         "staged_dir": str(frames_dir),
         "prompts": {},  # objectId -> prompt dict
+        "registered": {},  # objectId -> set of anchor frame indices already registered
+        "prompt_signature": {},  # objectId -> guidance signature at last propagation
         "propagated": {},  # objectId -> {frame_index: bool ndarray}
         "propagated_upto": {},  # objectId -> last frame index drained
     }
@@ -74,14 +77,87 @@ def _register_prompt(predictor, sam2_state: dict, object_id: str, prompt: dict) 
     sam2_state["prompts"][object_id] = prompt
 
 
+def _anchor_geometry(anchor: dict) -> dict:
+    """Map a protocol anchor dict to add_new_points_or_box kwargs."""
+    kwargs = {}
+    if anchor.get("points"):
+        kwargs["points"] = [list(map(float, p)) for p in anchor["points"]]
+        kwargs["labels"] = [int(l) for l in anchor.get("pointLabels", [])]
+    if anchor.get("box"):
+        kwargs["box"] = [float(v) for v in anchor["box"]]
+    return kwargs
+
+
+def _register_anchors(
+    predictor, sam2_state: dict, object_id: str, prompt: dict, frame_index: int
+) -> None:
+    """Register every anchor up to ``frame_index`` that is not registered yet.
+
+    The first (base) anchor uses the prompt's top-level geometry via
+    :func:`_register_prompt`; later anchors (re-prompts against loop drift)
+    are registered as the incremental propagation reaches their frame.
+    Registering an anchor invalidates cached masks from that frame onward so
+    they are recomputed with the new guidance.
+    """
+    anchors = prompt.get("anchors")
+    if not anchors:
+        _register_prompt(predictor, sam2_state, object_id, prompt)
+        return
+    registered = sam2_state["registered"].setdefault(object_id, set())
+    state = sam2_state["inference_state"]
+    for anchor in sorted(anchors, key=lambda a: int(a.get("frameIndex", 0))):
+        anchor_idx = int(anchor.get("frameIndex", 0))
+        if anchor_idx in registered or anchor_idx > frame_index:
+            continue
+        if not anchor.get("points") and not anchor.get("box"):
+            continue  # protocol validated this; defensive against stale states
+        predictor.add_new_points_or_box(
+            state, obj_id=object_id, frame_idx=anchor_idx, **_anchor_geometry(anchor)
+        )
+        registered.add(anchor_idx)
+        # Masks already produced at/after this frame were computed without the
+        # new prompt: drop them so propagation redoes them.
+        cache = sam2_state["propagated"].get(object_id)
+        if cache:
+            for idx in [i for i in cache if i >= anchor_idx]:
+                del cache[idx]
+        upto = sam2_state["propagated_upto"].get(object_id, -1)
+        if upto >= anchor_idx:
+            sam2_state["propagated_upto"][object_id] = anchor_idx - 1
+
+
+def _prompt_signature(prompt: dict) -> str:
+    """Stable identity of the prompt's guidance (geometry + anchors)."""
+    keys = ("objectId", "points", "pointLabels", "box", "anchorFrameIndex", "anchors")
+    payload = {k: prompt.get(k) for k in keys if prompt.get(k) is not None}
+    return _canonical(payload)
+
+
+def _canonical(obj) -> str:
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
     """Return the boolean mask for ``prompt``'s object at ``frame_index``.
 
     Propagation is incremental: results are cached so repeated requests for
-    the same object only advance the predictor forward.
+    the same object only advance the predictor forward. When the prompt's
+    guidance changes (anchors added/edited between propagate runs), cached
+    masks are dropped and propagation restarts from scratch.
     """
     object_id = prompt["objectId"]
-    _register_prompt(predictor, sam2_state, object_id, prompt)
+    signature = _prompt_signature(prompt)
+    signatures = sam2_state.setdefault("prompt_signature", {})
+    if signatures.get(object_id) != signature:
+        # Guidance changed since the last propagation (re-anchor, geometry
+        # edit): stale masks must not leak into the new run.
+        sam2_state["prompts"].pop(object_id, None)
+        sam2_state.setdefault("registered", {}).pop(object_id, None)
+        sam2_state["propagated"].pop(object_id, None)
+        sam2_state["propagated_upto"].pop(object_id, None)
+        signatures[object_id] = signature
+
+    _register_anchors(predictor, sam2_state, object_id, prompt, frame_index)
 
     cache = sam2_state["propagated"].setdefault(object_id, {})
     upto = sam2_state["propagated_upto"].get(object_id, -1)

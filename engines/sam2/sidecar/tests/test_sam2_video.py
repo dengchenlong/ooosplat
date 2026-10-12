@@ -86,3 +86,78 @@ def test_incremental_propagate_uses_cached_and_new_frames():
     mask1 = sam2_video.segment_frame(predictor, state, prompt, 1)
     assert mask1.shape == (8, 8)
     assert mask1[3, 3] and not mask1[0, 0]
+
+
+class _RecordingPredictor:
+    """Records prompt registrations; mask geometry depends on registration count."""
+
+    def __init__(self, total_frames=4):
+        self.calls = []  # list of (obj_id, frame_idx, kwargs)
+        self.total_frames = total_frames
+
+    def add_new_points_or_box(self, state, obj_id, frame_idx, **kwargs):
+        self.calls.append((obj_id, frame_idx, kwargs))
+
+    def propagate_in_video(self, state, start_frame_idx=0):
+        # Before any anchor beyond the base is registered, the object sits at
+        # columns 2:5; once re-registered it drifts to columns 3:6.
+        col = 2 if len(self.calls) <= 1 else 3
+        logits = np.full((8, 8), -6.0, dtype=np.float32)
+        logits[2:5, col : col + 3] = 8.0
+        for idx in range(start_frame_idx, self.total_frames):
+            yield idx, ["obj"], [_LogitsStub(logits)]
+
+
+def _anchors_prompt(anchors):
+    return {
+        "objectId": "obj",
+        "anchors": [{"frameIndex": i, "points": [[4.0, 4.0]], "pointLabels": [1]} for i in anchors],
+    }
+
+
+class TestAnchorRegistration:
+    def test_anchors_register_as_propagation_reaches_them(self):
+        state = _state()
+        predictor = _RecordingPredictor()
+        prompt = _anchors_prompt([0, 2])
+        sam2_video.segment_frame(predictor, state, prompt, 0)
+        assert [c[1] for c in predictor.calls] == [0]
+        sam2_video.segment_frame(predictor, state, prompt, 1)
+        assert [c[1] for c in predictor.calls] == [0], "anchor 2 must wait until frame 2"
+        sam2_video.segment_frame(predictor, state, prompt, 2)
+        assert [c[1] for c in predictor.calls] == [0, 2]
+        sam2_video.segment_frame(predictor, state, prompt, 3)
+        assert [c[1] for c in predictor.calls] == [0, 2], "anchors register exactly once"
+
+    def test_new_anchor_invalidates_cached_masks_from_its_frame(self):
+        state = _state()
+        predictor = _RecordingPredictor()
+        prompt = _anchors_prompt([0])
+        mask0 = sam2_video.segment_frame(predictor, state, prompt, 0)
+        # Drift reported: user re-anchors at frame 2, masks >= 2 must recompute.
+        prompt = _anchors_prompt([0, 2])
+        sam2_video.segment_frame(predictor, state, prompt, 3)
+        cache = state["propagated"]["obj"]
+        assert 2 in cache and 3 in cache
+        # The recomputed masks reflect the post-anchor geometry (columns 3:6).
+        assert cache[2][4, 5], "re-propagated frame must use the new guidance"
+        assert not cache[2][4, 2]
+        assert mask0[3, 3], "frames before the anchor keep their original masks"
+
+    def test_prompt_guidance_change_restarts_propagation(self):
+        state = _state()
+        predictor = _RecordingPredictor()
+        sam2_video.segment_frame(predictor, state, _anchors_prompt([0]), 1)
+        assert [c[1] for c in predictor.calls] == [0]
+        # Same object, different guidance (anchor moved): full re-registration.
+        sam2_video.segment_frame(predictor, state, _anchors_prompt([1]), 1)
+        assert [c[1] for c in predictor.calls] == [0, 1]
+
+    def test_legacy_prompt_without_anchors_still_registers(self):
+        state = _state()
+        predictor = _RecordingPredictor()
+        prompt = {"objectId": "obj", "anchorFrameIndex": 0}
+        sam2_video.segment_frame(predictor, state, prompt, 0)
+        assert len(predictor.calls) == 1
+        sam2_video.segment_frame(predictor, state, prompt, 1)
+        assert len(predictor.calls) == 1, "base prompt must not re-register"

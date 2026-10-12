@@ -190,9 +190,7 @@ class SidecarServer:
         if "points" not in prompt and "box" not in prompt:
             raise RequestError("invalid_request", "prompt requires points or box")
 
-        frame_index = next(
-            i for i, f in enumerate(session["frames"]) if f["frameId"] == frame_id
-        )
+        frame_index = next(i for i, f in enumerate(session["frames"]) if f["frameId"] == frame_id)
         prompt["anchorFrameIndex"] = frame_index
         anchor = {"frameId": frame_id, "frameIndex": frame_index}
         for key in ("points", "pointLabels", "box"):
