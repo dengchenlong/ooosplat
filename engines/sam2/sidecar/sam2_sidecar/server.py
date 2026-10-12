@@ -190,12 +190,52 @@ class SidecarServer:
         if "points" not in prompt and "box" not in prompt:
             raise RequestError("invalid_request", "prompt requires points or box")
 
+        frame_index = next(
+            i for i, f in enumerate(session["frames"]) if f["frameId"] == frame_id
+        )
+        prompt["anchorFrameIndex"] = frame_index
+        anchor = {"frameId": frame_id, "frameIndex": frame_index}
+        for key in ("points", "pointLabels", "box"):
+            if key in prompt:
+                anchor[key] = prompt[key]
+
+        existing = session["prompts"].get(object_id)
+        if existing is None:
+            # First prompt: the base anchor. Its geometry stays at the top
+            # level so backends that only understand a single prompt keep
+            # working unchanged.
+            prompt["anchors"] = [anchor]
+        else:
+            # Re-prompt on an existing object = a new anchor (issue #2,
+            # loop-drift countermeasure: one anchor per ~90° of view change).
+            # A repeated prompt on an already-anchored frame replaces that
+            # anchor's geometry instead of appending a duplicate.
+            anchors = existing["anchors"]
+            replaced = False
+            for i, old in enumerate(anchors):
+                if old["frameId"] == frame_id:
+                    anchors[i] = anchor
+                    replaced = True
+                    break
+            if not replaced:
+                anchors.append(anchor)
+            if frame_id == existing["anchorFrameId"]:
+                # Correcting the base anchor: update its authoritative copy.
+                for key in ("points", "pointLabels", "box"):
+                    existing.pop(key, None)
+                for key in ("points", "pointLabels", "box"):
+                    if key in prompt:
+                        existing[key] = prompt[key]
+                existing["anchorFrameIndex"] = frame_index
+            prompt = existing
+
         session["prompts"][object_id] = prompt
         return {
             "type": RES_PROMPT_ACCEPTED,
             "sessionId": request["sessionId"],
             "objectId": object_id,
             "frameId": frame_id,
+            "anchorCount": len(prompt["anchors"]),
         }
 
     def _handle_propagate(self, request: dict):

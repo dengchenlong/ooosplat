@@ -171,7 +171,13 @@ class TestAddPrompt:
             }
         )
         assert resp == [
-            {"type": "prompt_accepted", "sessionId": "s1", "objectId": "obj1", "frameId": "0000"}
+            {
+                "type": "prompt_accepted",
+                "sessionId": "s1",
+                "objectId": "obj1",
+                "frameId": "0000",
+                "anchorCount": 1,
+            }
         ]
 
     def test_box_prompt_accepted(self, frame_dir):
@@ -420,6 +426,84 @@ class TestPropagate:
         done = next(r for r in resp if r["type"] == "propagate_done")
         assert done["completed"] == 2
         assert done["skipped"] == 0
+
+
+class TestAnchors:
+    """Multi-anchor re-prompt (issue #2): a second add_prompt on the same
+    object is a re-anchor against loop drift, not a replacement."""
+
+    def _add_prompt(self, h, frame_id, points):
+        return h.request(
+            {
+                "type": "add_prompt",
+                "sessionId": "s1",
+                "objectId": "obj1",
+                "frameId": frame_id,
+                "points": points,
+                "pointLabels": [1] * len(points),
+            }
+        )
+
+    def test_second_prompt_becomes_anchor(self, frame_dir):
+        h = Harness()
+        init_session(h, frame_dir)
+        self._add_prompt(h, "0000", [[32, 24]])
+        resp = self._add_prompt(h, "0002", [[30, 20]])
+        assert resp[0]["type"] == "prompt_accepted"
+        assert resp[0]["anchorCount"] == 2
+        prompt = h.server.sessions["s1"]["prompts"]["obj1"]
+        assert prompt["anchorFrameId"] == "0000"
+        assert prompt["anchors"][0]["frameId"] == "0000"
+        assert prompt["anchors"][0]["frameIndex"] == 0
+        assert prompt["anchors"][1] == {
+            "frameId": "0002",
+            "frameIndex": 2,
+            "points": [[30.0, 20.0]],
+            "pointLabels": [1],
+        }
+
+    def test_anchor_at_base_frame_replaces_base_geometry(self, frame_dir):
+        h = Harness()
+        init_session(h, frame_dir)
+        self._add_prompt(h, "0000", [[32, 24]])
+        self._add_prompt(h, "0002", [[30, 20]])
+        resp = self._add_prompt(h, "0000", [[10, 10]])
+        assert resp[0]["anchorCount"] == 2, "same frameId must replace, not append"
+        prompt = h.server.sessions["s1"]["prompts"]["obj1"]
+        assert prompt["points"] == [[10.0, 10.0]], "base prompt geometry must update"
+        assert prompt["anchors"][0]["points"] == [[10.0, 10.0]]
+        assert prompt["anchors"][1]["points"] == [[30.0, 20.0]]
+
+    def test_anchor_addition_invalidates_checkpoint(self, frame_dir, tmp_path):
+        h = Harness()
+        init_session(h, frame_dir)
+        self._add_prompt(h, "0000", [[32, 24]])
+        masks_dir = tmp_path / "masks"
+        h.request(
+            {"type": "propagate", "sessionId": "s1", "objectId": "obj1", "masksDir": str(masks_dir)}
+        )
+        before = json.loads((masks_dir / "state.json").read_text(encoding="utf-8"))
+        # User reviews frames, spots drift, re-anchors at frame 0002.
+        self._add_prompt(h, "0002", [[30, 20]])
+        resp = h.request(
+            {"type": "propagate", "sessionId": "s1", "objectId": "obj1", "masksDir": str(masks_dir)}
+        )
+        done = next(r for r in resp if r["type"] == "propagate_done")
+        assert done["completed"] == 4, "anchors change the outcome: all frames recompute"
+        assert done["skipped"] == 0
+        after = json.loads((masks_dir / "state.json").read_text(encoding="utf-8"))
+        assert after["framesHash"] != before["framesHash"]
+
+    def test_anchor_rejects_empty_geometry(self, frame_dir):
+        h = Harness()
+        init_session(h, frame_dir)
+        self._add_prompt(h, "0000", [[32, 24]])
+        resp = h.request(
+            {"type": "add_prompt", "sessionId": "s1", "objectId": "obj1", "frameId": "0002"}
+        )
+        assert resp[0]["type"] == "error"
+        assert resp[0]["code"] == "invalid_request"
+        assert len(h.server.sessions["s1"]["prompts"]["obj1"]["anchors"]) == 1
 
 
 class TestShutdown:
