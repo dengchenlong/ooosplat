@@ -120,7 +120,13 @@ pub struct AutomaticQualityConfig {
     pub rescue_max_fps: f64,
     pub sfm_max_features: u32,
     pub allow_two_view_tracks: bool,
+    #[serde(default = "default_loop_detection")]
+    pub loop_detection: bool,
     pub initial_brush_profile: BrushTrainingProfile,
+}
+
+const fn default_loop_detection() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -461,6 +467,15 @@ mod tests {
     fn embedded_configuration_is_valid() {
         let config = parse_and_validate(EMBEDDED_CONFIG).unwrap();
         assert_eq!(config.schema_version, 1);
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            assert!(
+                config
+                    .qualities
+                    .get(quality)
+                    .automatic_optimization_on
+                    .loop_detection
+            );
+        }
         assert_eq!(config.caspar.minimum_keypoints, 2_000_000);
         assert_eq!(
             config
@@ -552,6 +567,41 @@ mod tests {
                 profile.label()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn loop_detection_honors_saved_optimization_and_old_configuration_snapshots() {
+        let mut old: serde_json::Value = serde_json::from_str(EMBEDDED_CONFIG).unwrap();
+        for name in ["fast", "balanced", "high"] {
+            old["qualities"][name]["automaticOptimizationOn"]
+                .as_object_mut()
+                .unwrap()
+                .remove("loopDetection");
+        }
+        let mut config = parse_and_validate(&old.to_string()).unwrap();
+        with_pipeline_config(config.clone(), async {
+            for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+                assert!(quality.loop_detection_enabled(true));
+                assert!(!quality.loop_detection_enabled(false));
+            }
+        })
+        .await;
+        let snapshot = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            snapshot["qualities"]["fast"]["automaticOptimizationOn"]["loopDetection"],
+            true
+        );
+        config
+            .qualities
+            .fast
+            .automatic_optimization_on
+            .loop_detection = false;
+        with_pipeline_config(config, async {
+            assert!(!Quality::Fast.loop_detection_enabled(true));
+            assert!(Quality::Balanced.loop_detection_enabled(true));
+            assert!(Quality::High.loop_detection_enabled(true));
+        })
+        .await;
     }
 
     #[test]

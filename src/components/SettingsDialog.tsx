@@ -1,15 +1,16 @@
-import { Monitor, Settings2, ShieldCheck, X } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { Monitor, RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type { TelemetryPreferences } from "../types/telemetry";
 import { PrivacySettingsPanel } from "./TelemetryPreferences";
 
 import { McpSettingsPanel } from "./McpSettingsPanel";
 
-type SettingsSection = "interface" | "privacy" | "mcp";
-const sections: SettingsSection[] = ["interface", "privacy", "mcp"];
+type SettingsSection = "interface" | "updates" | "privacy" | "mcp";
+const sections: SettingsSection[] = ["interface", "updates", "privacy", "mcp"];
 
-export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, onTelemetryChange, onRuntimePanelChange, onClose }: {
+export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, onTelemetryChange, onRuntimePanelChange, onClose, updatePanel }: {
+  updatePanel?: ReactNode;
   preferences: TelemetryPreferences | null;
   telemetryBusy: boolean;
   showRuntimePanel: boolean;
@@ -46,7 +47,7 @@ export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, o
     <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <header className="settings-heading">
         <span className="settings-symbol"><Settings2 size={19} /></span>
-        <div><small>{t("settings.path")}</small><h2 id="settings-title">{t("settings.title")}</h2></div>
+        <div><small>{t("settings.title")} / {section === "mcp" ? "MCP" : t(section === "interface" ? "settings.interface" : section === "updates" ? "update.settingsTitle" : "settings.privacy")}</small><h2 id="settings-title">{t("settings.title")}</h2></div>
         <button type="button" aria-label={t("settings.closeAria")} onClick={onClose}><X size={18} /></button>
       </header>
       <div className="settings-layout">
@@ -62,7 +63,7 @@ export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, o
             tabIndex={section === item ? 0 : -1}
             onClick={() => setSection(item)}
             onKeyDown={(event) => selectFromKeyboard(event, index)}
-          >{item === "interface" ? <Monitor size={15} /> : <ShieldCheck size={15} />}<span>{item === "mcp" ? "MCP" : t(item === "interface" ? "settings.interface" : "settings.privacy")}</span></button>)}
+          >{item === "interface" ? <Monitor size={15} /> : item === "updates" ? <RefreshCw size={15} /> : <ShieldCheck size={15} />}<span>{item === "mcp" ? "MCP" : t(item === "interface" ? "settings.interface" : item === "updates" ? "update.settingsTitle" : "settings.privacy")}</span></button>)}
         </nav>
         <div className="settings-content">
           {section === "interface" && <section id="settings-panel-interface" role="tabpanel" aria-labelledby="settings-tab-interface">
@@ -71,6 +72,9 @@ export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, o
               <div><strong>{t("settings.runtimePanel")}</strong><p>{t("settings.runtimePanelHint")}</p></div>
               <button type="button" role="switch" aria-checked={showRuntimePanel} aria-label={t("settings.runtimePanel")} className={showRuntimePanel ? "settings-switch enabled" : "settings-switch"} onClick={() => onRuntimePanelChange(!showRuntimePanel)}><span /></button>
             </div>
+          </section>}
+          {section === "updates" && <section id="settings-panel-updates" role="tabpanel" aria-labelledby="settings-tab-updates">
+            {updatePanel}
           </section>}
           {section === "mcp" && <section id="settings-panel-mcp" role="tabpanel" aria-labelledby="settings-tab-mcp"><McpSettingsPanel /></section>}
           {section === "privacy" && <section id="settings-panel-privacy" role="tabpanel" aria-labelledby="settings-tab-privacy">

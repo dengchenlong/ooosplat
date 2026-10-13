@@ -148,4 +148,24 @@ describe("GaussianSelectionController mask helpers", () => {
     expect([...textures.ooosplatSelected.data]).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
     controller.destroy();
   });
+
+  it("serializes inversion, excludes deleted points and padding, and restores after two inversions", async () => {
+    const { GaussianSelectionController } = await import("./GaussianSelectionController");
+    const textures = { ooosplatSelected: createTexture(16), ooosplatDeleted: createTexture(16), ooosplatScratch: createTexture(16) };
+    const component = {
+      entity: { getWorldTransform: () => ({ data: new Float32Array(16) }) },
+      getInstanceTexture: (name: keyof typeof textures) => textures[name], workBufferUpdate: "auto",
+    };
+    const requestRender = vi.fn();
+    const controller = new GaussianSelectionController({} as never, component as never,
+      { projectionMatrix: {}, camera: { viewMatrix: {} } } as never, 10, requestRender);
+    await controller.applyMasks(new Uint8Array([0b10, 0]), new Uint8Array([0b1, 0]));
+    const first = controller.invertSelection();
+    const second = controller.invertSelection();
+    expect([...await first]).toEqual([0b11111100, 0b11]);
+    expect([...await second]).toEqual([0b1, 0]);
+    expect(textures.ooosplatSelected.data[1]).toBe(0);
+    expect(requestRender).toHaveBeenCalledTimes(3);
+    controller.destroy();
+  });
 });

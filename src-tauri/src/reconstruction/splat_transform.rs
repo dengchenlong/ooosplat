@@ -913,6 +913,7 @@ mod tests {
             crop: Some(GaussianCrop::Box {
                 center: [-1.0, 0.0, 0.0],
                 size: [3.0, 1.0, 1.0],
+                inverted: false,
             }),
             deleted_mask: Some(&deleted),
         };
@@ -958,6 +959,7 @@ mod tests {
                 crop: Some(GaussianCrop::Box {
                     center: [8.0, 0.0, 0.0],
                     size: [10.0, 2.0, 2.0],
+                    inverted: false,
                 }),
                 deleted_mask: Some(&[1]),
             },
@@ -973,6 +975,48 @@ mod tests {
         let mut row = vec![0; layout.stride];
         reader.read_exact(&mut row).unwrap();
         assert!((read_float(&row, layout.offsets["x"]) + 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn exports_inverted_sphere_and_box_using_the_same_world_space_filter() {
+        for crop in [
+            GaussianCrop::Sphere {
+                center: [-1.0, 0.0, 0.0],
+                radius: 2.0,
+                inverted: true,
+            },
+            GaussianCrop::Box {
+                center: [-1.0, 0.0, 0.0],
+                size: [4.0, 2.0, 2.0],
+                inverted: true,
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("final.ply");
+            write_fixture_rows(
+                &source,
+                &[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            );
+            let original = std::fs::read(&source).unwrap();
+            let (output, info) = export_transformed_ply_with_edits(
+                &source,
+                directory.path(),
+                GaussianTransform::default(),
+                GaussianExportEdits {
+                    crop: Some(crop),
+                    deleted_mask: Some(&[1]),
+                },
+                |_, _| {},
+            )
+            .unwrap();
+            assert_eq!(info.splat_count, 1);
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            let mut reader = BufReader::new(File::open(output).unwrap());
+            let layout = parse_layout(&mut reader).unwrap();
+            let mut row = vec![0; layout.stride];
+            reader.read_exact(&mut row).unwrap();
+            assert_eq!(read_float(&row, layout.offsets["x"]), 4.0);
+        }
     }
     #[test]
     fn cancelled_dedicated_export_cleans_temporary_files() {

@@ -66,6 +66,7 @@
         "initialFps": 6.0,
         "rescueMaxFps": 9.0,
         "sfmMaxFeatures": 4096,
+        "loopDetection": true,
         "allowTwoViewTracks": false,
         "initialBrushProfile": "fast"
       }
@@ -102,6 +103,7 @@
         "rescueMaxFps": 12.0,
         "sfmMaxFeatures": 8192,
         "allowTwoViewTracks": false,
+        "loopDetection": true,
         "initialBrushProfile": "balanced"
       }
     },
@@ -136,6 +138,7 @@
         "initialFps": 12.0,
         "rescueMaxFps": 15.0,
         "sfmMaxFeatures": 16384,
+        "loopDetection": true,
         "allowTwoViewTracks": true,
         "initialBrushProfile": "highLow"
       }

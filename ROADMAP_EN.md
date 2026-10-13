@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Main development version: **0.6.0**. Latest published release: **0.5.0**. The current 0.6.0 work adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, corrected transparent-input handling, and further Auto Optimize, training densification, and preview stability improvements.
+Main development version: **0.6.1**. Latest published release: **0.5.0**. The current 0.6.1 work adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, corrected transparent-input handling, and further Auto Optimize, training densification, and preview stability improvements.
 
 ## Product Principles
 

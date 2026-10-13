@@ -58,6 +58,15 @@ Brush 配置如下：
 
 实际 `maxSplats` 不会低于初始 SfM 三维点数。Fast 和 Balanced 不增加 OOM 降级链；High 只有在错误明确分类为显存不足时才按当前 Profile 的 `oomFallback` 降低一级，并且整次任务最多自动重试一次；`DeviceLost` 或普通进程错误不会触发该降级。
 
+## 视频闭环检测
+
+自动优化开启时，Fast、Balanced、High 的 `automaticOptimizationOn.loopDetection` 默认均为 `true`。普通视频在顺序匹配中额外寻找相隔较远、但画面相似的拍摄位置，有助于连接绕拍回到起点的画面；素材没有合适重叠时不保证找到闭环，匹配耗时可能增加。
+
+- 复用内置 `lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin`，在匹配前检查大小与 SHA256；无需联网或增加安装包资源。文件缺失或损坏时明确报错，不静默关闭闭环。
+- 参数为 `--SequentialMatching.loop_detection 1` 和词汇树绝对路径；保持 `overlap=10`、检测间隔10张、候选数量50。CPU/GPU SIFT 匹配及显卡选择不变。
+- 自动优化关闭时明确使用 `loop_detection=0`。图片序列及高清补拍继续穷举匹配，Bridge 继续指定图片对匹配，不重复启用闭环。
+- 旧配置和任务快照缺少 `loopDetection` 时默认 `true`，但仍受任务保存的自动优化开关控制。已经完成的匹配检查点不自动重算；尚未匹配的续跑任务执行当前保存的配置。
+
 ## Bridge 与 Caspar
 
 - Bridge 仅用于开启自动优化的视频。初始注册率低于 `bridgeTriggerRatio`（默认 0.8）且候选池仍有预算时，优先填补最大的内部未注册区，再处理首尾缺口；失败会回滚到初始模型。图片输入不执行 Bridge。最终重建低于 `goodRegistrationRatio`（默认同为 0.8）时给出质量警告，但仍允许继续训练。

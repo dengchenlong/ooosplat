@@ -1,9 +1,17 @@
-# OOOSplat
-
-[中文](README.md) | [English](README_EN.md)
-
 <p align="center">
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
+</p>
+
+<h1 align="center">OOOSplat</h1>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><img src="https://img.shields.io/badge/release-v0.6.1-blue?style=flat" alt="Release: v0.6.1"></a>
+  <a href="#系统要求"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -11,21 +19,13 @@
   <a href="https://trendshift.io/repositories/177239?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-177239" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/177239/weekly?language=Rust" alt="OOOSplat — Trendshift Rust 周榜荣誉" width="250" height="55" /></a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.0"><strong>⬇️ 下载最新正式版 OOOSplat 0.6.0（Windows / macOS / Ubuntu）</strong></a>
-</p>
-
 OOOSplat 是一款将普通环绕拍摄视频或图片序列一键转换为 3D Gaussian Splatting 的本地桌面应用。选择素材、项目目录和质量档位后，应用会自动完成画面准备、相机重建、训练与 PLY 发布，并可直接预览、调整和导出结果。
 
-Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端；普通 GUI 工作流不依赖远程服务或 localhost API，只有用户启用可选 MCP 服务时才会启动本机 loopback HTTP 入口。
-
-当前正式版本：**0.6.0**。
-
-OOOSplat 提供可选的本地 MCP：服务默认关闭、仅监听 `127.0.0.1` 且无需 token。本机 AI Agent 可以创建和启动任务、查看进度与日志，以及取消任务；所有任务都会同步显示在应用界面中。连接方式见 [MCP 文档](docs/mcp-v1.md)。
+Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端，普通生成与预览不需要额外启动 HTTP 服务。
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.6.0 加入 MCP、多任务管理、透明素材支持、横屏视频与离线 HTML 导出，并升级 COLMAP、自动优化和训练监控。
+> 0.6.1 加入版本更新提醒、预览移动轴、旋转环、反选快捷键与视角恢复，改进 Gaussian 选择和编辑保存流程；自动优化三档启用视频闭环检测，并修复预览排序与 Planner 效果统计，减少生成期间的界面刷新负担。
 
 ## 核心优势
 
@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ### 创建与管理任务
 
-![OOOSplat 创建新任务与历史任务界面](assets/screenshots/task-workspace.png)
+![OOOSplat 创建新任务与任务列表界面](assets/screenshots/task-workspace.png)
 
 ### 高斯泼溅预览与调整
 
@@ -53,10 +53,9 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **一键生成**：支持 MP4、MOV 和 JPG、JPEG、PNG 图片序列，自动完成画面准备、相机重建、训练和 PLY 发布。
 - **三种质量档位**：提供快速、均衡和精细档；自动优化会根据素材与显存选择合适的抽帧、分辨率和训练配置。
 - **透明素材**：支持透明 MOV 和 PNG，保留原始颜色与 Alpha，并自动生成 COLMAP 黑白蒙版。
-- **多任务管理**：保存多个任务草稿和历史记录，实时显示阶段、进度、耗时、硬件占用与日志；支持取消和断点续跑。
-- **MCP**：Codex 等本机 AI Agent 可以创建、启动、查询和取消任务，并读取运行日志。MCP 任务与手动任务显示在同一个界面中。
-- **补拍**：为已完成项目补充新视频或图片，并创建独立的新项目，不覆盖原结果。
-- **预览与编辑**：直接预览 PLY，支持旋转、平移、缩放、模型变换、区域裁切、点删除和撤销重做。
+- **多任务管理**：任务列表分为新任务、已完成和未完成，可保存多个草稿、调整顺序并自动执行下一个任务；同一时间只运行一个生成任务，支持取消和断点续跑。
+- **补拍**：从已完成项目创建补拍任务，复用原相机和重建数据处理新素材，再用全部已注册画面重新训练；派生项目不覆盖原结果。
+- **预览与编辑**：优先使用 WebGPU，不支持时回退 WebGL2；支持模型移动轴和旋转环、区域裁切、点删除、反选与撤销重做。
 - **多种导出**：支持竖屏或横屏 MP4、单文件离线 HTML，以及原始或编辑后的 PLY。
 - **本地运行**：COLMAP 重建与 Brush 训练都在本机完成；满足条件时自动使用 GPU，否则使用可用的兼容路径。
 - **跨平台与双语界面**：支持 Windows、Apple Silicon macOS 和 Ubuntu，并可在简体中文与英文之间切换。
@@ -65,7 +64,9 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 - 矩形选择时，左键拖动替换选区，`Shift + 左键拖动`添加，`Ctrl + 左键拖动`移除；中键旋转视角，右键平移，滚轮缩放。
 - 黄色高亮表示当前选区；按 `Delete` 或 `Backspace` 删除选中 Gaussian，按 `Esc` 清空临时选区。
+- 在矩形、球形或盒形选择中，点击“反选”或按 `Ctrl + I`（macOS 为 `⌘ + I`）切换保留或选中的部分。
 - 球形或盒形选择会自动进入正交视图，可切换侧视图、正视图和顶视图，并通过视口控制器或数值面板调整位置与大小。
+- 变换面板中的“场景操作轴”可切换“移动／旋转”，再次点击当前选中的按钮即可关闭；左键拖轴操作模型，拖动空白处转动视角。旋转环和面板旋转都围绕模型中心；松开提交一次编辑，`Esc` 取消本次拖轴，操作轴模式保存在本机。
 - `Ctrl + Z` 撤销，`Ctrl + Shift + Z` 或 `Ctrl + Y` 重做。模型变换、裁切和删除共享同一历史记录；相机移动和临时黄色选区不计入历史。
 
 ## 处理流程
@@ -74,14 +75,16 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 输入视频或图片序列
   │
   ├─ 视频：FFprobe 分析，FFmpeg 按档位目标 FPS 和工作分辨率抽帧；透明视频同步生成 RGBA 画面与 Mask
-  ├─ 图片：按文件名排序并保留全部图片；透明 PNG 自动生成 Mask
-  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，图片穷举匹配
+  ├─ 图片：快速扫描文件头并按文件名自然排序，复制源素材后优先硬链接复用；按需生成 Alpha Mask
+  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，自动优化开启时含闭环检测，图片穷举匹配
   ├─ COLMAP：增量重建并验证注册率和三维点；自动优化开启时可按需尝试桥接补帧
   ├─ Brush：使用可用 GPU 训练 Gaussian Splats；精细档按显存选择训练配置
   └─ 校验 PLY 后原子发布为 final.ply
 ```
 
-只要 COLMAP 生成了至少一张注册图像和有效三维点，任务就会继续进入 Brush；注册率低于 80% 时会给出质量警告，但不再因低于 50% 自动终止。
+COLMAP 生成至少一张注册图像和有效三维点后，普通生成任务会继续进入 Brush。注册率低于 80% 时会给出质量警告，不会仅因注册率低而终止；补拍还要求至少一张新增画面成功注册。
+
+图片序列预检只读取 JPG/PNG 文件头，检查数量、尺寸和 Alpha 通道，不提前解码全部像素。“检测到 Alpha 通道”不等于已经找到透明区域，生成时才检查实际透明度并按需启用 Mask。项目仍保留一份源素材副本；项目内的画面优先通过硬链接复用，不支持时回退复制，素材导入和画面准备期间会持续显示进度与日志。
 
 ## 系统要求
 
@@ -102,7 +105,7 @@ Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行�
 - 内置原生 arm64 FFmpeg 8.1.2、独立 FFprobe、COLMAP 4.2.1 Ceres CPU CLI-only 和 OOOBrush ooo-v1.0.0 CLI。
 - 用户不需要安装 Homebrew，也不会回退到 Homebrew 或系统 `PATH` 中的同名程序。
 - COLMAP 固定使用 CPU；Brush 独立选择可用的 Metal 图形后端，界面会明确显示该原因。
-- 首次打开未签名版本时，macOS Gatekeeper 可能阻止启动。请在 Finder 中右键应用并选择“打开”；正式版本将在后续接入 Apple 签名和公证。
+- 首次打开未签名版本时，macOS Gatekeeper 可能阻止启动。确认应用来自可信来源且未被修改后，可按 [Apple 官方打开说明](https://support.apple.com/zh-cn/102445)，在“系统设置 → 隐私与安全性”中选择“仍要打开”；[macOS 15 及以上不再支持右键绕过该提示](https://developer.apple.com/news/?id=saqachfa)。
 
 ### Ubuntu 24.04 Alpha（仅限 x86_64）
 
@@ -126,10 +129,10 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。内置 COLMAP 在兼容 NVIDIA 设备上使用 CUDA/Caspar，否则使用 CPU/Ceres；Brush 独立选择图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
-从 main 分支 GitHub Actions 下载 `OOOSplat-0.6.0-x64-linux` Artifact 后，可执行：
+从 main 分支 GitHub Actions 下载 `OOOSplat-0.6.1-x64-linux` Artifact 后，可执行：
 
 ```bash
-sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
 ```
 
 `.deb` 仅通过 Ubuntu 包管理器安装 FFmpeg/FFprobe；锁定的 COLMAP 和 Brush 已包含在安装包中。
@@ -138,22 +141,26 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 
 测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
 
-1. Windows 运行 `OOOSplat-0.6.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.6.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.6.0-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.6.1-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.6.1-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.6.1-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
-3. 在“01 创建新任务”的输入类型下拉栏选择“视频”或“图片”，再点击输入框选择视频文件或图片序列文件夹。
+3. 在右侧“任务列表 → 新任务”中选择一个草稿，或点击“新增”。在左侧“创建新任务”的输入类型下拉栏选择“视频”或“图片”，再选择视频文件或图片序列文件夹。
 4. 选择项目根目录；程序会记住上次使用的位置。
 5. 选择“快速”“均衡”或“精细”档位。
 6. 查看自动检测到的 COLMAP 加速状态及原因，然后点击“开始生成”。
-7. 在左侧查看实时阶段、指标和日志；完成后，在“02 历史任务”中查看项目并点击“预览”。
-8. 在“03 预览”的“调整”模式中修改模型，Transform 会自动保存；点击“保存”生成或更新 `edit.ply`。
-9. 切换到“动画”，在命令栏中间选择“竖屏 / 横屏”，通过“导出 → 导出视频”生成 23 秒 MP4；调整或动画模式均可通过“导出 → 导出离线 HTML”分享当前编辑结果。导出期间可取消，完成后可打开所在文件夹。
-10. 如需补充细节，在“02 历史任务”的已完成项目中点击“高清补拍”，使用原项目相同设备、镜头、方向、分辨率和缩放倍率拍摄，并确保补拍画面与原素材有足够重叠。
+7. 在左侧查看所选任务的阶段、进度和日志；点击右侧任意任务可切换详情。生成出的项目按状态进入“已完成”或“未完成”，已完成项目可点击“预览”。
+8. 在“预览”的“调整”模式中修改模型，变换、裁切和删除记录会自动保存到项目中，视角按项目保存在本机。点击“保存编辑”可确认当前编辑与视角已保存；需要模型文件时，在“导出”菜单选择“导出 PLY”，生成或更新 `edit.ply`。
+9. 切换到“动画”，在命令栏中间选择“竖屏 / 横屏”，通过“导出 → 导出视频”生成 30 FPS、23 秒 MP4，分辨率分别为 1080×1920 和 1920×1080；调整或动画模式均可导出离线 HTML。导出使用当前编辑结果，可取消，完成后可打开所在文件夹。
+10. 如需补充细节，在已完成项目中点击“补拍”，右侧会创建补拍草稿，不再弹出独立配置窗口。在左侧选择新素材，检查通过后点击“开始生成”；使用原项目相同设备、镜头和拍摄参数，并确保新画面与原素材有足够重叠。
 
 使用提示：
 
 - 拖动左右面板之间的分界线可以调整宽度；双击分界线恢复默认比例。
 - 点击右下角百分比按钮可缩小、恢复或放大整个界面。
-- 任务运行期间不可修改输入素材、项目目录和质量档位。
+- 新任务草稿会在本机保存，重启后重新检查素材。运行中的任务参数不能修改，但可以切换并编辑其他草稿；不能同时启动第二个任务。
+- 新任务可拖动排序。“自动执行下一个任务”默认关闭，开启后当前草稿生成成功时会启动紧邻的下一个有效草稿；失败、取消或遇到尚未准备好的草稿时停止，不会跳过它继续执行。
+- 补拍继承源项目的质量档位和自动优化设置。不能重复输入原素材；图片尺寸必须匹配原相机，视频可以按相同宽高比缩小到该尺寸，但不能放大或改变宽高比。缺失重建数据或使用旧版不兼容图片缓存的项目，需要先重新生成。
+- 补拍只对新增画面提取特征，在原数据库和模型副本上补充匹配及重建；Brush 使用全部已注册画面完整重训。派生项目继承模型变换，不继承删点或裁切记录。
+- 任务页日志保留最近 500 条，完整引擎日志位于项目的 `logs/` 目录。训练资源面板默认隐藏，可在“设置 → 界面”中开启。
 - 点击“删除”会回收整个项目目录，包括源视频副本和所有中间文件；如果移入回收站失败，程序不会降级为永久删除。
 
 ## 质量档位
@@ -162,11 +169,15 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 
 自动优化开启/关闭时各档位的完整参数、Bridge/Caspar/OOM 处理逻辑，以及开发环境外部配置覆盖方法见[自动优化参数配置](docs/pipeline-optimization-config.zh-CN.md)。默认参数集中维护在 `config/pipeline-optimization.json`。
 
-| 档位 | 视频初始 / 桥接上限 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
+自动优化开启时，三个档位的视频顺序匹配均启用闭环检测，复用内置词汇树、无需联网，帮助连接绕拍回到起点的画面。匹配耗时可能增加，且不保证所有素材都能找到闭环；关闭自动优化时不启用。图片序列、高清补拍及 Bridge 匹配策略保持不变。
+
+| 档位 | 视频初始 / 桥接目标 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
 | --- | ---: | ---: | ---: | --- |
 | 快速 | 6 / 9 FPS | 最大 1,600 | 1,200 / 4,096 | 8,000 iterations，最大分辨率 1,600 |
 | 均衡 | 8 / 12 FPS | 最大 1,920 | 1,600 / 8,192 | 15,000 iterations，最大分辨率 1,920 |
 | 精细 | 12 / 15 FPS | 依据显存为最大 3,200、3,840 或原生分辨率 | 3,200 / 16,384 | 30,000 iterations，依据显存选择最大分辨率和 Splat 上限 |
+
+短视频会尽量保留至少 30 张画面；源帧不足时使用全部可用画面。因此实际初始和候选采样率可能高于表中的目标值，但不会超过源帧率或源素材帧数。
 
 精细档的初始配置按可用显存划分：显存低于 8 GB 或无法读取时，视频和 Brush 最大长边为 3,200；8 GB（含）至 12 GB 之间为 3,840；12 GB（含）以上保留视频原生长边，并让 Brush 使用原生长边。三个精细配置的 COLMAP 图像长边均限制为 3,200。桥接补帧仅在视频初始重建覆盖不足且仍有候选画面时尝试；失败会安全回退到初始重建，不适用于图片序列。精细档在明确检测到显存不足时最多自动降低一次训练配置并重试。
 
@@ -180,7 +191,7 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 <项目根目录>\<yyyyMMdd-HHmmss_素材名>\
   final.ply             最终 Gaussian Splatting 文件
   project.json          项目元数据与结果指标
-  edit.ply              当前编辑结果；再次保存时安全替换（可选）
+  edit.ply              导出的编辑结果；再次导出 PLY 时安全替换（可选）
   preview.mp4           首次动画预览视频导出（可选）
   preview-2.mp4         后续视频导出自动编号（可选）
   preview-landscape.mp4 横屏视频导出（后续自动编号）
@@ -191,7 +202,9 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
     images\             规范化的源图片副本（图片序列项目）
   work\
     frames\             抽取或准备后的输入画面
+    colmap_frames\      与原始画面内容一致的 COLMAP 专用图片
     masks\              透明素材对应的 COLMAP Mask（按需）
+    reshoot-masks\      补拍素材对应的 COLMAP Mask（按需）
     colmap\             COLMAP 数据库与稀疏重建
     brush\              Brush 数据集与训练中间文件
   logs\                 FFmpeg、COLMAP、Brush 等完整日志
@@ -204,8 +217,11 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 ```text
 %LOCALAPPDATA%\SplatStudio\settings.json
 %LOCALAPPDATA%\SplatStudio\project-index.json
+%LOCALAPPDATA%\SplatStudio\tasks.json
 %LOCALAPPDATA%\SplatStudio\telemetry.json
 ```
+
+以上为 Windows 路径。macOS 和 Linux 使用各自的本地应用数据目录。未启动的草稿、界面偏好和预览视角保存在本机 WebView 存储中，不随项目文件迁移。
 
 ## 匿名使用统计
 
@@ -216,12 +232,13 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 字段 | 说明 |
 | --- | --- |
 | 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
-| 应用版本、操作系统、CPU 架构 | 例如 `0.6.0` / `windows` / `x86_64` |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.6.1` / `windows` / `x86_64` |
 | 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
 | 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
 | 阶段耗时与总耗时 | 毫秒 |
-| 帧数与视频时长 | 分桶值，不是原始数量 |
-| 自动优化效果指标 | 匿名的素材尺寸与数量、规划结果、注册结果、桥接补帧、Brush 配置、Splat 数量和阶段耗时，用于比较自动优化效果 |
+| 基础生成事件的帧数与视频时长 | 分桶值；Planner 效果事件另含实际素材和重建数量 |
+| 自动优化效果指标 | 匿名的素材尺寸与数量、规划结果、注册图像与三维点数、桥接补帧、Brush 配置、Splat 数量、PLY 大小和阶段耗时；普通生成、续跑及补拍均记录，关闭自动优化时仍可用于效果比较 |
+| Planner 显卡信息 | 厂商枚举和检测到的总显存，不含完整显卡名称或设备序列号；无法检测时留空或标记为未知 |
 | 失败阶段与错误码 | 枚举值，例如 `colmap_mapper_failed`；不含原始错误文本 |
 
 匿名统计不会发送的内容：视频、图片、PLY 等任何素材；文件名、路径和项目名称；日志与命令输出；用户名或任何个人信息。
@@ -236,7 +253,7 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 
 | 引擎 | 固定版本/构建 | 用途 |
 | --- | --- | --- |
-| FFmpeg / FFprobe | Windows x64 8.1 LGPL shared；macOS arm64 8.1.2 LGPL shared | 视频分析与抽帧 |
+| FFmpeg / FFprobe | Windows x64 8.1 系列 LGPL shared 锁定构建（n8.1.3-14-g330caae0c1）；macOS arm64 8.1.2 LGPL shared；Ubuntu 系统包 | 视频分析与抽帧 |
 | COLMAP | 4.2.1 同一 commit；Windows/Linux CUDA + Caspar/Ceres；macOS Ceres CPU | 特征、匹配和相机重建 |
 | Brush | OOOBrush ooo-v1.0.0；Windows/Linux x64、macOS arm64 | 无界面 Gaussian Splatting 训练与 PLY 导出 |
 
@@ -252,7 +269,7 @@ Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/man
 
 ### 下载 COLMAP 开发包
 
-运行 `npm run setup:engines` 会自动下载并校验开发所需的两个引擎：
+Windows 和 Ubuntu 使用 `npm run setup:engines` 下载并校验 COLMAP 和 Brush。Windows 还会恢复锁定的 FFmpeg/FFprobe，Ubuntu 使用系统 FFmpeg/FFprobe；macOS 按下方 Apple Silicon 开发流程准备运行时。
 
 - COLMAP 从 [**ooosplat-colmap**](https://github.com/ooolabdev/ooosplat-colmap) 下载。
 - Brush 从 [**OOOBrush**](https://github.com/ooolabdev/OOOBrush) 下载。
@@ -267,7 +284,7 @@ Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/man
 
 详细目录结构和校验方式见 [引擎开发包说明](engines/README.md)。
 
-### 开发环境
+### Windows 开发环境
 
 - Node.js 22.12 或更高版本。
 - Rust stable，目标为 `x86_64-pc-windows-msvc`。
@@ -312,7 +329,9 @@ npm run verify:licenses
 npm run tauri -- dev
 ```
 
-`setup:engines` 从同仓库的固定 GitHub Release 下载完整 arm64 运行时；Homebrew 只用于维护者先执行 `npm run setup:build-deps:macos`，再执行 `npm run build:engines:macos` 重建引擎。`.github/workflows/macos.yml` 构建未签名应用和 DMG，`.github/workflows/macos-engines.yml` 生成并发布锁定的引擎归档。
+上述下载启动流程要求 macOS 混合运行时已完成哈希锁定。当前 `engines/manifest.macos.json` 的分发哈希仍为空，常规 `setup:engines` 会明确拒绝安装；首次本地开发需先按 [macOS CI 工作流](.github/workflows/macos.yml) 构建并验证 FFmpeg/Brush 归档，COLMAP 则从独立的 `ooosplat-colmap` 锁定 Release 安装。该限制针对源码开发的运行时下载，不是使用已经包含引擎的安装包。
+
+Homebrew 用于源码构建前的 `npm run setup:build-deps:macos`，之后执行 `npm run build:engines:macos`。macOS CI 会验证本次构建的本地归档后生成未签名应用和 DMG；若要启用清单指定归档的常规下载，应先审核并填入归档与完整性文件的哈希。
 
 ### 测试与检查
 
@@ -345,7 +364,7 @@ npm run package:windows
 NSIS 安装包输出到：
 
 ```text
-dist-artifacts\OOOSplat-0.6.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.6.1-x64-windows.exe
 ```
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。
@@ -378,11 +397,17 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 Linux 的 FFmpeg/FFprobe 保留各自的环境变量与 PATH 发现方式；Brush 默认只使用托管目录 `linux/brush/brush_app`，显式 `OOOSPLAT_BRUSH` 诊断覆盖也必须支持新 CLI，不再自动回退 PATH。COLMAP 只使用托管目录 `linux/colmap/bin/colmap`，不接受单独的 `OOOSPLAT_COLMAP` 或 PATH 回退。
 
+## MCP（可选）
+
+在“设置 → MCP”中开启后，Codex 等本机 AI Agent 可以创建、启动、查询和取消任务，并读取日志；这些任务会同步显示在应用中。服务默认关闭，仅监听 `127.0.0.1`，无需 token。
+
+连接与配置示例见 [MCP 文档](docs/mcp-v1.md)。
+
 ## 常见问题
 
 ### 如何让 COLMAP 使用显卡？
 
-无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。CUDA 13.2.0 的最低兼容要求为 NVIDIA 驱动 580.00、Compute Capability 7.5；Caspar 另需实际 BA 探测通过，失败仅回退 Ceres，不影响可用的 SIFT GPU；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
+无需手动选择。Windows 和 Ubuntu 会检查锁定的 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配。CUDA 13.2.0 的最低兼容要求为 NVIDIA 驱动 580.00、Compute Capability 7.5；Caspar 另需实际 BA 探测通过，失败仅回退 Ceres，不影响可用的 SIFT GPU。检测结果显示在任务配置中，当前任务实际使用的后端以该任务的信息和日志为准；后台检测短暂超时不会把正在运行的任务切换为 CPU。macOS 的 COLMAP 使用 CPU，Brush 独立选择可用图形后端。
 
 ### 不同显卡组合会如何处理？
 
@@ -400,7 +425,8 @@ COLMAP 和 Brush 是两个独立阶段：COLMAP 只有兼容的 NVIDIA CUDA 环�
 | NVIDIA 驱动过旧、型号不兼容或检测失败 | 自动回退 CPU | Brush 仍会尝试通过 Vulkan 自动选择可用 GPU，但不会强制 NVIDIA | 当前使用保守的 Low 配置 |
 | 没有可用 GPU 图形后端 | COLMAP 使用 CPU | Brush 可能无法启动；CPU-only 软件图形后端尚未完成端到端验证 | 不适用 |
 | macOS：Apple Silicon M 系列（含 Pro、Max、Ultra） | 当前使用 CPU，不启用 CUDA | 自动使用 M 系列芯片的 Metal GPU 和统一内存 | 当前不会按统一内存容量提升显存档，使用保守的 Low 配置 |
-| Ubuntu Alpha：NVIDIA、AMD 或 Intel GPU | 当前使用 CPU | 通过 Vulkan 自动选择可用 GPU | 当前使用保守的 Low 配置 |
+| Ubuntu Alpha：兼容的 NVIDIA GPU | 满足运行时、驱动和 Compute Capability 要求时使用 CUDA，否则回退 CPU | 通过 Vulkan 自动选择可用 GPU，不强制 Windows 选卡策略 | 根据兼容 NVIDIA 显卡的总显存选择 Low、Standard 或 Large |
+| Ubuntu Alpha：AMD、Intel 或无法检测兼容 NVIDIA GPU | 使用 CPU | 通过 Vulkan 自动选择可用 GPU | 使用保守的 Low 配置 |
 
 上述强制选卡和 AMD 隐式层规避只通过环境变量传给单次 `brush_app.exe` 子进程，不会修改系统环境、驱动设置或其他应用，也不会将 Brush 切换到 D3D12。AMD-only 设备不会应用 AMD 隐式层规避。
 
@@ -414,15 +440,19 @@ M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把�
 
 ### 为什么项目占用空间很大？
 
-每个项目会保留源视频副本、抽帧、COLMAP 数据和 Brush 中间文件，便于诊断和追溯。确认结果后，可通过历史任务中的“删除”将整个项目移入回收站。
+每个项目会保留源素材副本、输入画面、COLMAP 数据和 Brush 中间文件，便于诊断和续跑。图片序列在项目内部优先使用硬链接，减少重复物理复制；确认结果后，可通过任务列表中的“删除”将整个项目移入回收站。
 
 ### 可以直接在应用中查看 final.ply 吗？
 
-可以。在“02 历史任务”中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式支持整体 Transform，以及矩形、球形和盒形 Gaussian 选择；可以非破坏式删除、裁切、撤销和重做。编辑状态会保存在项目中，点击“保存”生成或更新唯一的 `edit.ply`，原始 `final.ply` 始终不变。“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕以及带水印的竖屏 MP4 导出；`.sog` 和 `.spz` 尚未开放。
+可以。在任务列表中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式支持整体 Transform，以及矩形、球形和盒形 Gaussian 选择；可以非破坏式删除、裁切、反选、撤销和重做。编辑记录会自动保存在项目中；“保存编辑”确认当前编辑与视角已保存，不生成模型文件。“导出 → 导出 PLY”生成或更新唯一的 `edit.ply`，原始 `final.ply` 始终不变。重新打开时恢复编辑与本机保存的视角，黄色选区和撤销历史不跨次恢复。“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕，以及带水印的横竖屏 MP4 和离线 HTML 导出；`.sog` 和 `.spz` 尚未开放。
+
+### 超大 PLY 可以预览吗？
+
+大于 256 MiB 的 PLY 使用 Range 分块读取，每次约 1 MB，减少文件传输阶段的整文件缓冲；不会压缩、降采样或丢弃 SH 数据。解析、排序和 GPU 纹理仍需要内存与显存，能否打开取决于模型大小和设备能力，不保证所有大模型都能加载。
 
 ## 技术栈
 
-预览的“导出”菜单支持竖屏/横屏视频和单文件离线 HTML。HTML 初始展示完整编辑结果，可手动播放动画，鼠标操作会暂停播放；支持 WebGPU 优先、WebGL2 回退，不包含项目路径、源素材、日志或遥测。开发和构建命令会预先生成离线查看器资源，单独运行 Rust 前可先执行 `npm run build:html-viewer`。
+预览的“导出”菜单支持 PLY、竖屏/横屏视频和单文件离线 HTML。HTML 初始展示完整编辑结果，保留未删除的 Gaussian 与 SH 数据，可离线旋转、平移、缩放并手动播放动画，鼠标操作会暂停播放；支持 WebGPU 优先、WebGL2 回退，不提供模型编辑，也不包含项目路径、源素材、日志或遥测。HTML 体积约为对应 PLY 的 4/3，另含查看器资源，大模型打开仍取决于设备能力。开发和构建命令会预先生成离线查看器资源，单独运行 Rust 前可先执行 `npm run build:html-viewer`。
 
 - 桌面框架：Tauri 2
 - 后端：Rust、Tokio
@@ -430,7 +460,7 @@ M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把�
 - Gaussian 预览与动画：PlayCanvas Engine、PlayCanvas React
 - 视频编码与封装：WebCodecs、Mediabunny
 - 原生流水线：FFmpeg / FFprobe、COLMAP、Brush
-- 进程树管理：Windows Job Object；Linux Unix process group
+- 进程树管理：Windows Job Object；Linux/macOS Unix process group
 
 ## 许可说明
 

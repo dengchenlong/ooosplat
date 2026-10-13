@@ -40,7 +40,7 @@ export function SelectionPanel({ crop, kind, onBegin, onChange, onCommit, onEnab
   return <aside className={`transform-panel selection-panel ${activeCrop ? "enabled" : "disabled"}`} aria-label={t("panel.region")}>
     <div className="transform-panel-heading">
       <strong>{t("panel.region")}</strong>
-      <small>{t("panel.keepInside", { kind: kindLabel })}</small>
+      <small>{t(activeCrop?.inverted ? "panel.keepOutside" : "panel.keepInside", { kind: kindLabel })}</small>
     </div>
     {activeCrop ? <>
       <section><h4>{t("panel.position")}</h4><div className="transform-fields">{centerField(0)}{centerField(1)}{centerField(2)}</div></section>

@@ -339,7 +339,7 @@ impl TelemetryService {
     }
 
     #[cfg(test)]
-    pub(super) fn recording(
+    pub(crate) fn recording(
         path: PathBuf,
     ) -> (Self, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -354,7 +354,7 @@ impl TelemetryService {
     }
 
     #[cfg(test)]
-    pub(super) async fn enable_for_test(&self) {
+    pub(crate) async fn enable_for_test(&self) {
         self.preferences().await.unwrap();
         let mut state = self.state.lock().await;
         state.config.as_mut().unwrap().analytics_enabled = true;

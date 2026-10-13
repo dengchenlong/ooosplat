@@ -5,6 +5,7 @@ import type { GaussianHtmlView } from "../src/types/pipeline";
 import logo from "../assets/app-icon.svg?raw";
 import { configureViewerResolution } from "./resolution";
 import { configurePreviewRenderer } from "../src/components/GaussianViewer/PreviewBackend";
+import { PreviewSortCoordinator } from "../src/components/GaussianViewer/PreviewSortCoordinator";
 const config = JSON.parse(document.getElementById("viewer-config")!.textContent!) as {
     locale: "zh-CN" | "en";
     view: GaussianHtmlView;
@@ -28,11 +29,15 @@ document.querySelector("nav")!.setAttribute("aria-label", zh ? "动画控制" : 
 let app: Application | undefined, asset: Asset | undefined, controls: ViewerControls | undefined, objectUrl: string | undefined;
 let playing = false, elapsed = 0, disposed = false;
 let releaseResolution: (() => void) | undefined;
+let sorting: PreviewSortCoordinator | undefined;
+const initialization = new AbortController();
 let startView = config.view;
 function dispose() {
     if (disposed)
         return;
     disposed = true;
+    initialization.abort();
+    sorting?.destroy();
     playing = false;
     controls?.destroy();
     releaseResolution?.();
@@ -77,6 +82,7 @@ async function boot() {
     app = new Application(canvas, { graphicsDevice: device });
     app.scene.gsplatCentersEnabled = true;
     configurePreviewRenderer(app);
+    sorting = new PreviewSortCoordinator(app);
     app.scene.gsplat.colorUpdateAngle = 0;
     device.on("devicelost", () => fail(labels.lost));
     releaseResolution = configureViewerResolution(app);
@@ -134,6 +140,7 @@ async function boot() {
     component.setParameter("uOoosplatCropCenter", new Float32Array(3));
     component.setParameter("uOoosplatCropSize", new Float32Array([1, 1, 1]));
     component.setParameter("uOoosplatCropRadius", 1);
+    component.setParameter("uOoosplatCropInverted", 0);
     component.setParameter("uOoosplatShowSelection", 0);
     function uniforms(enabled: boolean) { component.setParameter("uOoosplatAnimationEnabled", enabled ? 1 : 0); component.setParameter("uOoosplatAnimationTime", elapsed); component.workBufferUpdate = enabled && animationEffectsActive(elapsed) ? WORKBUFFER_UPDATE_ALWAYS : WORKBUFFER_UPDATE_ONCE; app!.renderNextFrame = true; }
     uniforms(false);
@@ -156,9 +163,13 @@ async function boot() {
         if (elapsed >= VIDEO_DURATION_SECONDS)
             pause();
     });
+    controls.enabled = false;
+    app.start();
+    await sorting.waitForFrame(camera.camera!, initialization.signal, zh ? "模型排序超时，请重新打开后重试。" : "Model sorting timed out. Reopen this file to retry.");
+    initialization.signal.throwIfAborted();
+    controls.enabled = true;
     [play, replay, reset].forEach(b => { b.disabled = false; });
     loading.hidden = true;
     status.textContent = `${device.isWebGPU ? "WEBGPU" : "WEBGL2"} / UNIFIED GSPLAT · ${labels.controls}`;
-    app.start();
 }
 void boot().catch(fail);

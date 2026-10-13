@@ -245,6 +245,29 @@ impl PlannerEffectivenessTracker {
         });
     }
 
+    pub fn restore_brush(
+        &self,
+        initial: Option<ResolvedBrushTrainingPreset>,
+        resolved: Option<ResolvedBrushTrainingPreset>,
+        oom_retry_used: bool,
+    ) {
+        if initial.is_none() && resolved.is_none() {
+            return;
+        }
+        self.update(|snapshot| {
+            let mut brush = PlannerBrushMetrics::default();
+            if let Some(resolved) = resolved.or(initial) {
+                brush.update(resolved, oom_retry_used);
+            }
+            // Old OOM checkpoints can contain only the final profile. Keep the
+            // unknown initial profile null instead of reporting the fallback as initial.
+            brush.initial_profile = initial
+                .or_else(|| (!oom_retry_used).then_some(resolved).flatten())
+                .map(|value| value.profile);
+            snapshot.brush = Some(brush);
+        });
+    }
+
     pub fn record_final_result(&self, metrics: PlannerFinalResultMetrics) {
         self.update(|snapshot| snapshot.final_result = Some(metrics));
     }
@@ -287,6 +310,23 @@ mod tests {
             Some(BrushTrainingProfile::HighStandard)
         );
         assert_eq!(brush.final_profile, Some(BrushTrainingProfile::HighLow));
+        assert!(brush.oom_retry_used);
+    }
+
+    #[test]
+    fn old_oom_checkpoint_does_not_invent_an_initial_profile() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let resolved = crate::presets::resolve_brush_training_preset(
+            crate::presets::Quality::High,
+            true,
+            Some(8192),
+            3840,
+            1000,
+        );
+        tracker.restore_brush(None, Some(resolved), true);
+        let brush = tracker.snapshot().brush.unwrap();
+        assert_eq!(brush.initial_profile, None);
+        assert_eq!(brush.final_profile, Some(resolved.profile));
         assert!(brush.oom_retry_used);
     }
 }

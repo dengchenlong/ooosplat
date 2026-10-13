@@ -13,6 +13,7 @@ pub mod project;
 pub mod reconstruction;
 pub mod tasks;
 pub mod telemetry;
+pub mod updates;
 pub mod video;
 
 pub fn run_app() {
@@ -28,10 +29,12 @@ pub fn run_app() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .manage(commands::PipelineController::default())
         .manage(commands::PreviewController::default())
         .manage(telemetry::TelemetryService::new())
+        .manage(updates::UpdateService::default())
         .setup(|app| {
             use tauri::Manager;
             let tasks = app.state::<commands::PipelineController>().inner().clone();
@@ -57,6 +60,7 @@ pub fn run_app() {
         })
         .manage(mcp::McpController::default())
         .invoke_handler(tauri::generate_handler![
+            updates::check_app_update,
             commands::check_engines,
             commands::check_colmap_acceleration,
             commands::probe_and_plan,

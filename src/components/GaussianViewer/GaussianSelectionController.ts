@@ -22,12 +22,60 @@ uniform float uOoosplatSelectionCropKind;
 uniform vec3 uOoosplatSelectionCropCenter;
 uniform vec3 uOoosplatSelectionCropSize;
 uniform float uOoosplatSelectionCropRadius;
+uniform float uOoosplatSelectionCropInverted;
+uniform vec2 uOoosplatSelectionViewport;
 uniform float uOoosplatSelectionOperation;
 
 bool cropContains(vec3 center) {
     if (uOoosplatSelectionCropKind < 0.5) return true;
-    if (uOoosplatSelectionCropKind < 1.5) return distance(center, uOoosplatSelectionCropCenter) <= uOoosplatSelectionCropRadius;
-    return all(lessThanEqual(abs(center - uOoosplatSelectionCropCenter), uOoosplatSelectionCropSize * 0.5));
+    bool inside = uOoosplatSelectionCropKind < 1.5
+        ? distance(center, uOoosplatSelectionCropCenter) <= uOoosplatSelectionCropRadius
+        : all(lessThanEqual(abs(center - uOoosplatSelectionCropCenter), uOoosplatSelectionCropSize * 0.5));
+    return uOoosplatSelectionCropInverted > 0.5 ? !inside : inside;
+}
+
+vec3 ooosplatRotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+vec2 ooosplatProjectedAxis(vec3 axis, vec4 clip) {
+    vec4 delta = uOoosplatViewProjection * uOoosplatModelMatrix * vec4(axis, 0.0);
+    return (delta.xy - clip.xy / clip.w * delta.w) / clip.w;
+}
+
+float ooosplatEllipseDistance(vec2 p, vec3 covariance) {
+    float determinant = max(covariance.x * covariance.z - covariance.y * covariance.y, 1e-30);
+    return (covariance.z * p.x * p.x - 2.0 * covariance.y * p.x * p.y + covariance.x * p.y * p.y) / determinant;
+}
+
+bool ooosplatEllipseHitsRect(vec2 center, vec3 cov, float limit) {
+    vec2 lo = uOoosplatSelectionRect.xy - center;
+    vec2 hi = uOoosplatSelectionRect.zw - center;
+    if (all(lessThanEqual(lo, vec2(0.0))) && all(greaterThanEqual(hi, vec2(0.0)))) return true;
+    float q0 = ooosplatEllipseDistance(vec2(lo.x, clamp(cov.y * lo.x / cov.x, lo.y, hi.y)), cov);
+    float q1 = ooosplatEllipseDistance(vec2(hi.x, clamp(cov.y * hi.x / cov.x, lo.y, hi.y)), cov);
+    float q2 = ooosplatEllipseDistance(vec2(clamp(cov.y * lo.y / cov.z, lo.x, hi.x), lo.y), cov);
+    float q3 = ooosplatEllipseDistance(vec2(clamp(cov.y * hi.y / cov.z, lo.x, hi.x), hi.y), cov);
+    return min(min(q0, q1), min(q2, q3)) <= limit;
+}
+
+bool ooosplatFootprintHits(vec4 clip) {
+    if (clip.w <= 0.0 || abs(clip.z) > clip.w) return false;
+    float opacity = getColor().a;
+    if (loadOoosplatSelected().r > 0.5) opacity = max(opacity, 0.72);
+    if (opacity < 1.0 / 255.0) return false;
+    vec4 rotation = getRotation().yzwx;
+    vec3 scale = getScale();
+    vec2 x = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3(scale.x, 0.0, 0.0)), clip);
+    vec2 y = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3(0.0, scale.y, 0.0)), clip);
+    vec2 z = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3(0.0, 0.0, scale.z)), clip);
+    // Match PlayCanvas' covariance blur and normalized, truncated Gaussian footprint.
+    vec2 blur = 0.3 / max(uOoosplatSelectionViewport * uOoosplatSelectionViewport, vec2(1.0));
+    vec3 cov = vec3(dot(vec3(x.x, y.x, z.x), vec3(x.x, y.x, z.x)) + blur.x,
+                    dot(vec3(x.x, y.x, z.x), vec3(x.y, y.y, z.y)),
+                    dot(vec3(x.y, y.y, z.y), vec3(x.y, y.y, z.y)) + blur.y);
+    float limit = -2.0 * log(exp(-4.0) + (1.0 - exp(-4.0)) / (255.0 * opacity));
+    return ooosplatEllipseHitsRect(clip.xy / clip.w, cov, limit);
 }
 
 void process() {
@@ -38,11 +86,8 @@ void process() {
         hit = !deleted && !cropContains(center);
     } else {
         vec4 clip = uOoosplatViewProjection * vec4(center, 1.0);
-        vec2 ndc = clip.xy / max(abs(clip.w), 0.000001);
         hit = !deleted
-            && clip.w > 0.0
-            && ndc.x >= uOoosplatSelectionRect.x && ndc.x <= uOoosplatSelectionRect.z
-            && ndc.y >= uOoosplatSelectionRect.y && ndc.y <= uOoosplatSelectionRect.w
+            && ooosplatFootprintHits(clip)
             && cropContains(center);
     }
     writeOoosplatScratch(vec4(hit ? 1.0 : 0.0));
@@ -57,16 +102,62 @@ uniform uOoosplatSelectionCropKind: f32;
 uniform uOoosplatSelectionCropCenter: vec3f;
 uniform uOoosplatSelectionCropSize: vec3f;
 uniform uOoosplatSelectionCropRadius: f32;
+uniform uOoosplatSelectionCropInverted: f32;
+uniform uOoosplatSelectionViewport: vec2f;
 uniform uOoosplatSelectionOperation: f32;
 
 fn cropContains(center: vec3f) -> bool {
     if (uniform.uOoosplatSelectionCropKind < 0.5) {
         return true;
     }
-    if (uniform.uOoosplatSelectionCropKind < 1.5) {
-        return distance(center, uniform.uOoosplatSelectionCropCenter) <= uniform.uOoosplatSelectionCropRadius;
-    }
-    return all(abs(center - uniform.uOoosplatSelectionCropCenter) <= uniform.uOoosplatSelectionCropSize * 0.5);
+    let inside = select(
+        all(abs(center - uniform.uOoosplatSelectionCropCenter) <= uniform.uOoosplatSelectionCropSize * 0.5),
+        distance(center, uniform.uOoosplatSelectionCropCenter) <= uniform.uOoosplatSelectionCropRadius,
+        uniform.uOoosplatSelectionCropKind < 1.5
+    );
+    return select(inside, !inside, uniform.uOoosplatSelectionCropInverted > 0.5);
+}
+
+fn ooosplatRotate(q: vec4f, v: vec3f) -> vec3f {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+fn ooosplatProjectedAxis(axis: vec3f, clip: vec4f) -> vec2f {
+    let delta = uniform.uOoosplatViewProjection * uniform.uOoosplatModelMatrix * vec4f(axis, 0.0);
+    return (delta.xy - clip.xy / clip.w * delta.w) / clip.w;
+}
+
+fn ooosplatEllipseDistance(p: vec2f, covariance: vec3f) -> f32 {
+    let determinant = max(covariance.x * covariance.z - covariance.y * covariance.y, 1e-30);
+    return (covariance.z * p.x * p.x - 2.0 * covariance.y * p.x * p.y + covariance.x * p.y * p.y) / determinant;
+}
+
+fn ooosplatEllipseHitsRect(center: vec2f, cov: vec3f, limit: f32) -> bool {
+    let lo = uniform.uOoosplatSelectionRect.xy - center;
+    let hi = uniform.uOoosplatSelectionRect.zw - center;
+    if (all(lo <= vec2f(0.0)) && all(hi >= vec2f(0.0))) { return true; }
+    let q0 = ooosplatEllipseDistance(vec2f(lo.x, clamp(cov.y * lo.x / cov.x, lo.y, hi.y)), cov);
+    let q1 = ooosplatEllipseDistance(vec2f(hi.x, clamp(cov.y * hi.x / cov.x, lo.y, hi.y)), cov);
+    let q2 = ooosplatEllipseDistance(vec2f(clamp(cov.y * lo.y / cov.z, lo.x, hi.x), lo.y), cov);
+    let q3 = ooosplatEllipseDistance(vec2f(clamp(cov.y * hi.y / cov.z, lo.x, hi.x), hi.y), cov);
+    return min(min(q0, q1), min(q2, q3)) <= limit;
+}
+
+fn ooosplatFootprintHits(clip: vec4f) -> bool {
+    if (clip.w <= 0.0 || abs(clip.z) > clip.w) { return false; }
+    let opacity = select(getColor().a, max(getColor().a, 0.72), loadOoosplatSelected().r > 0.5);
+    if (opacity < 1.0 / 255.0) { return false; }
+    let rotation = getRotation().yzwx;
+    let scale = getScale();
+    let x = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3f(scale.x, 0.0, 0.0)), clip);
+    let y = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3f(0.0, scale.y, 0.0)), clip);
+    let z = ooosplatProjectedAxis(ooosplatRotate(rotation, vec3f(0.0, 0.0, scale.z)), clip);
+    let blur = 0.3 / max(uniform.uOoosplatSelectionViewport * uniform.uOoosplatSelectionViewport, vec2f(1.0));
+    let cov = vec3f(dot(vec3f(x.x, y.x, z.x), vec3f(x.x, y.x, z.x)) + blur.x,
+                    dot(vec3f(x.x, y.x, z.x), vec3f(x.y, y.y, z.y)),
+                    dot(vec3f(x.y, y.y, z.y), vec3f(x.y, y.y, z.y)) + blur.y);
+    let limit = -2.0 * log(exp(-4.0) + (1.0 - exp(-4.0)) / (255.0 * opacity));
+    return ooosplatEllipseHitsRect(clip.xy / clip.w, cov, limit);
 }
 
 fn process() {
@@ -77,11 +168,8 @@ fn process() {
         hit = !deleted && !cropContains(center);
     } else {
         let clip = uniform.uOoosplatViewProjection * vec4f(center, 1.0);
-        let ndc = clip.xy / max(abs(clip.w), 0.000001);
         hit = !deleted
-            && clip.w > 0.0
-            && ndc.x >= uniform.uOoosplatSelectionRect.x && ndc.x <= uniform.uOoosplatSelectionRect.z
-            && ndc.y >= uniform.uOoosplatSelectionRect.y && ndc.y <= uniform.uOoosplatSelectionRect.w
+            && ooosplatFootprintHits(clip)
             && cropContains(center);
     }
     writeOoosplatScratch(vec4f(select(0.0, 1.0, hit)));
@@ -138,7 +226,7 @@ export class GaussianSelectionController {
   private appliedSelectionRevision = 0;
 
   constructor(
-    device: GraphicsDevice,
+    private readonly device: GraphicsDevice,
     private readonly component: GSplatComponent,
     private readonly camera: CameraComponent,
     private readonly splatCount: number,
@@ -230,6 +318,8 @@ export class GaussianSelectionController {
       this.processor.setParameter("uOoosplatSelectionCropCenter", center);
       this.processor.setParameter("uOoosplatSelectionCropSize", size);
       this.processor.setParameter("uOoosplatSelectionCropRadius", radius);
+      this.processor.setParameter("uOoosplatSelectionCropInverted", crop?.inverted ? 1 : 0);
+      this.processor.setParameter("uOoosplatSelectionViewport", [this.device.width || 1, this.device.height || 1]);
       this.processor.setParameter("uOoosplatSelectionOperation", 0);
       this.processor.process();
       const pixels = await this.scratchTexture.read(0, 0, this.scratchTexture.width, this.scratchTexture.height, { immediate: true }) as Uint8Array;
@@ -263,6 +353,7 @@ export class GaussianSelectionController {
       this.processor.setParameter("uOoosplatSelectionCropCenter", crop.center);
       this.processor.setParameter("uOoosplatSelectionCropSize", size);
       this.processor.setParameter("uOoosplatSelectionCropRadius", radius);
+      this.processor.setParameter("uOoosplatSelectionCropInverted", crop.inverted ? 1 : 0);
       this.processor.setParameter("uOoosplatSelectionOperation", 1);
       this.processor.process();
       const pixels = await this.scratchTexture.read(0, 0, this.scratchTexture.width, this.scratchTexture.height, { immediate: true }) as Uint8Array;
@@ -278,5 +369,21 @@ export class GaussianSelectionController {
       return next;
     };
     return this.enqueue(execute);
+  }
+
+  invertSelection() {
+    const revision = ++this.requestedSelectionRevision;
+    return this.enqueue(() => {
+      if (this.destroyed) throw new Error(translate(getCurrentLocale(), "viewer.selectorDestroyed"));
+      for (let index = 0; index < this.selectedMask.length; index += 1) {
+        this.selectedMask[index] = ~this.selectedMask[index] & ~this.deletedMask[index];
+      }
+      const remainder = this.splatCount % 8;
+      if (remainder) this.selectedMask[this.selectedMask.length - 1] &= (1 << remainder) - 1;
+      this.appliedSelectionRevision = revision;
+      this.uploadMask(this.selectedTexture, this.selectedPixels, this.selectedMask);
+      this.refreshWorkBuffer();
+      return this.selectedMask.slice();
+    });
   }
 }

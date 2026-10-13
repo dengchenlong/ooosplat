@@ -8,6 +8,8 @@ use crate::{
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
+mod vocabulary;
+
 pub const LOCKED_VERSION: &str = "4.2.1";
 pub const LOCKED_COMMIT: &str = "bd1fcf654d2dd8fefa1466999c190a246f83f4b9";
 
@@ -367,6 +369,7 @@ pub async fn extract_incremental_features(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn match_sequential(
     executable: &Path,
     database: &Path,
@@ -374,12 +377,24 @@ pub async fn match_sequential(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
+    loop_detection: bool,
 ) -> Result<()> {
+    let vocab_tree = if loop_detection {
+        Some(vocabulary::prepare(executable, manager.child_token()).await?)
+    } else {
+        None
+    };
     let (use_gpu_option, gpu_index_option) =
         matching_gpu_options(executable, "sequential_matcher", manager).await?;
     run_colmap(
         executable,
-        sequential_matching_args(database, gpu_index, use_gpu_option, gpu_index_option),
+        sequential_matching_args(
+            database,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+            vocab_tree.as_deref(),
+        ),
         database.parent().unwrap_or(Path::new(".")),
         log,
         manager,
@@ -560,6 +575,7 @@ fn sequential_matching_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
+    vocab_tree: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = matching_args(
         "sequential_matcher",
@@ -571,7 +587,19 @@ fn sequential_matching_args(
     args.extend([
         OsString::from("--SequentialMatching.overlap"),
         OsString::from("10"),
+        OsString::from("--SequentialMatching.loop_detection"),
+        OsString::from(if vocab_tree.is_some() { "1" } else { "0" }),
     ]);
+    if let Some(path) = vocab_tree {
+        args.extend([
+            "--SequentialMatching.loop_detection_period".into(),
+            "10".into(),
+            "--SequentialMatching.loop_detection_num_images".into(),
+            "50".into(),
+            "--SequentialMatching.vocab_tree_path".into(),
+            path.into(),
+        ]);
+    }
     args
 }
 
@@ -850,6 +878,7 @@ mod tests {
             Some(2),
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
+            None,
         ));
         assert!(matching
             .windows(2)
@@ -884,6 +913,7 @@ mod tests {
             None,
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
+            None,
         ));
         assert!(matching
             .windows(2)
@@ -912,6 +942,155 @@ mod tests {
         assert!(!matching
             .iter()
             .any(|arg| arg == "--SequentialMatching.overlap"));
+        assert!(!matching
+            .iter()
+            .any(|arg| arg.starts_with("--SequentialMatching.")));
+    }
+
+    #[test]
+    fn loop_detection_is_explicit_and_preserves_sift_gpu_selection() {
+        let tree = Path::new("中文 工程 with spaces/lib/colmap/vocab.bin");
+        for (use_gpu, gpu_index) in [
+            ("--FeatureMatching.use_gpu", "--FeatureMatching.gpu_index"),
+            ("--SiftMatching.use_gpu", "--SiftMatching.gpu_index"),
+        ] {
+            for selected_gpu in [None, Some(2)] {
+                for vocabulary in [None, Some(tree)] {
+                    let args = strings(sequential_matching_args(
+                        Path::new("database.db"),
+                        selected_gpu,
+                        use_gpu,
+                        gpu_index,
+                        vocabulary,
+                    ));
+                    let value = |name: &str| {
+                        args.windows(2)
+                            .find(|pair| pair[0] == name)
+                            .map(|pair| pair[1].as_str())
+                    };
+                    assert_eq!(
+                        value(use_gpu),
+                        Some(if selected_gpu.is_some() { "1" } else { "0" })
+                    );
+                    assert_eq!(value(gpu_index), selected_gpu.map(|_| "2"));
+                    assert_eq!(value("--SequentialMatching.overlap"), Some("10"));
+                    assert_eq!(
+                        value("--SequentialMatching.loop_detection"),
+                        Some(if vocabulary.is_some() { "1" } else { "0" })
+                    );
+                    if vocabulary.is_some() {
+                        assert_eq!(value("--SequentialMatching.vocab_tree_path"), tree.to_str());
+                        assert_eq!(
+                            value("--SequentialMatching.loop_detection_period"),
+                            Some("10")
+                        );
+                        assert_eq!(
+                            value("--SequentialMatching.loop_detection_num_images"),
+                            Some("50")
+                        );
+                    } else {
+                        assert_eq!(value("--SequentialMatching.vocab_tree_path"), None);
+                        assert_eq!(value("--SequentialMatching.loop_detection_period"), None);
+                    }
+                }
+            }
+        }
+        let bridge = strings(matching_args(
+            "matches_importer",
+            Path::new("database.db"),
+            None,
+            "--FeatureMatching.use_gpu",
+            "--FeatureMatching.gpu_index",
+        ));
+        assert!(!bridge
+            .iter()
+            .any(|arg| arg.starts_with("--SequentialMatching.")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_loop_matching_stops_before_probing_or_launching_colmap() {
+        let manager = ProcessManager::new();
+        manager.cancel();
+        let error = match_sequential(
+            Path::new("missing/bin/colmap"),
+            Path::new("database.db"),
+            PathBuf::from("colmap.log"),
+            &manager,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SplatError::Cancelled));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the locked bundled COLMAP runtime; runs only CPU extraction and matching"]
+    async fn bundled_offline_loop_matching_smoke() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let engines = super::super::EnginePaths::discover(None);
+        let executable = std::path::absolute(&engines.colmap).unwrap();
+        assert!(
+            executable.is_file(),
+            "Prepare the locked bundled COLMAP runtime first"
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let working = temporary.path().join("中文 loop check with spaces");
+        let images = working.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let picture = std::fs::read(workspace.join("src-tauri/icons/128x128.png")).unwrap();
+        for index in 1..=12 {
+            std::fs::write(images.join(format!("frame_{index:06}.png")), &picture).unwrap();
+        }
+        let database = working.join("database.db");
+        let log = working.join("colmap.log");
+        let manager = ProcessManager::new();
+        // Relative image paths mirror the production Windows Unicode-path
+        // workaround, while the database and vocabulary use absolute paths.
+        extract_features_quality_v2(
+            &executable,
+            &database,
+            Path::new("images"),
+            None,
+            None,
+            128,
+            4096,
+            log.clone(),
+            &manager,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let database_connection = rusqlite::Connection::open(&database).unwrap();
+        let features: u64 = database_connection
+            .query_row("SELECT SUM(rows) FROM keypoints", [], |row| row.get(0))
+            .unwrap();
+        assert!(features > 0, "Smoke input must have real SIFT features");
+        drop(database_connection);
+        match_sequential(
+            &executable,
+            &database,
+            log.clone(),
+            &manager,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let output = std::fs::read_to_string(&log).unwrap();
+        let logged_arguments: Vec<_> = output.lines().map(str::trim).collect();
+        assert!(logged_arguments
+            .windows(2)
+            .any(|pair| pair == ["--SequentialMatching.loop_detection", "1"]));
+        assert!(
+            output.contains("Indexing image"),
+            "Bundled vocabulary must be read, not silently skipped"
+        );
+        assert!(output.contains("Generating sequential image pairs"));
+        println!("Verified offline CPU loop matching: 12 images, {features} SIFT features, bundled hash-locked vocabulary, no Mapper or Brush.");
     }
 
     #[test]

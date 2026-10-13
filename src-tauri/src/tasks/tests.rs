@@ -605,7 +605,7 @@ async fn gui_mcp_admission_duplicate_start_and_disconnect_are_independent() {
     let (root, service, first) = fixture().await;
     let signal = Arc::new(tokio::sync::Notify::new());
     let worker_signal = signal.clone();
-    *service.executor.lock().unwrap() = Some(Arc::new(move |_| {
+    *service.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
         let signal = worker_signal.clone();
         Box::pin(async move {
             signal.notified().await;
@@ -699,7 +699,7 @@ async fn cancellation_rejects_stale_execution_then_confirms_terminal_state() {
     let (_root, service, task) = fixture().await;
     let updates = record_notifications(&service);
     let observe = service.clone();
-    *service.executor.lock().unwrap() = Some(Arc::new(move |task| {
+    *service.executor.lock().unwrap() = Some(Arc::new(move |task, _| {
         let service = observe.clone();
         Box::pin(async move {
             loop {
@@ -763,7 +763,7 @@ async fn cancellation_rejects_stale_execution_then_confirms_terminal_state() {
 #[tokio::test]
 async fn panic_and_restart_do_not_leave_phantom_running_tasks() {
     let (root, service, task) = fixture().await;
-    *service.executor.lock().unwrap() = Some(Arc::new(|_| {
+    *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
         Box::pin(async { panic!("mock runner panic") })
     }));
     service
@@ -1013,7 +1013,7 @@ async fn successful_execution_is_persisted_and_terminal_events_cannot_reactivate
     let (root, service, task) = fixture().await;
     let path = root.path().join("synthetic-project");
     let project = Uuid::new_v4();
-    *service.executor.lock().unwrap() = Some(Arc::new(move |_| {
+    *service.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
         let path = path.clone();
         Box::pin(async move {
             Ok(PipelineResult {
@@ -1062,6 +1062,351 @@ async fn successful_execution_is_persisted_and_terminal_events_cannot_reactivate
         reopened.get(task.task_id).await.unwrap().status,
         TaskStatus::Completed
     );
+}
+
+// Drive the production Runner metric writers through TaskService::start_inner.
+// Returning a synthetic result alone would miss the shared-tracker regression.
+fn write_planner_fixture(
+    runner: &PipelineRunner,
+    task: &TaskRecord,
+    selected: u64,
+    complete: bool,
+) -> crate::project::ProjectOutput {
+    use crate::{
+        engines::ColmapAccelerationStatus,
+        presets::resolve_brush_training_preset,
+        project::{FrameState, PipelineStateFile, ProjectInputType, ReshootState},
+        reconstruction::validator::{ReconstructionQuality, ReconstructionReport},
+        video::{ImageSequenceInfo, PlannedFrame, VideoInfo},
+    };
+    let is_images = task.input_path.is_dir();
+    let is_reshoot = task.source_project_id.is_some();
+    let mut state = PipelineStateFile::created_for(
+        task.quality,
+        if is_images {
+            ProjectInputType::Images
+        } else {
+            ProjectInputType::Video
+        },
+    );
+    state.planner_enabled = task.planner_enabled;
+    state.frames = Some(FrameState {
+        initial_extracted_frames: selected,
+        extracted_frames: Some(selected),
+        candidate_frames: (0..selected + 20)
+            .map(|index| PlannedFrame {
+                source_frame_index: index,
+                timestamp_seconds: index as f64 / 30.0,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    if is_images {
+        state.image_sequence = Some(ImageSequenceInfo {
+            image_count: selected,
+            width: 3840,
+            height: 2160,
+            has_alpha: false,
+            requires_large_sequence_confirmation: false,
+        });
+    } else {
+        state.video = Some(VideoInfo {
+            width: 3840,
+            height: 2160,
+            total_frames: 300,
+            fps: 30.0,
+            duration: 10.0,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "rgb24".into(),
+            has_alpha: false,
+        });
+    }
+    if is_reshoot {
+        state.reshoot = Some(ReshootState {
+            source_image_count: 100,
+            reshoot_frame_count: selected,
+            supplemental_frames_complete: true,
+            ..Default::default()
+        });
+    }
+    let input_images = selected + if is_reshoot { 100 } else { 0 };
+    let report = ReconstructionReport {
+        input_images,
+        registered_images: input_images - 2,
+        registered_ratio: (input_images - 2) as f64 / input_images as f64,
+        points_3d: selected * 100,
+        quality: ReconstructionQuality::Good,
+    };
+    let initial = resolve_brush_training_preset(
+        task.quality,
+        task.planner_enabled,
+        Some(24_576),
+        3840,
+        report.points_3d,
+    );
+    state.brush_training.initial_resolved = Some(initial);
+    let resolved = if task.project_id.is_some() && task.planner_enabled {
+        state.brush_training.oom_retry_used = true;
+        initial.downgrade_after_oom(report.points_3d).unwrap()
+    } else {
+        initial
+    };
+    state.brush_training.resolved = Some(resolved);
+    // Exercise the same saved checkpoint representation used on resume.
+    let state: PipelineStateFile =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    runner.record_frame_metrics(&state, selected, None);
+    let acceleration: ColmapAccelerationStatus = serde_json::from_value(serde_json::json!({
+        "backend": "gpu", "detectionState": "ready", "reasonCode": "gpuReady",
+        "reason": "fixture", "device": null, "detectedNvidiaDeviceCount": 1,
+        "requirements": { "minimumDriverVersion": "580", "minimumComputeCapability": "7.5" }
+    }))
+    .unwrap();
+    runner.record_reconstruction_metrics(&report, &acceleration, false, is_reshoot);
+    runner.record_brush_metrics(&state);
+    let output = crate::project::ProjectOutput {
+        final_ply: task.projects_root.join("final.ply"),
+        file_size: selected * 1000,
+        splat_count: selected * 10,
+        input_images,
+        registered_images: report.registered_images,
+        registered_ratio: report.registered_ratio,
+        points_3d: report.points_3d,
+    };
+    if complete {
+        runner.record_final_metrics(&output);
+    }
+    output
+}
+
+#[tokio::test]
+async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("input.mp4");
+    let images = root.path().join("images");
+    std::fs::write(&video, b"fixture").unwrap();
+    std::fs::create_dir(&images).unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let (telemetry, captured) = TelemetryService::recording(root.path().join("telemetry.json"));
+    telemetry.enable_for_test().await;
+    let mut run_ids = std::collections::BTreeSet::new();
+    for (index, (is_images, reshoot, resume, enabled, fails)) in [
+        (false, false, false, true, false),
+        (true, false, false, false, false),
+        (false, false, true, true, false),
+        (true, false, true, false, false),
+        (false, true, false, true, false),
+        (true, true, false, false, false),
+        (true, true, true, true, false),
+        (false, false, false, true, true),
+        (true, true, false, true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = 30 + index as u64;
+        let task = service
+            .create(
+                None,
+                if is_images {
+                    images.clone()
+                } else {
+                    video.clone()
+                },
+                Quality::High,
+                root.path().join("projects"),
+                enabled,
+                "gui",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        if reshoot {
+            service
+                .mark_reshoot(task.task_id, Uuid::new_v4())
+                .await
+                .unwrap();
+        }
+        if resume {
+            let mut records = service.records();
+            let task = records.tasks.get_mut(&task.task_id).unwrap();
+            task.project_id = Some(Uuid::new_v4());
+            task.status = TaskStatus::Failed;
+        }
+        *service.executor.lock().unwrap() = Some(Arc::new(move |task, runner| {
+            Box::pin(async move {
+                let output = write_planner_fixture(&runner, &task, selected, !fails);
+                if fails {
+                    return Err(crate::error::SplatError::BrushOutOfMemory("fixture".into()));
+                }
+                Ok(PipelineResult {
+                    project_id: task.project_id.unwrap_or_else(Uuid::new_v4).to_string(),
+                    project_path: task.projects_root.clone(),
+                    final_ply: output.final_ply,
+                    file_size: output.file_size,
+                    splat_count: output.splat_count,
+                    input_images: output.input_images,
+                    registered_images: output.registered_images,
+                    registered_ratio: output.registered_ratio,
+                    points_3d: output.points_3d,
+                    duration_ms: 100,
+                    completed_at: Utc::now(),
+                    warning: None,
+                    logs_directory: task.projects_root.join("logs"),
+                    source_duration_seconds: (!is_images).then_some(10.0),
+                })
+            })
+        }));
+        service
+            .start_inner(
+                task.task_id,
+                default_engine_paths(None),
+                Some(telemetry.clone()),
+                resume,
+            )
+            .await
+            .unwrap();
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.wait(task.task_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            finished.status,
+            if fails {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Completed
+            }
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let ready = {
+                    let events = captured.lock().unwrap();
+                    events
+                        .iter()
+                        .filter(|e| e["event"] == "planner_evaluation")
+                        .count()
+                        == index + 1
+                        && events
+                            .iter()
+                            .filter(|e| {
+                                e["event"] == "generation_completed"
+                                    || e["event"] == "generation_failed"
+                            })
+                            .count()
+                            == index + 1
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = captured.lock().unwrap();
+        let evaluation = events
+            .iter()
+            .filter(|e| e["event"] == "planner_evaluation")
+            .nth(index)
+            .unwrap();
+        if index == 0 || index == 4 {
+            eprintln!("OOOSPLAT_TELEMETRY_DEBUG {evaluation}");
+        }
+        assert!(run_ids.insert(
+            evaluation["properties"]["runId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        ));
+        let p = &evaluation["properties"];
+        assert_eq!(p["plannerEnabled"], enabled);
+        assert_eq!(p["plannerVersion"].is_null(), !enabled);
+        assert_eq!(p["runKind"], if resume { "resume" } else { "new" });
+        assert_eq!(p["inputType"], if is_images { "images" } else { "video" });
+        assert_eq!(p["framePlan"]["sourceWidth"], 3840);
+        assert_eq!(
+            p["framePlan"]["sourceItemCount"],
+            if is_images { selected } else { 300 }
+        );
+        assert_eq!(p["framePlan"]["initialSelectedCount"], selected);
+        assert_eq!(
+            p["initialReconstruction"]["inputImages"],
+            selected + if reshoot { 100 } else { 0 }
+        );
+        assert_eq!(p["initialReconstruction"]["points3d"], selected * 100);
+        assert!(!p["brush"]["finalProfile"].is_null());
+        assert_eq!(p["brush"]["oomRetryUsed"], resume && enabled);
+        if resume && enabled {
+            assert_ne!(p["brush"]["initialProfile"], p["brush"]["finalProfile"]);
+        }
+        assert!(p["stageDurations"]["extractingFramesMs"].is_null());
+        if reshoot {
+            assert_eq!(p["bridge"]["status"], "notApplicable");
+            assert_eq!(p["bridge"]["addedFrames"], 0);
+            assert_eq!(p["framePlan"]["candidateCount"], selected);
+            assert!(p["framePlan"]["configuredCandidateFps"].is_null());
+        }
+        if fails {
+            assert_eq!(p["outcome"], "failed");
+            assert_eq!(p["errorCode"], "brush_out_of_memory");
+            assert!(p["finalResult"].is_null());
+        } else {
+            assert_eq!(p["outcome"], "completed");
+            assert_eq!(p["finalResult"]["splatCount"], selected * 10);
+            assert_eq!(p["finalResult"]["plySizeBytes"], selected * 1000);
+        }
+    }
+}
+
+#[tokio::test]
+async fn task_cancellation_and_disabled_analytics_send_no_terminal_statistics() {
+    for cancelled in [true, false] {
+        let (root, service, task) = fixture().await;
+        let (telemetry, events) = TelemetryService::recording(root.path().join("telemetry.json"));
+        telemetry.enable_for_test().await;
+        if !cancelled {
+            telemetry.set_consent(false).await.unwrap();
+        }
+        *service.executor.lock().unwrap() = Some(Arc::new(move |task, runner| {
+            Box::pin(async move {
+                write_planner_fixture(&runner, &task, 30, false);
+                Err(if cancelled {
+                    crate::error::SplatError::Cancelled
+                } else {
+                    crate::error::SplatError::BrushDeviceLost("fixture".into())
+                })
+            })
+        }));
+        service
+            .start(
+                task.task_id,
+                default_engine_paths(None),
+                Some(telemetry.clone()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.wait(task.task_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = events.lock().unwrap();
+        if cancelled {
+            assert!(!events.iter().any(|e| e["event"] == "planner_evaluation"
+                || e["event"] == "generation_failed"
+                || e["event"] == "generation_completed"));
+        } else {
+            assert!(events.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

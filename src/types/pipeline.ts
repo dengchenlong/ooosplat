@@ -225,8 +225,8 @@ export interface GaussianTransform {
 export type GaussianEditorTool = "transform" | "rectangle" | "sphere" | "box";
 export type GaussianOrthographicView = "side" | "front" | "top";
 export type GaussianCrop =
-  | { kind: "sphere"; center: [number, number, number]; radius: number }
-  | { kind: "box"; center: [number, number, number]; size: [number, number, number] }
+  | { kind: "sphere"; center: [number, number, number]; radius: number; inverted?: boolean }
+  | { kind: "box"; center: [number, number, number]; size: [number, number, number]; inverted?: boolean }
   | null;
 export interface GaussianEditState {
   crop: GaussianCrop;

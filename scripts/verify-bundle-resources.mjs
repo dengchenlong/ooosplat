@@ -28,9 +28,14 @@ const runtimeLock = readJson("engines/colmap-runtime.json");
 if (runtimeLock.offlineVocabulary?.path !== "lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin"
   || !/^[a-f0-9]{64}$/i.test(runtimeLock.offlineVocabulary?.sha256 ?? "")) throw new Error("The offline COLMAP vocabulary must remain hash-locked and bundled.");
 
-// The Release proves offline loop-detection capability, but OOOSplat keeps the
-// existing matching behavior until that feature is deliberately enabled.
-const colmapSource = fs.readFileSync(path.join(workspace, "src-tauri/src/engines/colmap.rs"), "utf8");
-if (/SequentialMatching\.(?:loop_detection|vocab_tree_path)/.test(colmapSource)) throw new Error("Offline loop detection must not be enabled implicitly.");
+// Loop detection is deliberately enabled for optimized video in every tier.
+// Rust tests enforce the saved optimization toggle, explicit CLI flags, and
+// unchanged exhaustive/Bridge matching. No resource download is introduced.
+const optimization = readJson("config/pipeline-optimization.json");
+for (const quality of ["fast", "balanced", "high"]) {
+  if (optimization.qualities?.[quality]?.automaticOptimizationOn?.loopDetection !== true) {
+    throw new Error(`${quality} must enable optimized-video loop detection by default.`);
+  }
+}
 
-console.log("Verified complete COLMAP runtime mappings, retained offline vocabulary, and unchanged matching behavior.");
+console.log("Verified complete COLMAP runtimes, retained offline vocabulary, and loop-detection defaults for all three tiers.");

@@ -60,6 +60,7 @@ export class ViewerControls {
     cameraEntity: Entity,
     private readonly onOrthographicViewChange?: (view: GaussianOrthographicView | null) => void,
     cameraError = "The preview camera component is unavailable",
+    private readonly onViewChange?: () => void,
   ) {
     if (!cameraEntity.camera) throw new Error(cameraError);
     this.canvas = canvas;
@@ -144,6 +145,7 @@ export class ViewerControls {
     this.camera.projection = state.projection;
     this.camera.orthoHeight = state.orthoHeight;
     this.orthographicView = state.orthographicView;
+    this.onOrthographicViewChange?.(state.orthographicView);
     this.updateCamera();
   }
 
@@ -163,6 +165,10 @@ export class ViewerControls {
 
   setSceneBounds(bounds: BoundingBox) {
     this.sceneBounds = bounds.clone();
+    if (!this.enabled && this.transitioning) {
+      this.updateClipPlanes(this.cameraEntity.getPosition(), this.cameraEntity.forward);
+      return;
+    }
     this.cancelViewTransition();
     this.updateCamera();
   }
@@ -199,18 +205,27 @@ export class ViewerControls {
     this.camera.orthoHeight = destinationOrthoHeight;
     this.distance = destinationDistance;
     this.horizontalFrameOffset = 0;
+    this.onViewChange?.();
     if (!animate || this.destroyed) {
       this.updateCamera();
       return;
     }
 
     this.transitioning = true;
-    const startedAt = performance.now();
+    let startedAt = performance.now();
+    let previousFrameAt = startedAt;
     const position = new Vec3();
     const lookTarget = new Vec3();
     const up = new Vec3();
     const tick = (now: number) => {
       if (this.destroyed || !this.transitioning) return;
+      if (!this.enabled) {
+        startedAt += now - previousFrameAt;
+        previousFrameAt = now;
+        this.transitionFrame = requestAnimationFrame(tick);
+        return;
+      }
+      previousFrameAt = now;
       const linear = Math.min(1, Math.max(0, (now - startedAt) / VIEW_TRANSITION_MS));
       const progress = 1 - Math.pow(1 - linear, 3);
       position.lerp(startPosition, destinationPosition, progress);
@@ -226,6 +241,7 @@ export class ViewerControls {
         this.transitioning = false;
         this.transitionFrame = 0;
         this.updateCamera();
+        this.onViewChange?.();
       }
     };
     this.transitionFrame = requestAnimationFrame(tick);
@@ -425,6 +441,7 @@ export class ViewerControls {
     if (this.pointerId !== event.pointerId) return;
     if (this.canvas.hasPointerCapture(event.pointerId)) this.canvas.releasePointerCapture(event.pointerId);
     this.cancelGesture();
+    this.onViewChange?.();
   };
 
   private onWheel = (event: WheelEvent) => {
@@ -438,5 +455,6 @@ export class ViewerControls {
       this.distance = Math.max(0.01, Math.min(1_000_000, this.distance * Math.exp(delta * 0.001)));
     }
     this.updateCamera();
+    this.onViewChange?.();
   };
 }

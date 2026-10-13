@@ -449,6 +449,148 @@ impl PipelineRunner {
         self
     }
 
+    pub(crate) fn record_frame_metrics(
+        &self,
+        state: &PipelineStateFile,
+        selected_count: u64,
+        plan: Option<&FramePlan>,
+    ) {
+        let Some(tracker) = &self.effectiveness else {
+            return;
+        };
+        let (source_width, source_height, source_item_count) =
+            match (state.video.as_ref(), state.image_sequence.as_ref()) {
+                (Some(video), _) => (
+                    u64::from(video.width),
+                    u64::from(video.height),
+                    video.total_frames,
+                ),
+                (_, Some(images)) => (
+                    u64::from(images.width),
+                    u64::from(images.height),
+                    images.image_count,
+                ),
+                _ => return,
+            };
+        let frames = state.frames.as_ref();
+        let is_reshoot = state.reshoot.is_some();
+        let is_planned_video = state.planner_enabled && state.video.is_some();
+        let initial_selected_count = if is_reshoot {
+            selected_count
+        } else {
+            frames
+                .map(|frames| frames.initial_extracted_frames)
+                .filter(|count| *count > 0)
+                .unwrap_or(selected_count)
+        };
+        let has_candidates = is_planned_video && !is_reshoot;
+        let candidate_count = if has_candidates {
+            plan.map(|plan| plan.candidate_frames.len() as u64)
+                .or_else(|| frames.map(|frames| frames.candidate_frames.len() as u64))
+                .filter(|count| *count > 0)
+                .unwrap_or(initial_selected_count)
+        } else {
+            initial_selected_count
+        };
+        let preset = state.preset.preset();
+        let effective_fps = |count| {
+            state
+                .video
+                .as_ref()
+                .map(|video| count as f64 / video.duration.max(0.001))
+        };
+        tracker.record_frame_plan(PlannerFramePlanMetrics {
+            source_width,
+            source_height,
+            source_item_count,
+            configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
+            configured_candidate_fps: has_candidates.then_some(preset.rescue_max_fps).flatten(),
+            effective_target_fps: effective_fps(initial_selected_count),
+            effective_candidate_fps: (!is_reshoot)
+                .then(|| effective_fps(candidate_count))
+                .flatten(),
+            initial_selected_count,
+            candidate_count,
+            minimum_frame_override_applied: is_planned_video
+                && if is_reshoot {
+                    state.video.as_ref().is_some_and(|video| {
+                        preset.initial_fps.is_some_and(|fps| {
+                            crate::video::minimum_selected_frames() as f64
+                                / video.duration.max(0.001)
+                                > fps
+                        })
+                    })
+                } else {
+                    plan.map(|plan| plan.minimum_frame_override_applied)
+                        .or_else(|| frames.map(|frames| frames.minimum_frame_override_applied))
+                        .unwrap_or(false)
+                },
+            minimum_frame_target_unreachable: is_planned_video
+                && source_item_count < crate::video::minimum_selected_frames(),
+        });
+    }
+
+    pub(crate) fn record_reconstruction_metrics(
+        &self,
+        report: &ReconstructionReport,
+        acceleration: &crate::engines::ColmapAccelerationStatus,
+        allow_two_view_tracks: bool,
+        is_reshoot: bool,
+    ) {
+        let Some(tracker) = &self.effectiveness else {
+            return;
+        };
+        tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
+            PlannerGpuVendor::Nvidia
+        } else if cfg!(target_os = "macos") {
+            PlannerGpuVendor::Apple
+        } else {
+            PlannerGpuVendor::Unknown
+        });
+        tracker.record_initial_reconstruction(PlannerInitialReconstructionMetrics {
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            points_3d: report.points_3d,
+            backend: acceleration.backend,
+            allow_two_view_tracks,
+        });
+        if is_reshoot {
+            tracker.record_bridge(PlannerBridgeMetrics {
+                status: PlannerBridgeStatus::NotApplicable,
+                trigger_ratio: bridge_trigger_ratio(),
+                initial_input_images: report.input_images,
+                initial_registered_images: report.registered_images,
+                initial_points_3d: report.points_3d,
+                final_input_images: report.input_images,
+                final_registered_images: report.registered_images,
+                final_points_3d: report.points_3d,
+                ..Default::default()
+            });
+        }
+    }
+
+    pub(crate) fn record_brush_metrics(&self, state: &PipelineStateFile) {
+        if let Some(tracker) = &self.effectiveness {
+            tracker.restore_brush(
+                state.brush_training.initial_resolved,
+                state.brush_training.resolved,
+                state.brush_training.oom_retry_used,
+            );
+        }
+    }
+
+    pub(crate) fn record_final_metrics(&self, output: &ProjectOutput) {
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_final_result(PlannerFinalResultMetrics {
+                input_images: output.input_images,
+                registered_images: output.registered_images,
+                points_3d: output.points_3d,
+                splat_count: output.splat_count,
+                ply_size_bytes: output.file_size,
+            });
+        }
+    }
+
     pub fn with_workspace_task_id(mut self, workspace_task_id: Option<uuid::Uuid>) -> Self {
         self.workspace_task_id = workspace_task_id;
         self
@@ -1494,6 +1636,7 @@ impl PipelineRunner {
                     })
                     .await
                     .map_err(|error| SplatError::Process(format!("补拍图片扫描失败：{error}")))??;
+                    state.image_sequence = Some(scan.info.clone());
                     let frames = paths.frames.clone();
                     let colmap_frames = paths.colmap_frames.clone();
                     let masks = reshoot_masks.clone();
@@ -1561,6 +1704,7 @@ impl PipelineRunner {
                         &self.process_manager,
                     )
                     .await?;
+                    state.video = Some(supplemental_video.clone());
                     let target_width = u32::try_from(provenance.width).map_err(|_| {
                         SplatError::Process("Reshoot target width exceeds supported range".into())
                     })?;
@@ -1653,6 +1797,7 @@ impl PipelineRunner {
             );
             prepared
         };
+        self.record_frame_metrics(&state, prepared.image_count, None);
         let reshoot_names = image_names_with_prefix(&paths.colmap_frames, "reshoot_").await?;
         write_image_list(&reshoot_list, &reshoot_names).await?;
 
@@ -1783,6 +1928,8 @@ impl PipelineRunner {
         }
 
         let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+        // Incremental Mapper does not enable two-view tracks or bridge backfill.
+        self.record_reconstruction_metrics(&report, acceleration, false, true);
         let model_copy = model.clone();
         let registered_reshoot_count =
             crate::presets::spawn_pipeline_blocking(move || read_registered_images(&model_copy))
@@ -1809,6 +1956,7 @@ impl PipelineRunner {
             state.brush_complete = false;
         }
         let candidate = if state.brush_complete {
+            self.record_brush_metrics(&state);
             brush_candidate(&paths.brush)
                 .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失".into()))?
         } else {
@@ -1827,7 +1975,14 @@ impl PipelineRunner {
                     report.points_3d,
                 )
             });
+            if !state.brush_training.oom_retry_used {
+                state
+                    .brush_training
+                    .initial_resolved
+                    .get_or_insert(resolved_brush);
+            }
             state.brush_training.resolved = Some(resolved_brush);
+            self.record_brush_metrics(&state);
             project_manager.write_state(&paths.state, &state).await?;
             self.events.send(
                 PipelineStage::TrainingSplats,
@@ -1892,6 +2047,9 @@ impl PipelineRunner {
         project_manager
             .write_metadata(&paths.metadata, metadata)
             .await?;
+        if let Some(output) = &metadata.output {
+            self.record_final_metrics(output);
+        }
         self.events
             .stage(PipelineStage::Completed, 1.0, "高清补拍处理完成");
         Ok(PipelineResult {
@@ -2030,58 +2188,7 @@ impl PipelineRunner {
                 prepared
             };
         let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
-        if let Some(tracker) = &self.effectiveness {
-            let (source_width, source_height, source_item_count) =
-                match (prepared.video.as_ref(), prepared.image_sequence.as_ref()) {
-                    (Some(video), _) => (
-                        u64::from(video.width),
-                        u64::from(video.height),
-                        video.total_frames,
-                    ),
-                    (_, Some(images)) => (
-                        u64::from(images.width),
-                        u64::from(images.height),
-                        images.image_count,
-                    ),
-                    _ => (0, 0, prepared.extracted_frames),
-                };
-            let preset = quality.preset();
-            let is_planned_video = state.planner_enabled && prepared.video.is_some();
-            let initial_selected_count = state
-                .frames
-                .as_ref()
-                .map(|frames| frames.initial_extracted_frames)
-                .filter(|count| *count > 0)
-                .unwrap_or(prepared.extracted_frames);
-            let candidate_count = if is_planned_video {
-                prepared.plan.candidate_frames.len() as u64
-            } else {
-                initial_selected_count
-            };
-            tracker.record_frame_plan(PlannerFramePlanMetrics {
-                source_width,
-                source_height,
-                source_item_count,
-                configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
-                configured_candidate_fps: is_planned_video
-                    .then_some(preset.rescue_max_fps)
-                    .flatten(),
-                effective_target_fps: prepared
-                    .video
-                    .as_ref()
-                    .map(|video| initial_selected_count as f64 / video.duration.max(0.001)),
-                effective_candidate_fps: prepared
-                    .video
-                    .as_ref()
-                    .map(|video| candidate_count as f64 / video.duration.max(0.001)),
-                initial_selected_count,
-                candidate_count,
-                minimum_frame_override_applied: is_planned_video
-                    && prepared.plan.minimum_frame_override_applied,
-                minimum_frame_target_unreachable: is_planned_video
-                    && source_item_count < crate::video::minimum_selected_frames(),
-            });
-        }
+        self.record_frame_metrics(&state, prepared.extracted_frames, Some(&prepared.plan));
 
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
@@ -2197,6 +2304,8 @@ impl PipelineRunner {
             );
         }
 
+        let loop_detection = prepared.input_type == ProjectInputType::Video
+            && quality.loop_detection_enabled(state.planner_enabled);
         if state.matching_complete {
             self.events.stage(
                 PipelineStage::Matching,
@@ -2215,6 +2324,8 @@ impl PipelineRunner {
                     "COLMAP 正在进行 {backend_label} {}",
                     if prepared.input_type == ProjectInputType::Images {
                         "穷举匹配"
+                    } else if loop_detection {
+                        "顺序匹配（已开启闭环检测）"
                     } else {
                         "顺序匹配"
                     }
@@ -2244,6 +2355,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    loop_detection,
                 )
                 .await?;
             }
@@ -2255,6 +2367,8 @@ impl PipelineRunner {
                 1.0,
                 if prepared.input_type == ProjectInputType::Images {
                     "穷举匹配完成"
+                } else if loop_detection {
+                    "顺序匹配（已开启闭环检测）完成"
                 } else {
                     "顺序匹配完成"
                 },
@@ -2318,22 +2432,12 @@ impl PipelineRunner {
             .unwrap_or(prepared.extracted_frames);
         let (initial_model, initial_report) =
             best_sparse_model_with_input_count(&sparse, initial_input_images).await?;
-        if let Some(tracker) = &self.effectiveness {
-            tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
-                PlannerGpuVendor::Nvidia
-            } else if cfg!(target_os = "macos") {
-                PlannerGpuVendor::Apple
-            } else {
-                PlannerGpuVendor::Unknown
-            });
-            tracker.record_initial_reconstruction(PlannerInitialReconstructionMetrics {
-                input_images: initial_report.input_images,
-                registered_images: initial_report.registered_images,
-                points_3d: initial_report.points_3d,
-                backend: acceleration.backend,
-                allow_two_view_tracks,
-            });
-        }
+        self.record_reconstruction_metrics(
+            &initial_report,
+            acceleration,
+            allow_two_view_tracks,
+            false,
+        );
         let initial_report_for_metrics = initial_report.clone();
         let (model, report) = self
             .maybe_run_bridge_backfill(
@@ -2404,18 +2508,7 @@ impl PipelineRunner {
         );
 
         let candidate = if state.brush_complete {
-            if let Some(tracker) = &self.effectiveness {
-                if let Some(initial) = state
-                    .brush_training
-                    .initial_resolved
-                    .or(state.brush_training.resolved)
-                {
-                    tracker.record_brush(initial, false);
-                }
-                if let Some(resolved) = state.brush_training.resolved {
-                    tracker.record_brush(resolved, state.brush_training.oom_retry_used);
-                }
-            }
+            self.record_brush_metrics(&state);
             self.events.stage(
                 PipelineStage::TrainingSplats,
                 1.0,
@@ -2460,17 +2553,14 @@ impl PipelineRunner {
                     },
                 )
             });
-            state
-                .brush_training
-                .initial_resolved
-                .get_or_insert(resolved_brush);
-            state.brush_training.resolved = Some(resolved_brush);
-            if let Some(tracker) = &self.effectiveness {
-                if let Some(initial) = state.brush_training.initial_resolved {
-                    tracker.record_brush(initial, false);
-                }
-                tracker.record_brush(resolved_brush, state.brush_training.oom_retry_used);
+            if !state.brush_training.oom_retry_used {
+                state
+                    .brush_training
+                    .initial_resolved
+                    .get_or_insert(resolved_brush);
             }
+            state.brush_training.resolved = Some(resolved_brush);
+            self.record_brush_metrics(&state);
             project_manager.write_state(&paths.state, &state).await?;
             let runtime_samples = catalog::runtime_samples().await;
             let estimated_brush_duration_ms = match (&prepared.video, &prepared.image_sequence) {
@@ -2564,14 +2654,8 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, metadata)
             .await?;
 
-        if let Some(tracker) = &self.effectiveness {
-            tracker.record_final_result(PlannerFinalResultMetrics {
-                input_images: report.input_images,
-                registered_images: report.registered_images,
-                points_3d: report.points_3d,
-                splat_count: ply.splat_count,
-                ply_size_bytes: ply.file_size,
-            });
+        if let Some(output) = &metadata.output {
+            self.record_final_metrics(output);
         }
 
         self.events.stage(
@@ -4536,6 +4620,22 @@ mod tests {
                 source.resolution_policy_version
             );
         }
+    }
+
+    #[test]
+    fn missing_checkpoint_metrics_stay_unknown() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let state = PipelineStateFile::created(Quality::High);
+        runner.record_frame_metrics(&state, 30, None);
+        runner.record_brush_metrics(&state);
+        let snapshot = tracker.snapshot();
+        assert!(snapshot.frame_plan.is_none());
+        assert!(snapshot.initial_reconstruction.is_none());
+        assert!(snapshot.bridge.is_none());
+        assert!(snapshot.brush.is_none());
+        assert!(snapshot.final_result.is_none());
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Download, FileCode2, Film } from "lucide-react";
+import { ChevronDown, Download, FileCode2, Film, Box } from "lucide-react";
 import { useI18n } from "../../i18n";
 import type { VideoOrientation } from "../../types/pipeline";
 export function PreviewOrientationControl({ orientation, disabled, onChange }: {
@@ -12,13 +12,14 @@ export function PreviewOrientationControl({ orientation, disabled, onChange }: {
     {(["portrait", "landscape"] as const).map(value => <button key={value} type="button" className={orientation === value ? "active" : ""} aria-pressed={orientation === value} disabled={disabled} onClick={() => onChange(value)}>{t(value === "portrait" ? "export.portrait" : "export.landscape")}</button>)}
   </div>;
 }
-export function PreviewExportMenu({ mode, disabled, videoSupported, videoReason, onVideo, onHtml }: {
+export function PreviewExportMenu({ mode, disabled, videoSupported, videoReason, onVideo, onHtml, onPly }: {
     mode: "adjust" | "preview";
     disabled: boolean;
     videoSupported: boolean;
     videoReason: string | null;
     onVideo: () => void;
     onHtml: () => void;
+    onPly: () => void;
 }) {
     const { t } = useI18n();
     const [open, setOpen] = useState(false);
@@ -33,6 +34,7 @@ export function PreviewExportMenu({ mode, disabled, videoSupported, videoReason,
     {open && <>
       <button type="button" className="export-menu-dismiss" aria-label={t("common.close")} onClick={close}/>
       <div id="preview-export-options" className="preview-export-options">
+        <button type="button" onClick={() => { close(); onPly(); }}><Box size={14}/>{t("export.ply")}</button>
         {mode === "preview" && <button type="button" disabled={!videoSupported} title={videoReason ?? undefined} onClick={() => { close(); onVideo(); }}><Film size={14}/>{t("export.video")}</button>}
         <button type="button" onClick={() => { close(); onHtml(); }}><FileCode2 size={14}/>{t("export.html")}</button>
       </div>

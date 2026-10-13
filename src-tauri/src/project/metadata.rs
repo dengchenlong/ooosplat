@@ -65,8 +65,18 @@ impl GaussianTransform {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum GaussianCrop {
-    Sphere { center: [f64; 3], radius: f64 },
-    Box { center: [f64; 3], size: [f64; 3] },
+    Sphere {
+        center: [f64; 3],
+        radius: f64,
+        #[serde(default)]
+        inverted: bool,
+    },
+    Box {
+        center: [f64; 3],
+        size: [f64; 3],
+        #[serde(default)]
+        inverted: bool,
+    },
 }
 
 impl GaussianCrop {
@@ -74,8 +84,8 @@ impl GaussianCrop {
         let valid_vector = |values: &[f64; 3]| values.iter().all(|value| value.is_finite());
         let valid_extent = |value: f64| value.is_finite() && (0.000_001..=1.0e12).contains(&value);
         let valid = match self {
-            Self::Sphere { center, radius } => valid_vector(&center) && valid_extent(radius),
-            Self::Box { center, size } => {
+            Self::Sphere { center, radius, .. } => valid_vector(&center) && valid_extent(radius),
+            Self::Box { center, size, .. } => {
                 valid_vector(&center) && size.iter().all(|value| valid_extent(*value))
             }
         };
@@ -89,19 +99,31 @@ impl GaussianCrop {
 
     pub fn contains(self, point: [f64; 3]) -> bool {
         match self {
-            Self::Sphere { center, radius } => {
-                point
+            Self::Sphere {
+                center,
+                radius,
+                inverted,
+            } => {
+                let inside = point
                     .iter()
                     .zip(center)
                     .map(|(value, origin)| (value - origin).powi(2))
                     .sum::<f64>()
-                    <= radius * radius
+                    <= radius * radius;
+                inside != inverted
             }
-            Self::Box { center, size } => point
-                .iter()
-                .zip(center)
-                .zip(size)
-                .all(|((value, origin), extent)| (value - origin).abs() <= extent * 0.5),
+            Self::Box {
+                center,
+                size,
+                inverted,
+            } => {
+                let inside = point
+                    .iter()
+                    .zip(center)
+                    .zip(size)
+                    .all(|((value, origin), extent)| (value - origin).abs() <= extent * 0.5);
+                inside != inverted
+            }
         }
     }
 }
@@ -548,11 +570,13 @@ mod tests {
         let crop = GaussianCrop::Sphere {
             center: [0.0, 1.0, 2.0],
             radius: 4.0,
+            inverted: false,
         };
         assert!(crop.validate().is_ok());
         assert!(GaussianCrop::Box {
             center: [0.0; 3],
             size: [1.0, 0.0, 1.0],
+            inverted: false,
         }
         .validate()
         .is_err());
@@ -564,5 +588,22 @@ mod tests {
         }
         .validate(9)
         .is_err());
+    }
+
+    #[test]
+    fn inverted_crops_keep_the_complement_and_old_projects_default_to_inside() {
+        for json in [
+            r#"{"kind":"sphere","center":[0,0,0],"radius":1}"#,
+            r#"{"kind":"box","center":[0,0,0],"size":[2,2,2]}"#,
+        ] {
+            let normal: GaussianCrop = serde_json::from_str(json).unwrap();
+            let inverted: GaussianCrop =
+                serde_json::from_str(&json.replace('}', ",\"inverted\":true}")).unwrap();
+            assert!(normal.contains([0.0, 0.0, 0.0]));
+            assert!(!inverted.contains([0.0, 0.0, 0.0]));
+            assert!(!normal.contains([3.0, 0.0, 0.0]));
+            assert!(inverted.contains([3.0, 0.0, 0.0]));
+            assert!(inverted.validate().is_ok());
+        }
     }
 }

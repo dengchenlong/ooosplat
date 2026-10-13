@@ -38,6 +38,7 @@ function setup() {
     lookAt,
     right: new Vec3(1, 0, 0),
     up: new Vec3(0, 1, 0),
+    forward: new Vec3(0, 0, -1),
   } as unknown as Entity;
   const onOrthographicViewChange = vi.fn();
   const controls = new ViewerControls(canvas, entity, onOrthographicViewChange);
@@ -145,27 +146,50 @@ describe("ViewerControls", () => {
     controls.destroy();
   });
 
-  it("animates between orthographic editing views", () => {
+  it("restores the orthographic view indicator with the camera", () => {
+    const { controls, onOrthographicViewChange } = setup();
+    controls.alignOrthographic("top", new BoundingBox(new Vec3(1, 2, 3), new Vec3(2, 3, 4)), 0.85, false);
+    const saved = controls.snapshot();
+    controls.usePerspective();
+    controls.restore(saved);
+    expect(controls.snapshot()).toEqual(saved);
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith("top");
+    controls.destroy();
+  });
+
+  it("animates between orthographic views and pauses the transition while the model gizmo owns input", () => {
     const frames: FrameRequestCallback[] = [];
     const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
       frames.push(callback);
       return frames.length;
     });
     const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
     const { camera, controls, setPosition } = setup();
     const before = setPosition.mock.calls.length;
 
     controls.alignOrthographic("side", new BoundingBox(new Vec3(2, 3, 4), new Vec3(5, 6, 7)));
     expect(camera.projection).toBe(PROJECTION_ORTHOGRAPHIC);
     expect(frames).toHaveLength(1);
-    frames.shift()?.(performance.now() + 160);
+    frames.shift()?.(1160);
     expect(setPosition.mock.calls.length).toBeGreaterThan(before);
     expect(frames).toHaveLength(1);
-    frames.shift()?.(performance.now() + 1_000);
+    controls.enabled = false;
+    const pausedUpdates = setPosition.mock.calls.length;
+    frames.shift()?.(2160);
+    controls.setSceneBounds(new BoundingBox(new Vec3(2, 3, 4), new Vec3(6, 7, 8)));
+    frames.shift()?.(3160);
+    expect(setPosition).toHaveBeenCalledTimes(pausedUpdates);
+    expect(frames).toHaveLength(1);
+    controls.enabled = true;
+    frames.shift()?.(3320);
+    expect(setPosition.mock.calls.length).toBeGreaterThan(pausedUpdates);
+    expect(frames).toHaveLength(0);
 
     controls.destroy();
     request.mockRestore();
     cancel.mockRestore();
+    clock.mockRestore();
   });
 
   it("returns to perspective and clears the selected view when orbiting", () => {

@@ -119,12 +119,17 @@ pub struct QualityPreset {
     pub sfm_max_features: u32,
     pub planned_sfm_max_features: u32,
     pub sfm_allow_two_view_tracks: bool,
+    pub sfm_loop_detection: bool,
     pub brush_iterations: usize,
     pub brush_max_resolution: u32,
     pub brush_densification: Option<BrushDensificationPreset>,
 }
 
 impl Quality {
+    pub fn loop_detection_enabled(self, planner_enabled: bool) -> bool {
+        planner_enabled && self.preset().sfm_loop_detection
+    }
+
     pub fn preset(self) -> QualityPreset {
         let config = pipeline_optimization_config();
         let quality = config.qualities.get(self);
@@ -140,6 +145,7 @@ impl Quality {
             sfm_max_features: legacy.sfm_max_features,
             planned_sfm_max_features: automatic.sfm_max_features,
             sfm_allow_two_view_tracks: automatic.allow_two_view_tracks,
+            sfm_loop_detection: automatic.loop_detection,
             brush_iterations: legacy.brush.total_steps,
             brush_max_resolution: legacy.brush.max_resolution,
             brush_densification: automatic_brush.densification,

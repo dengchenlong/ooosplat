@@ -10,6 +10,7 @@ import type { ProjectSummary } from "../types/pipeline";
 
 const mocks = vi.hoisted(() => ({
   cancelPipeline: vi.fn(),
+  checkAppUpdate: vi.fn(),
   estimateProjectRuntime: vi.fn(),
   exportPly: vi.fn(),
   prepareGaussianPreview: vi.fn(),
@@ -40,6 +41,8 @@ const mocks = vi.hoisted(() => ({
   classifyDroppedInput: vi.fn(),
   onInputDragDrop: vi.fn(),
 }));
+
+vi.mock("../lib/updates", () => ({ checkAppUpdate: mocks.checkAppUpdate, copyUpdateText: vi.fn() }));
 
 vi.mock("../lib/backend", () => ({
   cancelPipeline: mocks.cancelPipeline,
@@ -128,6 +131,7 @@ describe("App preview workspace", () => {
       window.cancelAnimationFrame = (handle) => window.clearTimeout(handle);
     }
     useGaussianTransformStore.getState().close();
+    mocks.checkAppUpdate.mockReset().mockResolvedValue(null);
     mocks.getSharedTasks.mockReset().mockResolvedValue([]);
     mocks.onTaskUpdate.mockReset().mockResolvedValue(() => undefined);
     useAppStore.setState({
@@ -236,7 +240,7 @@ describe("App preview workspace", () => {
 
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
-    expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.6.0");
+    expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.6.1");
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
@@ -805,6 +809,27 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(container.querySelector(".preview-workspace")).not.toBeNull();
+  });
+
+  it("defers a late startup update until preview closes without remounting the viewer", async () => {
+    let resolve!: (value: unknown) => void;
+    mocks.checkAppUpdate.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await act(async () => root.render(<LanguageProvider><App /></LanguageProvider>));
+    await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>(".preview-link")!.click());
+    await flush();
+    const viewer = container.querySelector(".preview-workspace");
+    await act(async () => resolve({ currentVersion: "0.6.0", status: "updateAvailable", checkedAt: "2026-10-11T08:00:00Z", fromCache: true,
+      release: { version: "0.6.1", publishedAt: "2026-10-11T08:00:00Z", notes: { "zh-CN": ["更新"], en: ["Update"] },
+        downloads: { github: "https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1", quark: null, quarkCode: null } } }));
+    expect(container.querySelector(".preview-workspace")).toBe(viewer);
+    expect(container.querySelector(".update-notice-dialog")).toBeNull();
+    const back = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "返回任务")!;
+    await act(async () => back.click());
+    await flush();
+    expect(container.querySelector(".update-notice-dialog")).not.toBeNull();
   });
 
   it("keeps the reshoot entry away from unfinished projects", async () => {

@@ -101,12 +101,15 @@ uniform float uOoosplatCropKind;
 uniform vec3 uOoosplatCropCenter;
 uniform vec3 uOoosplatCropSize;
 uniform float uOoosplatCropRadius;
+uniform float uOoosplatCropInverted;
 uniform float uOoosplatShowSelection;
 
 bool ooosplatCropContains(vec3 center) {
     if (uOoosplatCropKind < 0.5) return true;
-    if (uOoosplatCropKind < 1.5) return distance(center, uOoosplatCropCenter) <= uOoosplatCropRadius;
-    return all(lessThanEqual(abs(center - uOoosplatCropCenter), uOoosplatCropSize * 0.5));
+    bool inside = uOoosplatCropKind < 1.5
+        ? distance(center, uOoosplatCropCenter) <= uOoosplatCropRadius
+        : all(lessThanEqual(abs(center - uOoosplatCropCenter), uOoosplatCropSize * 0.5));
+    return uOoosplatCropInverted > 0.5 ? !inside : inside;
 }
 
 bool ooosplatIsDeletedOrCropped(vec3 center) {
@@ -229,16 +232,19 @@ uniform uOoosplatCropKind: f32;
 uniform uOoosplatCropCenter: vec3f;
 uniform uOoosplatCropSize: vec3f;
 uniform uOoosplatCropRadius: f32;
+uniform uOoosplatCropInverted: f32;
 uniform uOoosplatShowSelection: f32;
 
 fn ooosplatCropContains(center: vec3f) -> bool {
     if (uniform.uOoosplatCropKind < 0.5) {
         return true;
     }
-    if (uniform.uOoosplatCropKind < 1.5) {
-        return distance(center, uniform.uOoosplatCropCenter) <= uniform.uOoosplatCropRadius;
-    }
-    return all(abs(center - uniform.uOoosplatCropCenter) <= uniform.uOoosplatCropSize * 0.5);
+    let inside = select(
+        all(abs(center - uniform.uOoosplatCropCenter) <= uniform.uOoosplatCropSize * 0.5),
+        distance(center, uniform.uOoosplatCropCenter) <= uniform.uOoosplatCropRadius,
+        uniform.uOoosplatCropKind < 1.5
+    );
+    return select(inside, !inside, uniform.uOoosplatCropInverted > 0.5);
 }
 
 fn ooosplatIsDeletedOrCropped(center: vec3f) -> bool {

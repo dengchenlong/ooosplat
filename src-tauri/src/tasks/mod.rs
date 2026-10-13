@@ -9,6 +9,7 @@ pub use notifications::TaskView;
 use crate::{
     engines::EnginePaths,
     pipeline::{
+        effectiveness::PlannerEffectivenessTracker,
         runner::{PipelineResult, PipelineRunner, ReshootInputType, RunnerUpdate},
         PipelineEvent, PipelineStage,
     },
@@ -203,6 +204,7 @@ struct Registry {
 pub(crate) type TestExecutor = Arc<
     dyn Fn(
             TaskRecord,
+            Arc<PipelineRunner>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = crate::error::Result<PipelineResult>> + Send>,
         > + Send
@@ -794,6 +796,7 @@ impl TaskService {
         let run_id = Uuid::new_v4();
         let service = self.clone();
         let lifecycle = self.clone();
+        let effectiveness = PlannerEffectivenessTracker::default();
         let session = telemetry.map(|telemetry| {
             Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
                 telemetry,
@@ -809,7 +812,7 @@ impl TaskService {
                     TelemetryRunKind::New
                 },
                 task.planner_enabled,
-                Default::default(),
+                effectiveness.clone(),
             ))
         });
         let observe = session.clone();
@@ -820,6 +823,7 @@ impl TaskService {
                 }
                 service.on_event(id, run_id, event);
             })
+            .with_effectiveness_tracker(effectiveness)
             .with_workspace_task_id(Some(id))
             .with_input_boundary(
                 (task.source.as_deref() == Some("mcp")).then(|| task.input_path.clone()),
@@ -895,7 +899,7 @@ impl TaskService {
                 async move {
                     #[cfg(test)]
                     if let Some(executor) = test_executor {
-                        return executor(execution).await;
+                        return executor(execution, execute_runner).await;
                     }
                     if let Some(project) = execution.project_id {
                         execute_runner.resume(project).await

@@ -19,7 +19,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let release = Arc::new(tokio::sync::Notify::new());
     let worker_release = release.clone();
-    *tasks.executor.lock().unwrap() = Some(Arc::new(move |_| {
+    *tasks.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
         let release = worker_release.clone();
         Box::pin(async move {
             release.notified().await;

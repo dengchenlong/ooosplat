@@ -10,7 +10,7 @@ import { useSharedTasks } from "./useSharedTasks";
 import { useProgressMessage } from "./useProgressMessage";
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu,
+  BellDot, Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu,
   FolderOpen, Images, Languages, LoaderCircle, Minus, Play, Plus, RotateCcw, Settings2,
   Send, Upload, X, Zap, Lock,
 } from "lucide-react";
@@ -18,6 +18,8 @@ import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import { SettingsDialog } from "../components/SettingsDialog";
+import { UpdateNoticeDialog, UpdateSettingsRow } from "../components/UpdateNotice";
+import { useUpdateNotice } from "./useUpdateNotice";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import {
@@ -321,6 +323,11 @@ export function App() {
   const [showZoomControls, setShowZoomControls] = useState(false);
   const [telemetryPreferences, setTelemetryPreferences] = useState<TelemetryPreferencesState | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const updates = useUpdateNotice();
+  const checkUpdatesManually = async () => {
+    const result = await updates.check(true);
+    if (result?.status === "updateAvailable") setSettingsOpen(false);
+  };
   const [uiPreferences, setUiPreferences] = useState(loadUiPreferences);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
@@ -1653,6 +1660,7 @@ export function App() {
       <div className="brand-lockup"><span className="brand-mark"><img src={appLogo} alt="" aria-hidden="true" /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / {packageMetadata.version}</span></div>
       <div className="topbar-actions">
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
+        {updates.release && <button className="settings-action update-notice-action" type="button" onClick={updates.open}><BellDot size={15} />{t("update.found")}</button>}
         <button className="settings-action" type="button" onClick={() => setSettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>
         <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
       </div>
@@ -1907,6 +1915,7 @@ export function App() {
     </div>}
     {failureDialog && <FailureGuidanceDialog failure={failureDialog} action={failureDialogAction} onClose={closeFailureDialog} onRetry={() => void retryFailedProject()} onOpenLogs={() => void openFailureLogs()} />}
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
-    {settingsOpen && <SettingsDialog preferences={telemetryPreferences} telemetryBusy={telemetryBusy} showRuntimePanel={uiPreferences.showRuntimePanel} onTelemetryChange={(enabled) => void changeTelemetryConsent(enabled)} onRuntimePanelChange={changeRuntimePanelPreference} onClose={() => setSettingsOpen(false)} />}
+    {settingsOpen && <SettingsDialog preferences={telemetryPreferences} telemetryBusy={telemetryBusy} showRuntimePanel={uiPreferences.showRuntimePanel} onTelemetryChange={(enabled) => void changeTelemetryConsent(enabled)} onRuntimePanelChange={changeRuntimePanelPreference} onClose={() => setSettingsOpen(false)} updatePanel={<UpdateSettingsRow result={updates.result} busy={updates.busy} failed={updates.failed} cooldownSeconds={updates.cooldownSeconds} onCheck={() => void checkUpdatesManually()} />} />}
+    {updates.dialogRequested && updates.release && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
   </main>;
 }
