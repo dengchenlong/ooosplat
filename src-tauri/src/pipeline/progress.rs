@@ -10,7 +10,8 @@ pub fn stage_progress_range(stage: PipelineStage) -> (f32, f32) {
         Matching => (32.0, 45.0),
         Reconstructing => (45.0, 58.0),
         ValidatingReconstruction => (58.0, 60.0),
-        TrainingSplats => (60.0, 98.0),
+        Segment => (60.0, 63.0),
+        TrainingSplats => (63.0, 98.0),
         Exporting => (98.0, 100.0),
         Completed => (100.0, 100.0),
         Failed | Cancelled => (0.0, 0.0),
@@ -33,8 +34,16 @@ mod tests {
             20.0
         );
         assert_eq!(
+            PipelineEvent::mapped(PipelineStage::Segment, 0.0, "").progress,
+            60.0
+        );
+        assert_eq!(
+            PipelineEvent::mapped(PipelineStage::Segment, 1.0, "").progress,
+            63.0
+        );
+        assert_eq!(
             PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.5, "").progress,
-            79.0
+            80.5
         );
         assert_eq!(
             PipelineEvent::mapped(PipelineStage::Failed, 1.0, "").progress,

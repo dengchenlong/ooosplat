@@ -69,6 +69,7 @@ pub enum TelemetryStage {
     Matching,
     Reconstructing,
     ValidatingReconstruction,
+    Segment,
     TrainingSplats,
     Exporting,
     Unknown,
@@ -83,6 +84,7 @@ impl TelemetryStage {
             PipelineStage::Matching => Some(Self::Matching),
             PipelineStage::Reconstructing => Some(Self::Reconstructing),
             PipelineStage::ValidatingReconstruction => Some(Self::ValidatingReconstruction),
+            PipelineStage::Segment => Some(Self::Segment),
             PipelineStage::TrainingSplats => Some(Self::TrainingSplats),
             PipelineStage::Exporting => Some(Self::Exporting),
             PipelineStage::Created

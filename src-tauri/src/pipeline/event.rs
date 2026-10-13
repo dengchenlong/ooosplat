@@ -31,6 +31,7 @@ pub enum PipelineEngine {
     Ffmpeg,
     Colmap,
     Brush,
+    Sam2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,7 +4,9 @@ pub mod event;
 pub mod progress;
 pub mod runner;
 pub mod runtime;
+pub mod segment;
 pub mod state;
 
 pub use event::{EventKind, EventLevel, PipelineEngine, PipelineEvent};
+pub use segment::{prompt_digest, SegmentManifest, SEGMENT_MANIFEST_VERSION};
 pub use state::PipelineStage;

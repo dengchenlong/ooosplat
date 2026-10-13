@@ -11,6 +11,7 @@ pub enum PipelineStage {
     Matching,
     Reconstructing,
     ValidatingReconstruction,
+    Segment,
     TrainingSplats,
     Exporting,
     Completed,
@@ -33,7 +34,8 @@ impl PipelineStage {
                 | (ExtractingFeatures, Matching)
                 | (Matching, Reconstructing)
                 | (Reconstructing, ValidatingReconstruction)
-                | (ValidatingReconstruction, TrainingSplats)
+                | (ValidatingReconstruction, Segment)
+                | (Segment, TrainingSplats)
                 | (TrainingSplats, Exporting)
                 | (Exporting, Completed)
         )
@@ -48,6 +50,10 @@ mod tests {
     fn allows_only_forward_pipeline_transitions() {
         assert!(Created.can_transition_to(ProbingVideo));
         assert!(Matching.can_transition_to(Reconstructing));
+        assert!(ValidatingReconstruction.can_transition_to(Segment));
+        assert!(Segment.can_transition_to(TrainingSplats));
+        assert!(!Segment.can_transition_to(Reconstructing));
+        assert!(Segment.can_transition_to(Failed));
         assert!(TrainingSplats.can_transition_to(Failed));
         assert!(!Matching.can_transition_to(PlanningFrames));
         assert!(!Completed.can_transition_to(Failed));

@@ -176,6 +176,7 @@ impl PlannerStageDurationMetrics {
             PipelineStage::ValidatingReconstruction => {
                 Self::add(&mut self.validating_reconstruction_ms, duration_ms)
             }
+            PipelineStage::Segment => {}
             PipelineStage::TrainingSplats => Self::add(&mut self.training_splats_ms, duration_ms),
             PipelineStage::Exporting => Self::add(&mut self.exporting_ms, duration_ms),
             PipelineStage::Created

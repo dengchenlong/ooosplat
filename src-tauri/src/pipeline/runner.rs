@@ -35,6 +35,7 @@ use crate::{
         },
         progress::stage_progress_range,
         runtime::{RuntimeSnapshot, RuntimeTracker},
+        segment::{prompt_digest, SegmentManifest, SEGMENT_MANIFEST_VERSION},
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
@@ -1216,6 +1217,70 @@ impl PipelineRunner {
             .await
     }
 
+    /// Segment stage (issue #3): per-frame object masks with a
+    /// resume-from-checkpoint contract.
+    ///
+    /// Resume rule — when `state.segment.complete` is set, the persisted
+    /// manifest under `work/segment/` must re-validate against the recorded
+    /// prompt digest; anything inconsistent resets the checkpoint and the
+    /// stage reruns. Until the SAM2 sidecar is wired into the runner
+    /// (issue #5+), the stage records the identity checkpoint (digest over
+    /// the extracted frame set + prompt) and produces no masks, so the
+    /// checkpoint is "no masks requested" rather than synthetic data.
+    async fn run_segment_stage(
+        &self,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        project_manager: &ProjectManager,
+    ) -> Result<()> {
+        let segment_dir = paths.work.join("segment");
+        if state.segment.complete {
+            let digest = state.segment.prompt_digest.clone().unwrap_or_default();
+            match SegmentManifest::load_checked(&segment_dir, &digest).await {
+                Ok(manifest) => {
+                    self.events.stage(
+                        PipelineStage::Segment,
+                        1.0,
+                        format!("已复用分割检查点（{} 帧 mask）", state.segment.mask_count),
+                    );
+                    let _ = manifest;
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Invalid checkpoint: rerun the stage from scratch.
+                    state.segment = Default::default();
+                }
+            }
+        }
+
+        self.events
+            .stage(PipelineStage::Segment, 0.0, "正在准备逐帧分割");
+        let frames_identity = segment_frames_identity(&paths.frames).await?;
+        // Placeholder prompt until the prompt UI (issue #5+) lands; it is part
+        // of the digest so later prompts automatically invalidate old masks.
+        let prompt_json = "default";
+        let digest = prompt_digest(&serde_json::to_string(&serde_json::json!({
+            "frames": frames_identity,
+            "prompt": prompt_json,
+        }))?);
+
+        let manifest = SegmentManifest {
+            version: SEGMENT_MANIFEST_VERSION,
+            prompt_digest: digest.clone(),
+            frames: Vec::new(),
+        };
+        manifest.write(&segment_dir).await?;
+
+        state.segment.complete = true;
+        state.segment.prompt_digest = Some(digest);
+        state.segment.mask_count = manifest.frames.len() as u64;
+        state.stage = PipelineStage::Segment;
+        project_manager.write_state(&paths.state, state).await?;
+        self.events
+            .stage(PipelineStage::Segment, 1.0, "分割阶段完成（0 帧 mask）");
+        Ok(())
+    }
+
     pub async fn resume(&self, project_id: uuid::Uuid) -> Result<PipelineResult> {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
@@ -1462,6 +1527,7 @@ impl PipelineRunner {
             checkpoint.incremental_matching_complete = false;
             checkpoint.incremental_reconstruction_complete = false;
             state.brush_complete = false;
+            state.segment = Default::default();
         }
         let prepared = if checkpoint.supplemental_frames_complete {
             validate_reshoot_image_sequence(
@@ -1736,6 +1802,7 @@ impl PipelineRunner {
         {
             checkpoint.incremental_reconstruction_complete = false;
             state.brush_complete = false;
+            state.segment = Default::default();
         }
         if !checkpoint.incremental_reconstruction_complete {
             let base = base_model.clone();
@@ -2025,6 +2092,7 @@ impl PipelineRunner {
                 state.matching_complete = false;
                 state.reconstruction_complete = false;
                 state.brush_complete = false;
+                state.segment = Default::default();
                 state.stage = PipelineStage::ExtractingFrames;
                 project_manager.write_state(&paths.state, &state).await?;
                 prepared
@@ -2402,6 +2470,9 @@ impl PipelineRunner {
                 report.registered_images, report.input_images, report.points_3d
             ),
         );
+
+        self.run_segment_stage(paths, &mut state, project_manager)
+            .await?;
 
         let candidate = if state.brush_complete {
             if let Some(tracker) = &self.effectiveness {
@@ -4472,6 +4543,20 @@ async fn remove_bridge_outputs(
     }
 }
 
+/// Stable identity of the extracted frame set: sorted frame file names.
+async fn segment_frames_identity(frames_dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut entries = tokio::fs::read_dir(frames_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {
     let dataset = root.join("dataset");
     let images = dataset.join("images");
@@ -4504,6 +4589,78 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn segment_stage_writes_checkpoint_and_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(tmp.path().join("engines")), |_| {});
+        let project_manager = ProjectManager::with_root(tmp.path().join("projects"));
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), tmp.path().join("project"));
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::write(paths.frames.join("000001.png"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.frames.join("000000.png"), b"x")
+            .await
+            .unwrap();
+
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        runner
+            .run_segment_stage(&paths, &mut state, &project_manager)
+            .await
+            .unwrap();
+        assert!(state.segment.complete);
+        assert!(state.segment.prompt_digest.is_some());
+        assert_eq!(state.stage, PipelineStage::Segment);
+        assert!(paths.work.join("segment").join("manifest.json").is_file());
+        let fresh_digest = state.segment.prompt_digest.clone().unwrap();
+
+        // Resume with an intact checkpoint: digest stays identical.
+        let mut resumed = state.clone();
+        resumed.segment.complete = true;
+        runner
+            .run_segment_stage(&paths, &mut resumed, &project_manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.segment.prompt_digest.as_deref(),
+            Some(fresh_digest.as_str())
+        );
+
+        // Resume with a tampered manifest: checkpoint resets and rewrites.
+        let manifest_path = paths.work.join("segment").join("manifest.json");
+        let mut manifest: SegmentManifest =
+            serde_json::from_slice(&tokio::fs::read(&manifest_path).await.unwrap()).unwrap();
+        manifest.prompt_digest = "stale".into();
+        manifest.write(&paths.work.join("segment")).await.unwrap();
+        let mut repaired = state.clone();
+        runner
+            .run_segment_stage(&paths, &mut repaired, &project_manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            repaired.segment.prompt_digest.as_deref(),
+            Some(fresh_digest.as_str())
+        );
+        let healed: SegmentManifest =
+            serde_json::from_slice(&tokio::fs::read(&manifest_path).await.unwrap()).unwrap();
+        assert_eq!(healed.prompt_digest, fresh_digest);
+
+        // Frame set changed: identity digest must change (checkpoint invalidated).
+        tokio::fs::write(paths.frames.join("000002.png"), b"x")
+            .await
+            .unwrap();
+        let mut changed = PipelineStateFile::created(Quality::Balanced);
+        runner
+            .run_segment_stage(&paths, &mut changed, &project_manager)
+            .await
+            .unwrap();
+        assert_ne!(
+            changed.segment.prompt_digest.as_deref(),
+            Some(fresh_digest.as_str())
+        );
+    }
 
     #[test]
     fn reshoot_project_name_uses_the_short_suffix() {
@@ -5623,8 +5780,8 @@ mod tests {
         sink.terminal(&SplatError::Process("boom".into()));
 
         let events = events.lock().unwrap();
-        assert_eq!(events[0].progress, 79.0);
-        assert_eq!(events[1].progress, 79.0);
+        assert_eq!(events[0].progress, 80.5);
+        assert_eq!(events[1].progress, 80.5);
         assert_eq!(events[1].stage_progress, None);
         assert_eq!(events[1].stage, PipelineStage::Failed);
         assert_eq!(

@@ -255,6 +255,7 @@ fn pipeline_stage_from_telemetry(stage: TelemetryStage) -> Option<PipelineStage>
         TelemetryStage::Matching => Some(PipelineStage::Matching),
         TelemetryStage::Reconstructing => Some(PipelineStage::Reconstructing),
         TelemetryStage::ValidatingReconstruction => Some(PipelineStage::ValidatingReconstruction),
+        TelemetryStage::Segment => Some(PipelineStage::Segment),
         TelemetryStage::TrainingSplats => Some(PipelineStage::TrainingSplats),
         TelemetryStage::Exporting => Some(PipelineStage::Exporting),
         TelemetryStage::Unknown => None,
@@ -305,6 +306,7 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
                 Some(TelemetryStage::Reconstructing | TelemetryStage::ValidatingReconstruction) => {
                     TelemetryErrorCode::ColmapMapperFailed
                 }
+                Some(TelemetryStage::Segment) => TelemetryErrorCode::Unknown,
                 Some(TelemetryStage::TrainingSplats) => TelemetryErrorCode::BrushFailed,
                 Some(TelemetryStage::Exporting | TelemetryStage::Unknown) | None => {
                     TelemetryErrorCode::Unknown

@@ -289,6 +289,21 @@ pub struct BrushTrainingCheckpoint {
     pub oom_retry_used: bool,
 }
 
+/// Segment stage (issue #3) checkpoint: when `complete` is true the persisted
+/// mask manifest under `work/segment/` validated against `prompt_digest`, so a
+/// resumed run skips straight to training. Absent on pre-#3 projects, which
+/// simply run without segmentation (serde default keeps old state.json valid).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentCheckpoint {
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_digest: Option<String>,
+    #[serde(default)]
+    pub mask_count: u64,
+}
+
 impl From<&FramePlan> for FrameState {
     fn from(plan: &FramePlan) -> Self {
         Self {
@@ -337,6 +352,8 @@ pub struct PipelineStateFile {
     pub bridge_backfill: BridgeBackfillCheckpoint,
     #[serde(default)]
     pub brush_training: BrushTrainingCheckpoint,
+    #[serde(default)]
+    pub segment: SegmentCheckpoint,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -386,6 +403,7 @@ impl PipelineStateFile {
             resolution_plan: None,
             bridge_backfill: BridgeBackfillCheckpoint::default(),
             brush_training: BrushTrainingCheckpoint::default(),
+            segment: SegmentCheckpoint::default(),
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
