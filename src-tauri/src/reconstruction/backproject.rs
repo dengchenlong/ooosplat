@@ -362,6 +362,116 @@ pub fn vote_splats(
     Ok(outcome)
 }
 
+/// Clustering parameters: eps-neighbor graph over candidate splats, then
+/// components smaller than `min_points` are dropped as outliers
+/// (DBSCAN-style cleanup of isolated false positives).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterConfig {
+    /// World-space maximum distance between neighbouring object splats.
+    pub eps: f64,
+    /// Components with fewer splats than this are treated as background.
+    pub min_points: usize,
+}
+
+/// Connected-component labelling of object candidates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterOutcome {
+    /// Per splat: 0 = background, 1.. = object instance id.
+    pub labels: Vec<i32>,
+    pub cluster_count: usize,
+}
+
+/// Groups voting candidates into spatially connected object instances.
+///
+/// Positions are indexed through a uniform hash grid with cell size `eps`, so
+/// neighbour lookup is O(1) per splat instead of a full O(n²) scan; the vote
+/// vectors, positions and labels stay the only in-memory state.
+pub fn label_object_clusters(
+    positions: &[[f64; 3]],
+    candidates: &[bool],
+    config: &ClusterConfig,
+) -> ClusterOutcome {
+    let mut labels = vec![0_i32; positions.len()];
+    if config.eps <= 0.0 {
+        return ClusterOutcome {
+            labels,
+            cluster_count: 0,
+        };
+    }
+    let eps2 = config.eps * config.eps;
+    let cell = |p: [f64; 3]| -> (i64, i64, i64) {
+        (
+            (p[0] / config.eps).floor() as i64,
+            (p[1] / config.eps).floor() as i64,
+            (p[2] / config.eps).floor() as i64,
+        )
+    };
+    let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, position) in positions.iter().enumerate() {
+        if candidates.get(index).copied().unwrap_or(false) {
+            grid.entry(cell(*position)).or_default().push(index);
+        }
+    }
+    let neighbours_within_eps = |index: usize| -> Vec<usize> {
+        let (cx, cy, cz) = cell(positions[index]);
+        let mut found = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &other in grid.get(&(cx + dx, cy + dy, cz + dz)).into_iter().flatten() {
+                        if other == index {
+                            continue;
+                        }
+                        let delta = [
+                            positions[index][0] - positions[other][0],
+                            positions[index][1] - positions[other][1],
+                            positions[index][2] - positions[other][2],
+                        ];
+                        if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] <= eps2 {
+                            found.push(other);
+                        }
+                    }
+                }
+            }
+        }
+        found
+    };
+
+    let mut cluster_count = 0_usize;
+    for seed in 0..positions.len() {
+        if !candidates.get(seed).copied().unwrap_or(false) || labels[seed] != 0 {
+            continue;
+        }
+        let mut component = vec![seed];
+        labels[seed] = -1; // visiting marker
+        let mut cursor = 0;
+        while cursor < component.len() {
+            for neighbour in neighbours_within_eps(component[cursor]) {
+                if labels[neighbour] == 0 {
+                    labels[neighbour] = -1;
+                    component.push(neighbour);
+                }
+            }
+            cursor += 1;
+        }
+        if component.len() >= config.min_points {
+            cluster_count += 1;
+            for index in component {
+                labels[index] = cluster_count as i32;
+            }
+        } else {
+            for index in component {
+                labels[index] = 0;
+            }
+        }
+    }
+    ClusterOutcome {
+        labels,
+        cluster_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +751,78 @@ mod tests {
         let ply = dir.path().join("cloud.ply");
         write_voting_fixture(&ply, &[(-0.2, 0.0, 10.0)]);
         assert!(vote_splats(&ply, &[], &VoteConfig::default(), 8).is_err());
+    }
+
+    // ---- connected components / DBSCAN cleanup --------------------------
+
+    #[test]
+    fn clusters_candidates_and_drops_outliers() {
+        let positions = [
+            [0.0, 0.0, 0.0], // blob 1 (chain of 3 within eps)
+            [0.05, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [5.0, 5.0, 5.0], // blob 2 (trio within eps)
+            [5.05, 5.0, 5.0],
+            [5.0, 5.05, 5.0],
+            [9.0, 9.0, 9.0],   // lone candidate outlier -> background
+            [0.06, 0.02, 0.0], // near blob 1 but not a candidate -> background
+        ];
+        let candidates = [true, true, true, true, true, true, true, false];
+        let outcome = label_object_clusters(
+            &positions,
+            &candidates,
+            &ClusterConfig {
+                eps: 0.2,
+                min_points: 3,
+            },
+        );
+        println!(
+            "[acceptance] cluster labels: {:?} ({} clusters)",
+            outcome.labels, outcome.cluster_count
+        );
+        assert_eq!(outcome.cluster_count, 2);
+        assert_eq!(outcome.labels[0..3], [1, 1, 1]);
+        assert_eq!(outcome.labels[3..6], [2, 2, 2]);
+        assert_eq!(outcome.labels[6], 0, "outlier cleaned up");
+        assert_eq!(outcome.labels[7], 0, "non-candidate stays background");
+    }
+
+    #[test]
+    fn min_points_drops_small_clusters() {
+        let positions = [[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]];
+        let outcome = label_object_clusters(
+            &positions,
+            &[true, true],
+            &ClusterConfig {
+                eps: 0.2,
+                min_points: 3,
+            },
+        );
+        assert_eq!(outcome.cluster_count, 0);
+        assert_eq!(outcome.labels, vec![0, 0]);
+    }
+
+    #[test]
+    fn eps_boundary_is_respected() {
+        let positions = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]];
+        let outcome = label_object_clusters(
+            &positions,
+            &[true, true],
+            &ClusterConfig {
+                eps: 0.2,
+                min_points: 2,
+            },
+        );
+        // Distance 0.3 > eps 0.2: two separate singletons, both dropped.
+        assert_eq!(outcome.cluster_count, 0);
+        let touching = label_object_clusters(
+            &positions,
+            &[true, true],
+            &ClusterConfig {
+                eps: 0.3,
+                min_points: 2,
+            },
+        );
+        assert_eq!(touching.cluster_count, 1);
     }
 }
