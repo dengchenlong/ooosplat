@@ -8,6 +8,7 @@
 import {
   encodeSidecarMessage,
   decodeSidecarMessage,
+  PROTOCOL_VERSION,
   SidecarRequestError,
   type AddPromptRequest,
   type HelloResponse,
@@ -59,7 +60,7 @@ export class SidecarClient {
   }
 
   async hello(): Promise<HelloResponse> {
-    return this.request<HelloResponse>({ type: "hello", protocolVersion: 1 });
+    return this.request<HelloResponse>({ type: "hello", protocolVersion: PROTOCOL_VERSION });
   }
 
   async ping(): Promise<void> {

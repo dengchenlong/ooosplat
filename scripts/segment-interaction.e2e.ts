@@ -45,7 +45,7 @@ class NodeTransport implements SidecarTransport {
     this.proc.stdout!.on("data", (chunk: string) => this.onData(chunk));
     this.proc.stderr!.setEncoding("utf-8");
     this.proc.stderr!.on("data", (chunk: string) => process.stderr.write(chunk));
-    this.proc.on("exit", () => {
+    this.proc.on("close", () => {
       for (const waiter of this.waiters.splice(0)) waiter(null);
     });
   }
@@ -212,7 +212,6 @@ async function main(): Promise<number> {
 
     // --- re-anchor (multi-anchor re-prompt against loop drift) ---------
     const accepted2 = await client.addPrompt({
-      type: "add_prompt",
       sessionId: "e2e",
       objectId: "bracelet",
       frameId: "0003",
@@ -225,6 +224,7 @@ async function main(): Promise<number> {
       { sessionId: "e2e", objectId: "bracelet", masksDir },
       { onMask: (m) => masksAfterAnchor.push(m) },
     );
+    assert(masksAfterAnchor.length === FRAME_COUNT, "re-anchored propagate must stream every frame");
     assert(
       done2.completed === FRAME_COUNT && done2.skipped === 0,
       `re-anchored propagate must recompute all frames: ${JSON.stringify(done2)}`,

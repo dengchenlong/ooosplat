@@ -2,7 +2,7 @@ import type { SidecarTransport } from "./transport";
 
 /**
  * In-memory transport for client tests: queued responses, recorded writes.
- * Exported from a non-test module so both vitest and future tooling reuse it.
+ * (Test double; lives outside `*.test.ts` because `tsc -b` covers all of src/.
  */
 export class ScriptedTransport implements SidecarTransport {
   written: string[] = [];
