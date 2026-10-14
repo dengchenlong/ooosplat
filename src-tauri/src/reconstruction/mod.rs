@@ -1,3 +1,4 @@
+pub mod backproject;
 pub mod colmap_model;
 pub mod edit_mask;
 pub mod ply;
