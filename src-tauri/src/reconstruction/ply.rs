@@ -258,7 +258,7 @@ pub fn stream_splat_cores(
     std::io::Seek::seek(
         &mut file,
         std::io::SeekFrom::Start(layout.header_bytes as u64),
-    );
+    )?;
     let mut reader = BufReader::with_capacity(batch_size * layout.stride, file);
     let mut record = vec![0_u8; layout.stride];
     let mut batch: Vec<SplatCore> = Vec::with_capacity(batch_size);

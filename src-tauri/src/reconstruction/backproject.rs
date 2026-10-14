@@ -1002,8 +1002,7 @@ mod tests {
         *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let scaled = ((*state >> 33) as f64 / (u32::MAX as f64 / 2.0)) - 1.0;
-        scaled
+        ((*state >> 33) as f64 / (u32::MAX as f64 / 2.0)) - 1.0
     }
 
     fn sample_cloud() -> Vec<[f64; 3]> {
