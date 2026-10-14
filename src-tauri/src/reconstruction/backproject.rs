@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use crate::error::{Result, SplatError};
 use crate::reconstruction::colmap_model::{CameraIntrinsics, ImagePose};
+use crate::reconstruction::ply::stream_splat_cores;
 
 /// Pinhole (+ optional distortion) projection for one COLMAP camera.
 ///
@@ -150,6 +153,215 @@ pub fn world_to_camera(pose: &ImagePose, point: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// One frame's binary object mask, packed row-major (bit set = object pixel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMask {
+    width: u32,
+    height: u32,
+    bits: Vec<u8>,
+}
+
+impl ObjectMask {
+    /// Builds a mask from an occupancy predicate (handy for tests and for
+    /// synthetic scenes; the sidecar PNG loader is the production path).
+    pub fn from_occupied(width: u32, height: u32, occupied: impl Fn(u32, u32) -> bool) -> Self {
+        let mut bits = vec![0_u8; (width as usize * height as usize).div_ceil(8)];
+        for y in 0..height {
+            for x in 0..width {
+                if occupied(x, y) {
+                    let index = y as usize * width as usize + x as usize;
+                    bits[index / 8] |= 1 << (index % 8);
+                }
+            }
+        }
+        Self {
+            width,
+            height,
+            bits,
+        }
+    }
+
+    /// Loads an 8-bit grayscale PNG written by the SAM2 sidecar (0/255).
+    pub fn load_png(path: &Path) -> Result<Self> {
+        let image = image::ImageReader::open(path)?
+            .with_guessed_format()?
+            .decode()
+            .map_err(|error| SplatError::Process(format!("分割 mask PNG 无法解码：{error}")))?;
+        let gray = image.to_luma8();
+        let (width, height) = (gray.width(), gray.height());
+        Ok(Self::from_occupied(width, height, |x, y| {
+            gray.get_pixel(x, y).0[0] > 0
+        }))
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn covers(&self, x: f64, y: f64) -> bool {
+        if x < 0.0 || y < 0.0 || x >= f64::from(self.width) || y >= f64::from(self.height) {
+            return false;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        self.bits[index / 8] & (1 << (index % 8)) != 0
+    }
+
+    /// Fraction of the pixel disk of the given radius (centred at the
+    /// projected splat) covered by the mask. Pixels outside the image count
+    /// as background so partially off-screen splats are not over-credited.
+    fn coverage_in_disk(&self, cx: f64, cy: f64, radius: f64) -> f64 {
+        let r2 = radius * radius;
+        let mut covered = 0_u64;
+        let mut total = 0_u64;
+        for y in (cy - radius).floor() as i64..=(cy + radius).ceil() as i64 {
+            for x in (cx - radius).floor() as i64..=(cx + radius).ceil() as i64 {
+                let dx = x as f64 - cx;
+                let dy = y as f64 - cy;
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                total += 1;
+                if self.covers(x as f64, y as f64) {
+                    covered += 1;
+                }
+            }
+        }
+        if total == 0 {
+            return 0.0;
+        }
+        covered as f64 / total as f64
+    }
+}
+
+/// One registered frame ready for voting: pose, projection and object mask.
+#[derive(Debug, Clone)]
+pub struct FrameView {
+    pub name: String,
+    pub projection: CameraProjection,
+    pub pose: ImagePose,
+    pub mask: ObjectMask,
+}
+
+/// Voting parameters. Defaults follow the plan document: 60% vote threshold,
+/// 2 px footprint dilation for occlusion/edge tolerance, and a frame counts
+/// as "object covers this splat" when the majority of the footprint disk
+/// falls inside the mask.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoteConfig {
+    pub vote_threshold: f64,
+    pub footprint_dilation_px: f64,
+    pub frame_fill_ratio: f64,
+}
+
+impl Default for VoteConfig {
+    fn default() -> Self {
+        Self {
+            vote_threshold: 0.6,
+            footprint_dilation_px: 2.0,
+            frame_fill_ratio: 0.5,
+        }
+    }
+}
+
+/// Per-splat voting result for the whole point cloud.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoteOutcome {
+    pub splat_count: u64,
+    /// yes-votes / visible-frame ratio per splat, in PLY vertex order.
+    pub ratios: Vec<f32>,
+    /// `ratios[i] >= vote_threshold` — object candidates before clustering.
+    pub candidates: Vec<bool>,
+}
+
+impl VoteOutcome {
+    fn push_splat(&mut self, ratio: f32, config: &VoteConfig) {
+        self.ratios.push(ratio);
+        self.candidates.push(ratio >= config.vote_threshold as f32);
+    }
+
+    /// Object-candidate vote statistics (used for acceptance evidence).
+    pub fn ratio_bounds(&self, of_candidates: bool) -> Option<(f32, f32)> {
+        let values = self
+            .ratios
+            .iter()
+            .zip(&self.candidates)
+            .filter(|(_, candidate)| **candidate == of_candidates)
+            .map(|(ratio, _)| *ratio)
+            .collect::<Vec<_>>();
+        let first = *values.first()?;
+        Some(
+            values
+                .iter()
+                .fold((first, first), |(lo, hi), v| (lo.min(*v), hi.max(*v))),
+        )
+    }
+}
+
+/// Votes every splat of a binary Gaussian PLY against the per-frame masks.
+///
+/// The PLY is streamed in `batch_size`-splat batches (see
+/// `stream_splat_cores`); only the compact masks and the per-splat vote
+/// vectors stay in memory, so multi-GB `final.ply` files never get
+/// materialised. `final.ply` is opened read-only.
+pub fn vote_splats(
+    ply_path: &Path,
+    frames: &[FrameView],
+    config: &VoteConfig,
+    batch_size: usize,
+) -> Result<VoteOutcome> {
+    if frames.is_empty() {
+        return Err(SplatError::Process(
+            "反投影投票需要至少一帧带 mask 的画面".into(),
+        ));
+    }
+    let mut outcome = VoteOutcome {
+        splat_count: 0,
+        ratios: Vec::new(),
+        candidates: Vec::new(),
+    };
+    stream_splat_cores(ply_path, batch_size, &mut |batch| {
+        for splat in batch {
+            let mut yes = 0_u32;
+            let mut visible = 0_u32;
+            for frame in frames {
+                let Some(pixel) = frame.projection.world_to_pixel(&frame.pose, splat.position)
+                else {
+                    continue;
+                };
+                let (width, height) = (
+                    f64::from(frame.mask.width()),
+                    f64::from(frame.mask.height()),
+                );
+                if pixel[0] < 0.0 || pixel[1] < 0.0 || pixel[0] >= width || pixel[1] >= height {
+                    continue;
+                }
+                visible += 1;
+                let depth = frame.projection.depth(&frame.pose, splat.position);
+                let radius = frame.projection.footprint_radius_px(splat.scale, depth)
+                    + config.footprint_dilation_px;
+                if frame.mask.coverage_in_disk(pixel[0], pixel[1], radius)
+                    >= config.frame_fill_ratio
+                {
+                    yes += 1;
+                }
+            }
+            let ratio = if visible == 0 {
+                0.0
+            } else {
+                yes as f32 / visible as f32
+            };
+            outcome.push_splat(ratio, config);
+        }
+        Ok(())
+    })?;
+    outcome.splat_count = outcome.ratios.len() as u64;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +481,165 @@ mod tests {
         );
         // depth() reports the camera-space z of the same point.
         assert_eq!(projection.depth(&IDENTITY, [0.1, 0.0, 5.0]), 5.0);
+    }
+
+    // ---- mask + voting -------------------------------------------------
+
+    fn rect_mask(width: u32, height: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> ObjectMask {
+        ObjectMask::from_occupied(width, height, |x, y| {
+            (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+        })
+    }
+
+    #[test]
+    fn mask_reports_disk_coverage_and_bounds() {
+        let mask = rect_mask(64, 48, 8, 16, 24, 32);
+        assert_eq!(mask.width(), 64);
+        assert_eq!(mask.height(), 48);
+        // Fully inside the rectangle.
+        assert_eq!(mask.coverage_in_disk(16.0, 24.0, 3.0), 1.0);
+        // Fully outside.
+        assert_eq!(mask.coverage_in_disk(48.0, 24.0, 3.0), 0.0);
+        // Pixels beyond the image count as background, not as covered.
+        assert!(mask.coverage_in_disk(63.0, 24.0, 3.0) < 1.0);
+    }
+
+    #[test]
+    fn loads_sidecar_png_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_000001.png");
+        let mut image = image::GrayImage::new(8, 4);
+        for y in 0..4 {
+            for x in 0..8 {
+                let on = x < 4 && y < 2;
+                image.put_pixel(x, y, image::Luma([if on { 255 } else { 0 }]));
+            }
+        }
+        image.save(&path).unwrap();
+        let mask = ObjectMask::load_png(&path).unwrap();
+        assert_eq!((mask.width(), mask.height()), (8, 4));
+        assert_eq!(mask.coverage_in_disk(1.5, 0.5, 1.0), 1.0);
+        assert_eq!(mask.coverage_in_disk(6.0, 3.0, 1.0), 0.0);
+    }
+
+    /// Writes a tiny binary PLY with only x/y/z/scale_0..2 float properties.
+    fn write_voting_fixture(path: &Path, splats: &[(f64, f64, f64)]) {
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty float scale_0\nproperty float scale_1\nproperty float scale_2\nend_header\n",
+            splats.len()
+        );
+        let mut body = Vec::new();
+        for (x, y, z) in splats {
+            for value in [*x, *y, *z, 0.005_f64.ln(), 0.005_f64.ln(), 0.005_f64.ln()] {
+                body.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+        }
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn frame(translation: [f64; 3], mask: &ObjectMask) -> FrameView {
+        FrameView {
+            name: "frame".into(),
+            projection: CameraProjection::from_intrinsics(
+                &crate::reconstruction::colmap_model::CameraIntrinsics {
+                    camera: crate::reconstruction::colmap_model::ColmapCamera {
+                        id: 1,
+                        model_id: 1,
+                        model: "PINHOLE".into(),
+                        width: 64,
+                        height: 48,
+                    },
+                    params: vec![800.0, 800.0, 32.0, 24.0],
+                },
+            )
+            .unwrap(),
+            pose: ImagePose {
+                quaternion: [1.0, 0.0, 0.0, 0.0],
+                translation,
+            },
+            mask: mask.clone(),
+        }
+    }
+
+    #[test]
+    fn voting_separates_object_from_background_splats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("cloud.ply");
+        // Rect mask x 8..24 px, y 16..32 px; camera depth 10, f=800.
+        // Splats A..D project to px x = 32 + 80*(x_w + t_x), py = 24 + 80*(y_w + t_y).
+        write_voting_fixture(
+            &ply,
+            &[
+                (-0.2, 0.0, 10.0),  // A: inside mask in 3 of 4 visible frames -> 3/4 = 0.75
+                (-0.2, 0.35, 10.0), // B: off-image in every frame -> visible 0 -> 0
+                (-0.2, 0.0, 10.0),  // C: same as A -> 3/4 = 0.75
+                (0.5, 0.0, 10.0),   // D: background side of the image -> 0
+            ],
+        );
+        let mask = rect_mask(64, 48, 8, 16, 24, 32);
+        let frames = vec![
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.0, 0.3, 0.0], &mask), // py 48 -> out of bounds
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.5, 0.0, 0.0], &mask), // px 72 (A/C) but still in-bounds
+            frame([0.0, 0.0, 0.0], &mask),
+        ];
+        let outcome = vote_splats(&ply, &frames, &VoteConfig::default(), 3).unwrap();
+        assert_eq!(outcome.splat_count, 4);
+        println!(
+            "[acceptance] object-splat vote ratios: A={:.3} C={:.3}; background: B={:.3} D={:.3}",
+            outcome.ratios[0], outcome.ratios[2], outcome.ratios[1], outcome.ratios[3]
+        );
+        // Object points vote well above the 0.6 threshold; background at 0.
+        assert!(outcome.candidates[0]);
+        assert!(outcome.candidates[2]);
+        assert!(!outcome.candidates[1]);
+        assert!(!outcome.candidates[3]);
+        assert!(outcome.ratios[0] > 0.6 && outcome.ratios[2] > 0.6);
+        assert_eq!(outcome.ratios[1], 0.0);
+        assert_eq!(outcome.ratios[3], 0.0);
+        let (lo, hi) = outcome.ratio_bounds(true).unwrap();
+        assert!(lo > 0.6 && hi <= 1.0);
+    }
+
+    #[test]
+    fn vote_threshold_gates_partial_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("cloud.ply");
+        // Splat projects inside the mask in exactly 3 of 5 frames.
+        write_voting_fixture(
+            &ply,
+            &[
+                (-0.2, 0.0, 10.0), // 4 of 5 visible frames -> 0.8, above 0.6
+                (-0.2, 0.2, 10.0), // py = 24+16=40 in-bounds but below rect -> 0/5
+            ],
+        );
+        let mask = rect_mask(64, 48, 8, 16, 24, 32);
+        let frames = vec![
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.0, 0.3, 0.0], &mask),
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.5, 0.0, 0.0], &mask),
+            frame([0.0, 0.0, 0.0], &mask),
+        ];
+        let config = VoteConfig {
+            vote_threshold: 0.9,
+            ..VoteConfig::default()
+        };
+        let outcome = vote_splats(&ply, &frames, &config, 64).unwrap();
+        println!("[acceptance] threshold test ratios: {:?}", outcome.ratios);
+        // 0.8 < 0.9 -> rejected despite strong object evidence.
+        assert!(!outcome.candidates[0]);
+        assert!(!outcome.candidates[1]);
+    }
+
+    #[test]
+    fn voting_requires_at_least_one_masked_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("cloud.ply");
+        write_voting_fixture(&ply, &[(-0.2, 0.0, 10.0)]);
+        assert!(vote_splats(&ply, &[], &VoteConfig::default(), 8).is_err());
     }
 }
