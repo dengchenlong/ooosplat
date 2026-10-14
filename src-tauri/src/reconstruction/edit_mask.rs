@@ -49,17 +49,21 @@ pub fn count_deleted(mask: &[u8], splat_count: u64) -> Result<u64> {
     Ok(mask.iter().map(|value| u64::from(value.count_ones())).sum())
 }
 
-pub fn write_mask_atomic(
-    project_root: &Path,
-    revision: u64,
+/// Writes an OOSMASK-format container (magic `OOSMASK\0`, version 1) to an
+/// explicit destination path, atomically. Generic over the payload semantics:
+/// `deleted-N.mask` edit bitmaps and derived instance bitmaps share the layout.
+pub fn write_mask_container_atomic(
+    destination: &Path,
     splat_count: u64,
+    revision: u64,
     mask: &[u8],
-) -> Result<PathBuf> {
+) -> Result<()> {
     let deleted_count = count_deleted(mask, splat_count)?;
-    let directory = project_root.join("edits");
-    std::fs::create_dir_all(&directory)?;
-    let destination = mask_path(project_root, revision);
-    let temporary = directory.join(format!(".deleted-{}.mask.tmp", Uuid::new_v4()));
+    let directory = destination
+        .parent()
+        .ok_or_else(|| SplatError::Process("OOSMASK 目标路径缺少父目录".into()))?;
+    std::fs::create_dir_all(directory)?;
+    let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -75,28 +79,35 @@ pub fn write_mask_atomic(
         file.write_all(mask)?;
         file.flush()?;
         file.sync_all()?;
-        std::fs::rename(&temporary, &destination)?;
+        std::fs::rename(&temporary, destination)?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
+    Ok(())
+}
+
+pub fn write_mask_atomic(
+    project_root: &Path,
+    revision: u64,
+    splat_count: u64,
+    mask: &[u8],
+) -> Result<PathBuf> {
+    let destination = mask_path(project_root, revision);
+    write_mask_container_atomic(&destination, splat_count, revision, mask)?;
     Ok(destination)
 }
 
-pub fn read_mask(project_root: &Path, editing: GaussianEditing) -> Result<Vec<u8>> {
-    let expected = packed_mask_bytes(editing.source_splat_count)?;
-    if editing.revision == 0 {
-        if editing.deleted_count != 0 {
-            return Err(SplatError::Process(
-                "Gaussian 编辑状态缺少删除位图修订号".into(),
-            ));
-        }
-        return Ok(vec![0; expected]);
-    }
-    let path = mask_path(project_root, editing.revision);
-    let mut file = File::open(&path).map_err(|error| {
+/// Reads and fully validates an OOSMASK container at an explicit path.
+///
+/// Returns `(revision, deleted_count, payload)`. Any mismatch in magic,
+/// version, splat count, payload length, checksum or trailing bytes is an
+/// error so callers never act on silently corrupted bitmaps.
+pub fn read_mask_container(path: &Path, expected_splat_count: u64) -> Result<(u64, u64, Vec<u8>)> {
+    let expected = packed_mask_bytes(expected_splat_count)?;
+    let mut file = File::open(path).map_err(|error| {
         SplatError::Process(format!(
             "无法读取 Gaussian 编辑位图 {}：{error}",
             path.display()
@@ -119,12 +130,7 @@ pub fn read_mask(project_root: &Path, editing: GaussianEditing) -> Result<Vec<u8
     file.read_exact(&mut checksum_bytes)
         .map_err(|error| SplatError::Process(format!("Gaussian 编辑位图校验字段损坏：{error}")))?;
     let expected_checksum = u64::from_le_bytes(checksum_bytes);
-    if version != FORMAT_VERSION
-        || revision != editing.revision
-        || splat_count != editing.source_splat_count
-        || deleted_count != editing.deleted_count
-        || payload_len != expected
-    {
+    if version != FORMAT_VERSION || splat_count != expected_splat_count || payload_len != expected {
         return Err(SplatError::Process("Gaussian 编辑位图元数据不匹配".into()));
     }
     let mut mask = vec![0_u8; payload_len];
@@ -136,6 +142,25 @@ pub fn read_mask(project_root: &Path, editing: GaussianEditing) -> Result<Vec<u8
     }
     if checksum(&mask) != expected_checksum || count_deleted(&mask, splat_count)? != deleted_count {
         return Err(SplatError::Process("Gaussian 编辑位图校验失败".into()));
+    }
+    Ok((revision, deleted_count, mask))
+}
+
+pub fn read_mask(project_root: &Path, editing: GaussianEditing) -> Result<Vec<u8>> {
+    if editing.revision == 0 {
+        if editing.deleted_count != 0 {
+            return Err(SplatError::Process(
+                "Gaussian 编辑状态缺少删除位图修订号".into(),
+            ));
+        }
+        return Ok(vec![0; packed_mask_bytes(editing.source_splat_count)?]);
+    }
+    let (revision, deleted_count, mask) = read_mask_container(
+        &mask_path(project_root, editing.revision),
+        editing.source_splat_count,
+    )?;
+    if revision != editing.revision || deleted_count != editing.deleted_count {
+        return Err(SplatError::Process("Gaussian 编辑位图元数据不匹配".into()));
     }
     Ok(mask)
 }

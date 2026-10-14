@@ -472,10 +472,79 @@ pub fn label_object_clusters(
     }
 }
 
+/// Writes the object/environment split as an OOSMASK-compatible packed bitmap
+/// (one bit per splat, set = object instance) to a derived-asset path.
+///
+/// The source `final.ply` is never touched: the bitmap is a sidecar file that
+/// downstream export steps turn into `object.ply` / `background.ply` subsets.
+/// Returns the number of object splats.
+pub fn write_instance_mask(destination: &Path, splat_count: u64, labels: &[i32]) -> Result<u64> {
+    if labels.len() as u64 != splat_count {
+        return Err(SplatError::Process(format!(
+            "实例标签数量 {} 与 splat 数量 {} 不一致",
+            labels.len(),
+            splat_count
+        )));
+    }
+    let mut mask = vec![0_u8; (labels.len()).div_ceil(8)];
+    let mut object_count = 0_u64;
+    for (index, label) in labels.iter().enumerate() {
+        if *label != 0 {
+            mask[index / 8] |= 1 << (index % 8);
+            object_count += 1;
+        }
+    }
+    // Revision 0 marks a derived instance bitmap (edit bitmaps start at 1).
+    super::edit_mask::write_mask_container_atomic(destination, splat_count, 0, &mask)?;
+    Ok(object_count)
+}
+
+/// Pairs the COLMAP model (single camera + posed images) with the per-frame
+/// sidecar masks (`<frame stem>.png`, 0/255 grayscale) into `FrameView`s.
+///
+/// Frames without a mask file are skipped — they simply cast no votes. An
+/// empty result (no masks at all) is an error: voting without masks is a
+/// misconfiguration, not a valid no-op.
+pub fn load_frame_views(model: &Path, masks_dir: &Path) -> Result<Vec<FrameView>> {
+    let intrinsics = crate::reconstruction::colmap_model::read_camera_intrinsics(model)?;
+    let projection = CameraProjection::from_intrinsics(&intrinsics)?;
+    let images = crate::reconstruction::colmap_model::read_posed_images(model)?;
+    let mut frames = Vec::with_capacity(images.len());
+    for image in images {
+        if image.camera_id != intrinsics.camera.id {
+            return Err(SplatError::Process(format!(
+                "图像 {} 引用了未知的相机 {}",
+                image.name, image.camera_id
+            )));
+        }
+        let stem = Path::new(&image.name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| SplatError::Process(format!("图像名称无效：{}", image.name)))?;
+        let mask_path = masks_dir.join(format!("{stem}.png"));
+        if !mask_path.is_file() {
+            continue;
+        }
+        frames.push(FrameView {
+            name: image.name.clone(),
+            projection,
+            pose: image.pose,
+            mask: ObjectMask::load_png(&mask_path)?,
+        });
+    }
+    if frames.is_empty() {
+        return Err(SplatError::Process(
+            "COLMAP 模型与 mask 目录没有可配对的帧，无法反投影投票".into(),
+        ));
+    }
+    Ok(frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reconstruction::colmap_model::ColmapCamera;
+    use std::io::Write;
 
     fn intrinsics(model_id: i32, params: &[f64]) -> CameraIntrinsics {
         CameraIntrinsics {
@@ -824,5 +893,98 @@ mod tests {
             },
         );
         assert_eq!(touching.cluster_count, 1);
+    }
+
+    // ---- instance bitmap output + frame pairing --------------------------
+
+    #[test]
+    fn writes_oosmask_instance_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("derived").join("instance.mask");
+        let object_count =
+            write_instance_mask(&destination, 10, &[1, 0, 2, 0, 0, 1, 0, 0, 0, 3]).unwrap();
+        assert_eq!(object_count, 4);
+        let (revision, deleted_count, mask) =
+            crate::reconstruction::edit_mask::read_mask_container(&destination, 10).unwrap();
+        assert_eq!(revision, 0, "derived instance bitmaps carry revision 0");
+        assert_eq!(deleted_count, 4);
+        // Bits 0, 2, 5 in byte 0 (labels 1, 2, 1) and bit 1 in byte 1 (label 3).
+        assert_eq!(mask, vec![0b0010_0101, 0b0000_0010]);
+    }
+
+    #[test]
+    fn rejects_instance_mask_length_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_instance_mask(&dir.path().join("i.mask"), 3, &[1, 0]).is_err());
+    }
+
+    fn write_model_fixture(model_dir: &Path, image_names: &[&str]) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        let mut cameras = std::fs::File::create(model_dir.join("cameras.bin")).unwrap();
+        cameras.write_all(&1_u64.to_le_bytes()).unwrap();
+        cameras.write_all(&7_u32.to_le_bytes()).unwrap();
+        cameras.write_all(&1_i32.to_le_bytes()).unwrap();
+        cameras.write_all(&64_u64.to_le_bytes()).unwrap();
+        cameras.write_all(&48_u64.to_le_bytes()).unwrap();
+        for value in [800.0_f64, 800.0, 32.0, 24.0] {
+            cameras.write_all(&value.to_le_bytes()).unwrap();
+        }
+        let mut images = std::fs::File::create(model_dir.join("images.bin")).unwrap();
+        images
+            .write_all(&(image_names.len() as u64).to_le_bytes())
+            .unwrap();
+        for (index, name) in image_names.iter().enumerate() {
+            images
+                .write_all(&((index + 1) as u32).to_le_bytes())
+                .unwrap();
+            for value in [1.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
+                images.write_all(&value.to_le_bytes()).unwrap();
+            }
+            images.write_all(&7_u32.to_le_bytes()).unwrap();
+            images.write_all(name.as_bytes()).unwrap();
+            images.write_all(&[0_u8]).unwrap();
+            images.write_all(&0_u64.to_le_bytes()).unwrap();
+        }
+    }
+
+    fn write_mask_png(dir: &Path, stem: &str) {
+        let mut image = image::GrayImage::new(64, 48);
+        for y in 0..48 {
+            for x in 0..64 {
+                let on = (8..=24).contains(&x) && (16..=32).contains(&y);
+                image.put_pixel(x, y, image::Luma([if on { 255 } else { 0 }]));
+            }
+        }
+        image.save(dir.join(format!("{stem}.png"))).unwrap();
+    }
+
+    #[test]
+    fn pairs_colmap_frames_with_sidecar_masks() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("sparse").join("0");
+        let masks_dir = dir.path().join("masks");
+        std::fs::create_dir_all(&masks_dir).unwrap();
+        // frame_000001.jpg and frame_000003.jpg have masks, 000002 has none.
+        write_model_fixture(
+            &model_dir,
+            &["frame_000001.jpg", "frame_000002.jpg", "frame_000003.jpg"],
+        );
+        write_mask_png(&masks_dir, "frame_000001");
+        write_mask_png(&masks_dir, "frame_000003");
+        let frames = load_frame_views(&model_dir, &masks_dir).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].name, "frame_000001.jpg");
+        assert_eq!(frames[1].name, "frame_000003.jpg");
+        assert_eq!((frames[0].mask.width(), frames[0].mask.height()), (64, 48));
+    }
+
+    #[test]
+    fn rejects_pairing_without_any_masks() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("sparse").join("0");
+        let masks_dir = dir.path().join("masks");
+        std::fs::create_dir_all(&masks_dir).unwrap();
+        write_model_fixture(&model_dir, &["frame_000001.jpg"]);
+        assert!(load_frame_views(&model_dir, &masks_dir).is_err());
     }
 }
