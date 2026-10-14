@@ -381,11 +381,18 @@ pub struct ClusterOutcome {
     pub cluster_count: usize,
 }
 
-/// Groups voting candidates into spatially connected object instances.
+/// Groups voting candidates into spatially connected object instances using
+/// DBSCAN core-point semantics.
 ///
-/// Positions are indexed through a uniform hash grid with cell size `eps`, so
-/// neighbour lookup is O(1) per splat instead of a full O(n²) scan; the vote
-/// vectors, positions and labels stay the only in-memory state.
+/// A splat is a *core point* when its eps-neighbourhood contains at least
+/// `min_points` candidates (itself included); clusters grow only from core
+/// points, and non-core candidates join a cluster only when they fall inside
+/// some core point's neighbourhood (border points) — everything else is
+/// noise. A sparse noise chain of non-core splats can therefore no longer
+/// bridge two dense blobs into one component. Positions are indexed through a
+/// uniform hash grid with cell size `eps`, so neighbour lookup is O(1) per
+/// splat instead of a full O(n²) scan; the vote vectors, positions and labels
+/// stay the only in-memory state.
 pub fn label_object_clusters(
     positions: &[[f64; 3]],
     candidates: &[bool],
@@ -399,6 +406,7 @@ pub fn label_object_clusters(
         };
     }
     let eps2 = config.eps * config.eps;
+    let min_points = config.min_points.max(1);
     let cell = |p: [f64; 3]| -> (i64, i64, i64) {
         (
             (p[0] / config.eps).floor() as i64,
@@ -438,32 +446,53 @@ pub fn label_object_clusters(
         found
     };
 
-    let mut cluster_count = 0_usize;
-    for seed in 0..positions.len() {
-        if !candidates.get(seed).copied().unwrap_or(false) || labels[seed] != 0 {
+    // Core points: neighbourhood size (self included) >= min_points. Only
+    // core-core reachability grows a cluster; border points are attached
+    // afterwards, noise stays background.
+    let mut core = vec![false; positions.len()];
+    let mut neighbour_cache: Vec<Vec<usize>> = vec![Vec::new(); positions.len()];
+    for index in 0..positions.len() {
+        if !candidates.get(index).copied().unwrap_or(false) {
             continue;
         }
-        let mut component = vec![seed];
-        labels[seed] = -1; // visiting marker
+        let neighbours = neighbours_within_eps(index);
+        if neighbours.len() + 1 >= min_points {
+            core[index] = true;
+            neighbour_cache[index] = neighbours;
+        }
+    }
+
+    let mut cluster_count = 0_usize;
+    for seed in 0..positions.len() {
+        if !core[seed] || labels[seed] != 0 {
+            continue;
+        }
+        cluster_count += 1;
+        labels[seed] = cluster_count as i32;
+        let mut queue = vec![seed];
         let mut cursor = 0;
-        while cursor < component.len() {
-            for neighbour in neighbours_within_eps(component[cursor]) {
-                if labels[neighbour] == 0 {
-                    labels[neighbour] = -1;
-                    component.push(neighbour);
+        while cursor < queue.len() {
+            for neighbour in &neighbour_cache[queue[cursor]] {
+                if labels[*neighbour] == 0 && core[*neighbour] {
+                    labels[*neighbour] = cluster_count as i32;
+                    queue.push(*neighbour);
                 }
             }
             cursor += 1;
         }
-        if component.len() >= config.min_points {
-            cluster_count += 1;
-            for index in component {
-                labels[index] = cluster_count as i32;
-            }
-        } else {
-            for index in component {
-                labels[index] = 0;
-            }
+    }
+    // Border points: non-core candidates touching a core point adopt its
+    // label; contested borders (rare) join the first cluster that claims
+    // them, matching DBSCAN's behaviour.
+    for index in 0..positions.len() {
+        if labels[index] != 0 || !candidates.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if let Some(neighbour) = neighbours_within_eps(index)
+            .into_iter()
+            .find(|neighbour| core[*neighbour])
+        {
+            labels[index] = labels[neighbour].max(1);
         }
     }
     ClusterOutcome {
@@ -525,11 +554,34 @@ pub fn load_frame_views(model: &Path, masks_dir: &Path) -> Result<Vec<FrameView>
         if !mask_path.is_file() {
             continue;
         }
+        let mask = ObjectMask::load_png(&mask_path)?;
+        let Ok(camera_width) = u32::try_from(intrinsics.camera.width) else {
+            return Err(SplatError::Process(format!(
+                "COLMAP 相机宽度 {} 无效：{}",
+                intrinsics.camera.width, image.name
+            )));
+        };
+        let Ok(camera_height) = u32::try_from(intrinsics.camera.height) else {
+            return Err(SplatError::Process(format!(
+                "COLMAP 相机高度 {} 无效：{}",
+                intrinsics.camera.height, image.name
+            )));
+        };
+        if mask.width() != camera_width || mask.height() != camera_height {
+            return Err(SplatError::Process(format!(
+                "mask 分辨率 {}x{} 与相机分辨率 {}x{} 不一致，拒绝反投影投票：{}",
+                mask.width(),
+                mask.height(),
+                intrinsics.camera.width,
+                intrinsics.camera.height,
+                image.name
+            )));
+        }
         frames.push(FrameView {
             name: image.name.clone(),
             projection,
             pose: image.pose,
-            mask: ObjectMask::load_png(&mask_path)?,
+            mask,
         });
     }
     if frames.is_empty() {
@@ -896,10 +948,7 @@ mod tests {
         let outcome = label_object_clusters(
             &positions,
             &candidates,
-            &ClusterConfig {
-                eps,
-                min_points: 4,
-            },
+            &ClusterConfig { eps, min_points: 4 },
         );
         println!(
             "[acceptance] dbscan labels: {:?} ({} clusters)",
@@ -909,15 +958,19 @@ mod tests {
             outcome.cluster_count, 2,
             "sparse noise chain must not bridge the two blobs"
         );
-        // Both blobs stay labelled; only the chain ends (adjacent to a blob)
-        // join a cluster, the sparse interior is noise.
-        let interior_noise = &outcome.labels[blob_count + 1..positions.len() - 2];
+        // Only the chain's first/last splats (within eps of a blob) become
+        // border points of a cluster; the sparse interior stays noise.
+        let interior_noise = &outcome.labels[blob_count + 2..positions.len() - 3];
         assert!(
             interior_noise.iter().all(|label| *label == 0),
             "sparse chain interior must stay background: {interior_noise:?}"
         );
         assert_eq!(outcome.labels[blob_count], 1, "chain start joins blob A");
-        assert_eq!(outcome.labels[positions.len() - 1], 2, "chain end joins blob B");
+        assert_eq!(
+            outcome.labels[positions.len() - 1],
+            2,
+            "chain end joins blob B"
+        );
     }
 
     #[test]
