@@ -872,6 +872,55 @@ mod tests {
     }
 
     #[test]
+    fn dbscan_core_semantics_keeps_sparse_noise_chains_from_bridging() {
+        // Two dense 3x3 blobs joined by a 1-D chain of splats spaced 0.08
+        // apart (eps = 0.1): every interior chain splat sees only its two
+        // chain neighbours (+ itself) inside eps, so with min_points = 4 true
+        // DBSCAN must treat them as non-core noise and keep the objects
+        // separate. Single-link labelling bridges them into one component.
+        let eps = 0.1;
+        let mut positions: Vec<[f64; 3]> = Vec::new();
+        for (cx, cy) in [(0.0_f64, 0.0_f64), (2.0, 0.0)] {
+            for i in 0..3_u32 {
+                for j in 0..3_u32 {
+                    positions.push([cx + 0.03 * f64::from(i), cy + 0.03 * f64::from(j), 0.0]);
+                }
+            }
+        }
+        let blob_count = positions.len();
+        let chain: Vec<f64> = (0..=24).map(|k| 0.12 + 0.08 * f64::from(k)).collect();
+        for x in &chain {
+            positions.push([*x, 0.0, 0.0]);
+        }
+        let candidates = vec![true; positions.len()];
+        let outcome = label_object_clusters(
+            &positions,
+            &candidates,
+            &ClusterConfig {
+                eps,
+                min_points: 4,
+            },
+        );
+        println!(
+            "[acceptance] dbscan labels: {:?} ({} clusters)",
+            outcome.labels, outcome.cluster_count
+        );
+        assert_eq!(
+            outcome.cluster_count, 2,
+            "sparse noise chain must not bridge the two blobs"
+        );
+        // Both blobs stay labelled; only the chain ends (adjacent to a blob)
+        // join a cluster, the sparse interior is noise.
+        let interior_noise = &outcome.labels[blob_count + 1..positions.len() - 2];
+        assert!(
+            interior_noise.iter().all(|label| *label == 0),
+            "sparse chain interior must stay background: {interior_noise:?}"
+        );
+        assert_eq!(outcome.labels[blob_count], 1, "chain start joins blob A");
+        assert_eq!(outcome.labels[positions.len() - 1], 2, "chain end joins blob B");
+    }
+
+    #[test]
     fn eps_boundary_is_respected() {
         let positions = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]];
         let outcome = label_object_clusters(
@@ -976,6 +1025,23 @@ mod tests {
         assert_eq!(frames[0].name, "frame_000001.jpg");
         assert_eq!(frames[1].name, "frame_000003.jpg");
         assert_eq!((frames[0].mask.width(), frames[0].mask.height()), (64, 48));
+    }
+
+    #[test]
+    fn load_frame_views_rejects_mask_resolution_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("sparse").join("0");
+        let masks_dir = dir.path().join("masks");
+        std::fs::create_dir_all(&masks_dir).unwrap();
+        write_model_fixture(&model_dir, &["frame_000001.jpg"]);
+        // The model fixture camera is 64x48; this mask is not, and a
+        // resolution mismatch would silently misplace every projection.
+        let mut image = image::GrayImage::new(32, 24);
+        image.put_pixel(0, 0, image::Luma([255_u8]));
+        image.save(masks_dir.join("frame_000001.png")).unwrap();
+        let error = load_frame_views(&model_dir, &masks_dir).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("分辨率"), "unexpected error: {message}");
     }
 
     #[test]
