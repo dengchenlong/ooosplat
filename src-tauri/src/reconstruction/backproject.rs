@@ -108,7 +108,10 @@ impl CameraProjection {
     /// Returns `None` when the point lies on or behind the camera plane.
     pub fn world_to_pixel(&self, pose: &ImagePose, point: [f64; 3]) -> Option<[f64; 2]> {
         let cam = world_to_camera(pose, point);
-        if cam[2] <= 0.0 {
+        // Points within float noise of the camera plane are treated as
+        // on-plane (invisible): the sign of `cam[2]` is not meaningful there
+        // and differs across platforms for exactly-on-plane inputs.
+        if cam[2] <= 1e-9 {
             return None;
         }
         let xu = cam[0] / cam[2];
