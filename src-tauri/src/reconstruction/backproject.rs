@@ -987,4 +987,247 @@ mod tests {
         write_model_fixture(&model_dir, &["frame_000001.jpg"]);
         assert!(load_frame_views(&model_dir, &masks_dir).is_err());
     }
+
+    // ---- end-to-end acceptance: vote -> cluster -> instance bitmap ------
+
+    const SCENE_WIDTH: u32 = 640;
+    const SCENE_HEIGHT: u32 = 480;
+    const SCENE_F: f64 = 800.0;
+    const OBJECT_RADIUS: f64 = 0.3;
+    const OBJECT_SPLATS: usize = 800;
+    const BACKGROUND_SPLATS: usize = 1200;
+
+    fn lcg(state: &mut u64) -> f64 {
+        // Deterministic pseudo-random in [-1, 1] for reproducible scenes.
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let scaled = ((*state >> 33) as f64 / (u32::MAX as f64 / 2.0)) - 1.0;
+        scaled
+    }
+
+    fn sample_cloud() -> Vec<[f64; 3]> {
+        let mut state = 0x5eed_cafe_u64;
+        let mut splats = Vec::with_capacity(OBJECT_SPLATS + BACKGROUND_SPLATS);
+        // Object: filled ball at the origin.
+        for _ in 0..OBJECT_SPLATS {
+            loop {
+                let p = [lcg(&mut state), lcg(&mut state), lcg(&mut state)];
+                if p.iter().map(|v| v * v).sum::<f64>() <= 1.0 {
+                    splats.push([
+                        p[0] * OBJECT_RADIUS,
+                        p[1] * OBJECT_RADIUS,
+                        p[2] * OBJECT_RADIUS,
+                    ]);
+                    break;
+                }
+            }
+        }
+        // Background: shell around the object (projection misses the mask).
+        for _ in 0..BACKGROUND_SPLATS {
+            loop {
+                let p = [lcg(&mut state), lcg(&mut state), lcg(&mut state)];
+                let r2 = p.iter().map(|v| v * v).sum::<f64>();
+                if r2 > 1.0 && r2 <= 4.0 {
+                    splats.push([p[0] * 0.9, p[1] * 0.9, p[2] * 0.9]);
+                    break;
+                }
+            }
+        }
+        splats
+    }
+
+    fn write_scene_cloud(path: &Path, splats: &[[f64; 3]]) {
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty float scale_0\nproperty float scale_1\nproperty float scale_2\nend_header\n",
+            splats.len()
+        );
+        let mut bytes = header.into_bytes();
+        let scale = 0.005_f64.ln();
+        for splat in splats {
+            for value in [splat[0], splat[1], splat[2], scale, scale, scale] {
+                bytes.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Cameras orbit the origin in the x-z plane (world y up) at depth 10;
+    /// the object silhouette is a disk around the principal point (radius
+    /// 32 px) in each mask. Orbiting views break the view-axis ambiguity so
+    /// background points behind/in front of the object align with at most 2
+    /// of the 6 view axes and stay below the vote threshold.
+    fn write_scene_model_and_masks(model_dir: &Path, masks_dir: &Path) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        std::fs::create_dir_all(masks_dir).unwrap();
+        let angles: [f64; 6] = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
+        let mut cameras = std::fs::File::create(model_dir.join("cameras.bin")).unwrap();
+        cameras.write_all(&1_u64.to_le_bytes()).unwrap();
+        cameras.write_all(&1_u32.to_le_bytes()).unwrap();
+        cameras.write_all(&1_i32.to_le_bytes()).unwrap();
+        cameras
+            .write_all(&(SCENE_WIDTH as u64).to_le_bytes())
+            .unwrap();
+        cameras
+            .write_all(&(SCENE_HEIGHT as u64).to_le_bytes())
+            .unwrap();
+        for value in [
+            SCENE_F,
+            SCENE_F,
+            SCENE_WIDTH as f64 / 2.0,
+            SCENE_HEIGHT as f64 / 2.0,
+        ] {
+            cameras.write_all(&value.to_le_bytes()).unwrap();
+        }
+        let mut images = std::fs::File::create(model_dir.join("images.bin")).unwrap();
+        images
+            .write_all(&(angles.len() as u64).to_le_bytes())
+            .unwrap();
+        for (index, degrees) in angles.iter().enumerate() {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            // Camera at (10 cos, 0, 10 sin), looking at the origin, y up.
+            // World-to-camera rotation rows: right, down, forward.
+            let rotation = [[sin, 0.0, -cos], [0.0, -1.0, 0.0], [-cos, 0.0, -sin]];
+            let quaternion = rotation_to_quaternion(&rotation);
+            // The origin projects to the principal point, so t = (0, 0, 10).
+            let translation = [0.0_f64, 0.0, 10.0];
+            images
+                .write_all(&((index + 1) as u32).to_le_bytes())
+                .unwrap();
+            for value in quaternion {
+                images.write_all(&value.to_le_bytes()).unwrap();
+            }
+            for value in translation {
+                images.write_all(&value.to_le_bytes()).unwrap();
+            }
+            images.write_all(&1_u32.to_le_bytes()).unwrap();
+            let name = format!("frame_{:06}.jpg", index + 1);
+            images.write_all(name.as_bytes()).unwrap();
+            images.write_all(&[0_u8]).unwrap();
+            images.write_all(&0_u64.to_le_bytes()).unwrap();
+
+            let mut image = image::GrayImage::new(SCENE_WIDTH, SCENE_HEIGHT);
+            for y in 0..SCENE_HEIGHT {
+                for x in 0..SCENE_WIDTH {
+                    let inside = (x as f64 - SCENE_WIDTH as f64 / 2.0).powi(2)
+                        + (y as f64 - SCENE_HEIGHT as f64 / 2.0).powi(2)
+                        <= 32.0_f64.powi(2);
+                    image.put_pixel(x, y, image::Luma([if inside { 255 } else { 0 }]));
+                }
+            }
+            let stem = name.trim_end_matches(".jpg");
+            image.save(masks_dir.join(format!("{stem}.png"))).unwrap();
+        }
+    }
+
+    /// Shepperd's method: rotation matrix (rows = camera axes in world
+    /// coordinates) to quaternion (w, x, y, z).
+    fn rotation_to_quaternion(m: &[[f64; 3]; 3]) -> [f64; 4] {
+        let trace = m[0][0] + m[1][1] + m[2][2];
+        let (qw, qx, qy, qz);
+        if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            qw = 0.25 * s;
+            qx = (m[2][1] - m[1][2]) / s;
+            qy = (m[0][2] - m[2][0]) / s;
+            qz = (m[1][0] - m[0][1]) / s;
+        } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
+            let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
+            qw = (m[2][1] - m[1][2]) / s;
+            qx = 0.25 * s;
+            qy = (m[0][1] + m[1][0]) / s;
+            qz = (m[0][2] + m[2][0]) / s;
+        } else if m[1][1] > m[2][2] {
+            let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
+            qw = (m[0][2] - m[2][0]) / s;
+            qx = (m[0][1] + m[1][0]) / s;
+            qy = 0.25 * s;
+            qz = (m[1][2] + m[2][1]) / s;
+        } else {
+            let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
+            qw = (m[1][0] - m[0][1]) / s;
+            qx = (m[0][2] + m[2][0]) / s;
+            qy = (m[1][2] + m[2][1]) / s;
+            qz = 0.25 * s;
+        }
+        [qw, qx, qy, qz]
+    }
+
+    #[test]
+    fn end_to_end_vote_cluster_instance_mask_on_sample_cloud() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("sparse").join("0");
+        let masks_dir = dir.path().join("masks");
+        write_scene_model_and_masks(&model_dir, &masks_dir);
+        let splats = sample_cloud();
+        let ply = dir.path().join("final.ply");
+        write_scene_cloud(&ply, &splats);
+        let original_bytes = std::fs::read(&ply).unwrap();
+
+        let frames = load_frame_views(&model_dir, &masks_dir).unwrap();
+        assert_eq!(frames.len(), 6);
+        let outcome = vote_splats(&ply, &frames, &VoteConfig::default(), 256).unwrap();
+        let positions: Vec<[f64; 3]> = splats.to_vec();
+        let clusters = label_object_clusters(
+            &positions,
+            &outcome.candidates,
+            &ClusterConfig {
+                eps: 0.1,
+                min_points: 10,
+            },
+        );
+
+        let object_ratios = &outcome.ratios[..OBJECT_SPLATS];
+        let background_ratios = &outcome.ratios[OBJECT_SPLATS..];
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        println!(
+            "[acceptance] object splats: n={} mean ratio={:.3} min={:.3}; background: n={} mean={:.3} max={:.3}; candidates: {}; clusters: {}",
+            object_ratios.len(),
+            mean(object_ratios),
+            object_ratios.iter().cloned().fold(f32::MAX, f32::min),
+            background_ratios.len(),
+            mean(background_ratios),
+            background_ratios.iter().cloned().fold(f32::MIN, f32::max),
+            outcome.candidates.iter().filter(|c| **c).count(),
+            clusters.cluster_count
+        );
+
+        // Voting: object points must vote far above background points. The
+        // worst background splats sit on a view axis (2/6 views covered by
+        // the object silhouette) and still stay below the 0.6 threshold.
+        assert!(mean(object_ratios) > 0.9, "object mean ratio too low");
+        assert!(
+            background_ratios.iter().cloned().fold(f32::MIN, f32::max) < 0.5,
+            "a background splat voted too high"
+        );
+        assert_eq!(
+            outcome.candidates.iter().filter(|c| **c).count(),
+            OBJECT_SPLATS,
+            "candidate set must be exactly the object"
+        );
+        // Clustering: the object forms exactly one component covering it.
+        assert_eq!(clusters.cluster_count, 1);
+        assert!(clusters.labels[..OBJECT_SPLATS].iter().all(|l| *l == 1));
+        assert!(clusters.labels[OBJECT_SPLATS..].iter().all(|l| *l == 0));
+
+        // Instance bitmap: derived OOSMASK asset, final.ply untouched.
+        let destination = dir.path().join("derived").join("instance.mask");
+        let object_count =
+            write_instance_mask(&destination, splats.len() as u64, &clusters.labels).unwrap();
+        assert_eq!(object_count, OBJECT_SPLATS as u64);
+        let (_, _, mask) = crate::reconstruction::edit_mask::read_mask_container(
+            &destination,
+            splats.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            mask.iter().map(|b| u64::from(b.count_ones())).sum::<u64>(),
+            OBJECT_SPLATS as u64
+        );
+        assert_eq!(
+            std::fs::read(&ply).unwrap(),
+            original_bytes,
+            "final.ply must be read-only"
+        );
+    }
 }
