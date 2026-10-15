@@ -999,4 +999,109 @@ mod tests {
         assert!(!output.exists());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
+
+    fn read_x_values(path: &Path) -> (u64, Vec<f64>) {
+        let mut reader = BufReader::new(File::open(path).unwrap());
+        let layout = parse_layout(&mut reader).unwrap();
+        let mut row = vec![0_u8; layout.stride];
+        let mut xs = Vec::new();
+        for _ in 0..layout.count {
+            reader.read_exact(&mut row).unwrap();
+            xs.push(read_float(&row, layout.offsets["x"]));
+        }
+        (layout.count, xs)
+    }
+
+    fn instance_fixture(labels: &[i32]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let positions = (0..labels.len())
+            .map(|index| [(index * 2) as f32, 0.0, 0.0])
+            .collect::<Vec<_>>();
+        write_fixture_rows(&directory.path().join("final.ply"), &positions);
+        crate::reconstruction::backproject::write_instance_mask(
+            &directory.path().join("derived").join("instance.mask"),
+            labels.len() as u64,
+            labels,
+        )
+        .unwrap();
+        directory
+    }
+
+    #[test]
+    fn splits_final_ply_into_object_and_background_assets_without_touching_source() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let source = project.path().join("final.ply");
+        let original = std::fs::read(&source).unwrap();
+
+        let info = export_instance_assets(project.path(), || Ok(())).unwrap();
+
+        assert_eq!(info.object.splat_count, 2);
+        assert_eq!(info.background.splat_count, 2);
+        assert_eq!(std::fs::read(&source).unwrap(), original, "final.ply bytes changed");
+        let (object_count, object_x) =
+            read_x_values(&project.path().join("assets").join("object.ply"));
+        let (background_count, background_x) =
+            read_x_values(&project.path().join("assets").join("background.ply"));
+        assert_eq!((object_count, background_count), (2, 2));
+        assert_eq!(object_x, vec![2.0, 6.0]);
+        assert_eq!(background_x, vec![0.0, 4.0]);
+    }
+
+    #[test]
+    fn rejects_instance_mask_for_a_different_splat_count() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        std::fs::remove_file(project.path().join("derived").join("instance.mask")).unwrap();
+        crate::reconstruction::backproject::write_instance_mask(
+            &project.path().join("derived").join("instance.mask"),
+            3,
+            &[0, 1, 0],
+        )
+        .unwrap();
+
+        assert!(export_instance_assets(project.path(), || Ok(())).is_err());
+        assert!(!project.path().join("assets").join("object.ply").exists());
+    }
+
+    #[test]
+    fn rejects_corrupted_instance_mask() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let mask = project.path().join("derived").join("instance.mask");
+        let mut bytes = std::fs::read(&mask).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&mask, bytes).unwrap();
+
+        assert!(export_instance_assets(project.path(), || Ok(())).is_err());
+        assert!(!project.path().join("assets").join("background.ply").exists());
+    }
+
+    #[test]
+    fn rejects_split_when_either_side_is_empty() {
+        let no_object = instance_fixture(&[0, 0, 0, 0]);
+        assert!(export_instance_assets(no_object.path(), || Ok(())).is_err());
+        let no_background = instance_fixture(&[1, 1, 1, 1]);
+        assert!(export_instance_assets(no_background.path(), || Ok(())).is_err());
+        assert!(!no_object.path().join("assets").join("object.ply").exists());
+        assert!(!no_background.path().join("assets").join("background.ply").exists());
+    }
+
+    #[test]
+    fn cancelled_asset_split_publishes_nothing_and_cleans_temporaries() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let calls = std::cell::Cell::new(0);
+        let result = export_instance_assets(project.path(), || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 1 {
+                Err(SplatError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        let assets = project.path().join("assets");
+        let leftovers = std::fs::read_dir(&assets)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "cancelled split left files in assets/");
+    }
 }
