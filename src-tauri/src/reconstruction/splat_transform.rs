@@ -564,6 +564,110 @@ pub fn export_transformed_ply_to(
     Ok(info)
 }
 
+/// Result of splitting `final.ply` by the derived instance bitmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceAssetInfo {
+    pub object: PlyInfo,
+    pub background: PlyInfo,
+}
+
+/// Splits `final.ply` into `assets/object.ply` (instance bit set) and
+/// `assets/background.ply` (bit clear) using `derived/instance.mask`.
+///
+/// Both subsets are written to temporaries inside `assets/` and published
+/// only after each passes PLY validation and its splat count is checked.
+/// `final.ply` is opened read-only and is never overwritten, so the source
+/// bytes stay identical whether the split succeeds, fails or is cancelled.
+pub fn export_instance_assets(
+    project_root: &Path,
+    check_cancelled: impl Fn() -> Result<()>,
+) -> Result<InstanceAssetInfo> {
+    check_cancelled()?;
+    let mut reader = BufReader::new(File::open(project_root.join("final.ply"))?);
+    let layout = parse_layout(&mut reader)?;
+    let (revision, object_count, mask) = super::edit_mask::read_mask_container(
+        &project_root.join("derived").join("instance.mask"),
+        layout.count,
+    )?;
+    if revision != 0 {
+        return Err(SplatError::Process(
+            "实例位图修订号无效，无法拆分 object/background".into(),
+        ));
+    }
+    let background_count = layout.count - object_count;
+    if object_count == 0 || background_count == 0 {
+        return Err(SplatError::Process(
+            "实例位图未同时包含物体与背景 splat，无法拆分".into(),
+        ));
+    }
+    let is_object = |index: u64| mask[(index / 8) as usize] & (1 << (index % 8)) != 0;
+
+    let assets = project_root.join("assets");
+    std::fs::create_dir_all(&assets)?;
+    let object_path = assets.join("object.ply");
+    let background_path = assets.join("background.ply");
+    let object_temp = assets.join(format!(".object-{}.ply.tmp", Uuid::new_v4()));
+    let background_temp = assets.join(format!(".background-{}.ply.tmp", Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let open = |path: &Path| -> Result<BufWriter<File>> {
+            let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+            Ok(BufWriter::new(file))
+        };
+        let mut object_writer = open(&object_temp)?;
+        let mut background_writer = open(&background_temp)?;
+        object_writer.write_all(&header_with_vertex_count(&layout.header, object_count))?;
+        background_writer.write_all(&header_with_vertex_count(&layout.header, background_count))?;
+
+        let mut rows_done = 0_u64;
+        let mut chunk = vec![0_u8; layout.stride * ROWS_PER_CHUNK];
+        while rows_done < layout.count {
+            check_cancelled()?;
+            let rows = ((layout.count - rows_done) as usize).min(ROWS_PER_CHUNK);
+            let bytes = rows * layout.stride;
+            reader.read_exact(&mut chunk[..bytes])?;
+            for (chunk_index, row) in chunk[..bytes].chunks_exact(layout.stride).enumerate() {
+                let index = rows_done + chunk_index as u64;
+                if is_object(index) {
+                    object_writer.write_all(row)?;
+                } else {
+                    background_writer.write_all(row)?;
+                }
+            }
+            rows_done += rows as u64;
+        }
+        for writer in [&mut object_writer, &mut background_writer] {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        Ok(())
+    })();
+    let cleanup = || {
+        let _ = std::fs::remove_file(&object_temp);
+        let _ = std::fs::remove_file(&background_temp);
+    };
+    if let Err(error) = result {
+        cleanup();
+        return Err(error);
+    }
+
+    let validated = (|| -> Result<InstanceAssetInfo> {
+        let object = inspect_gaussian_ply(&object_temp)?;
+        let background = inspect_gaussian_ply(&background_temp)?;
+        if object.splat_count != object_count || background.splat_count != background_count {
+            return Err(SplatError::Process("拆分 PLY 的 Splat 数量校验失败".into()));
+        }
+        check_cancelled()?;
+        publish_export(&object_temp, &object_path)?;
+        publish_export(&background_temp, &background_path)?;
+        Ok(InstanceAssetInfo { object, background })
+    })();
+    if validated.is_err() {
+        cleanup();
+    }
+    validated
+}
+
 // PlayCanvas uses real SH coefficients grouped by channel and by bands of 3, 5 and 7.
 struct ShRotation {
     band1: [[f64; 3]; 3],
@@ -1037,7 +1141,11 @@ mod tests {
 
         assert_eq!(info.object.splat_count, 2);
         assert_eq!(info.background.splat_count, 2);
-        assert_eq!(std::fs::read(&source).unwrap(), original, "final.ply bytes changed");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original,
+            "final.ply bytes changed"
+        );
         let (object_count, object_x) =
             read_x_values(&project.path().join("assets").join("object.ply"));
         let (background_count, background_x) =
@@ -1071,7 +1179,11 @@ mod tests {
         std::fs::write(&mask, bytes).unwrap();
 
         assert!(export_instance_assets(project.path(), || Ok(())).is_err());
-        assert!(!project.path().join("assets").join("background.ply").exists());
+        assert!(!project
+            .path()
+            .join("assets")
+            .join("background.ply")
+            .exists());
     }
 
     #[test]
@@ -1081,7 +1193,11 @@ mod tests {
         let no_background = instance_fixture(&[1, 1, 1, 1]);
         assert!(export_instance_assets(no_background.path(), || Ok(())).is_err());
         assert!(!no_object.path().join("assets").join("object.ply").exists());
-        assert!(!no_background.path().join("assets").join("background.ply").exists());
+        assert!(!no_background
+            .path()
+            .join("assets")
+            .join("background.ply")
+            .exists());
     }
 
     #[test]
