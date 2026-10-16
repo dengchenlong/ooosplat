@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectAssetDescriptor, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -152,6 +152,15 @@ export async function prepareGaussianPreview(projectId: string): Promise<Gaussia
       ? previewAssetUrl(convertFileSrc(descriptor.editMaskAssetPath), "editSession", crypto.randomUUID())
       : null,
   };
+}
+/** Lists the project's preview assets (final.ply + split object/background when present). */
+export async function listProjectAssets(projectId: string): Promise<Array<ProjectAssetDescriptor & { assetUrl: string }>> {
+  if (!inTauri()) return [];
+  const assets = await invoke<ProjectAssetDescriptor[]>("list_project_assets", { projectId });
+  return assets.map((asset) => ({
+    ...asset,
+    assetUrl: previewAssetUrl(convertFileSrc(asset.path), "assetSession", crypto.randomUUID()),
+  }));
 }
 export async function releaseGaussianPreview(projectId: string): Promise<void> { return invoke("release_gaussian_preview", { projectId }); }
 export async function saveGaussianTransform(projectId: string, transform: GaussianTransform): Promise<GaussianTransform> { return invoke("save_gaussian_transform", { projectId, transform }); }
