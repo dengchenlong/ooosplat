@@ -299,3 +299,11 @@ export interface GaussianVideoExportResult {
   fps: number;
   durationMs: number;
 }
+
+/** One entry of a project's split-asset list (issue #6). */
+export interface ProjectAssetDescriptor {
+  kind: "final" | "object" | "background";
+  path: string;
+  fileSize: number;
+  splatCount: number;
+}

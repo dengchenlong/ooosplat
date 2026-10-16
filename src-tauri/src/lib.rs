@@ -76,6 +76,7 @@ pub fn run_app() {
             commands::inspect_reshoot_source,
             commands::probe_reshoot_input,
             commands::start_incremental_reshoot_pipeline,
+            commands::list_project_assets,
             commands::resume_pipeline,
             commands::cancel_pipeline,
             commands::get_app_runtime_status,

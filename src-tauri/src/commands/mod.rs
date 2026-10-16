@@ -1944,10 +1944,10 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_dropped_input_path, classify_pipeline_failure, contains_mp4_ftyp,
-        create_preview_asset, next_gaussian_video_path, persisted_task_stage, preview_client_path,
-        read_project_log_tail, write_gaussian_video, GaussianVideoExportSession,
-        PipelineCommandError, VideoOrientation,
+        classify_dropped_input_path, classify_pipeline_failure, collect_project_assets,
+        contains_mp4_ftyp, create_preview_asset, next_gaussian_video_path, persisted_task_stage,
+        preview_client_path, read_project_log_tail, write_gaussian_video,
+        GaussianVideoExportSession, PipelineCommandError, VideoOrientation,
     };
     use crate::error::SplatError;
     use crate::pipeline::{PipelineEngine, PipelineStage};
@@ -2335,6 +2335,74 @@ mod tests {
         assert!(!session.destination.exists());
         assert!(!session.temporary.exists());
     }
+
+    /// Writes a tiny but valid Gaussian PLY so `inspect_gaussian_ply` accepts it.
+    fn write_minimal_gaussian_ply(path: &Path, count: usize) {
+        let header = format!(
+            "ply
+format binary_little_endian 1.0
+element vertex {count}
+property float x
+property float y
+property float z
+property float f_dc_0
+property float opacity
+property float scale_0
+property float rot_0
+end_header
+"
+        );
+        // 7 float properties per vertex.
+        let row = [0f32; 7];
+        let mut bytes = header.into_bytes();
+        for _ in 0..count {
+            bytes.extend_from_slice(&row.map(f32::to_le_bytes).concat());
+        }
+        fs::write(path, bytes).expect("write fixture ply");
+    }
+
+    #[test]
+    fn asset_list_includes_final_and_split_assets_that_exist() {
+        let root = tempdir().expect("temporary project");
+        write_minimal_gaussian_ply(&root.path().join("final.ply"), 2);
+        fs::create_dir(root.path().join("assets")).unwrap();
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object.ply"), 1);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("background.ply"), 1);
+
+        let assets = collect_project_assets(root.path()).expect("asset list");
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["final", "object", "background"]
+        );
+        assert_eq!(assets[0].splat_count, 2);
+        assert_eq!(assets[1].splat_count, 1);
+        assert_eq!(assets[2].splat_count, 1);
+        assert!(assets[0].file_size > 0);
+    }
+
+    #[test]
+    fn asset_list_skips_missing_split_assets_but_keeps_final() {
+        let root = tempdir().expect("temporary project");
+        write_minimal_gaussian_ply(&root.path().join("final.ply"), 2);
+
+        let assets = collect_project_assets(root.path()).expect("asset list");
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["final"]
+        );
+    }
+
+    #[test]
+    fn asset_list_without_any_ply_fails() {
+        let root = tempdir().expect("temporary project");
+        assert!(collect_project_assets(root.path()).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2418,6 +2486,94 @@ pub async fn start_gui_reshoot(
         )
         .await
 }
+
+/// A listed preview asset for the frontend asset panel (issue #6).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAssetDescriptor {
+    pub kind: String,
+    pub path: PathBuf,
+    pub file_size: u64,
+    pub splat_count: u64,
+}
+
+/// Candidates for the split-asset list, in display order.
+fn project_asset_candidates(project_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("final", project_root.join("final.ply")),
+        ("object", project_root.join("assets").join("object.ply")),
+        (
+            "background",
+            project_root.join("assets").join("background.ply"),
+        ),
+    ]
+}
+
+/// Builds the frontend asset list from the project root without opening Tauri
+/// state, so it stays unit-testable. Only files that exist and pass PLY header
+/// inspection are listed; the original final.ply is opened read-only.
+fn collect_project_assets(project_root: &Path) -> Result<Vec<ProjectAssetDescriptor>> {
+    let mut assets = Vec::new();
+    for (kind, path) in project_asset_candidates(project_root) {
+        if !path.is_file() {
+            continue;
+        }
+        let info = crate::reconstruction::ply::inspect_gaussian_ply(&path)?;
+        assets.push(ProjectAssetDescriptor {
+            kind: kind.to_string(),
+            path,
+            file_size: info.file_size,
+            splat_count: info.splat_count,
+        });
+    }
+    if assets.is_empty() {
+        return Err(SplatError::Process("项目缺少可预览的 PLY 资产".into()));
+    }
+    Ok(assets)
+}
+
+/// Lists the project's preview assets (final.ply plus split object/background
+/// subsets when present) as hard-linked session copies for the asset protocol.
+#[tauri::command]
+pub async fn list_project_assets(
+    app: tauri::AppHandle,
+    state: State<'_, PreviewController>,
+    project_id: String,
+) -> Result<Vec<ProjectAssetDescriptor>> {
+    let _lifecycle = state.lifecycle.lock().await;
+    if state.html_export.lock().await.is_some() || state.video_export.lock().await.is_some() {
+        return Err(SplatError::Process(
+            "导出期间不能重新加载或切换预览项目".into(),
+        ));
+    }
+    let id = parse_project_id(&project_id)?;
+    let (project_root, _final_ply, _metadata) =
+        catalog::registered_final_ply_for_project(id).await?;
+    let assets = collect_project_assets(&project_root)?;
+    let mut asset_paths = Vec::new();
+    let mut descriptors = Vec::new();
+    for asset in assets {
+        let copy = create_preview_asset(&project_root, &asset.path).await?;
+        app.asset_protocol_scope()
+            .allow_file(&copy)
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&copy);
+                SplatError::Process(format!("无法开放本地 PLY 预览资源：{error}"))
+            })?;
+        asset_paths.push(copy.clone());
+        descriptors.push(ProjectAssetDescriptor {
+            kind: asset.kind,
+            path: preview_client_path(&copy),
+            file_size: asset.file_size,
+            splat_count: asset.splat_count,
+        });
+    }
+    *state.active.lock().await = Some(GaussianPreviewSession {
+        project_id: id,
+        asset_paths,
+    });
+    Ok(descriptors)
+}
+
 #[tauri::command]
 pub async fn start_incremental_reshoot_pipeline(
     app: tauri::AppHandle,
