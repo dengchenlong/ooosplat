@@ -83,6 +83,7 @@ import type {
   GaussianTransform,
   GaussianVideoExportResult,
   GaussianVideoExportSession,
+  ProjectAssetDescriptor,
   GaussianHtmlView,
   GaussianHtmlExportResult,
   GaussianHtmlExportProgress,
@@ -127,6 +128,10 @@ import { TransformPanel } from "./TransformPanel";
 import { SelectionPanel } from "./SelectionPanel";
 import { PreviewExportMenu, PreviewOrientationControl } from "./PreviewExportControls";
 import { EDITABLE_SPLAT_ASSET_OPTIONS, splatTextureCapacityError } from "./SplatLoadPolicy";
+import { AssetVisibilityPanel, defaultHiddenKinds } from "./AssetVisibilityPanel";
+import { DerivedSplatLayer } from "./DerivedSplatLayer";
+import { useAssetVisibilityStore, visibleKinds } from "../../stores/assetVisibilityStore";
+import { listProjectAssets } from "../../lib/backend";
 import { createSplatRangeSource, shouldUseSplatRange } from "./SplatRangeSource";
 import { ViewerControls, type ViewerCameraState } from "./ViewerControls";
 
@@ -963,6 +968,19 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     return withPreviewAssetRevision(store.descriptor.assetUrl, "retry", rendererRevision.toString());
   }, [rendererRevision, store.descriptor]);
 
+  const [derivedAssets, setDerivedAssets] = useState<Array<ProjectAssetDescriptor & { assetUrl: string }>>([]);
+  const hiddenKinds = useAssetVisibilityStore((state) => state.hiddenKinds);
+  useEffect(() => {
+    let active = true;
+    setDerivedAssets([]);
+    useAssetVisibilityStore.getState().reset();
+    void listProjectAssets(store.descriptor?.projectId ?? "").then((assets) => {
+      if (active) setDerivedAssets(assets.filter((asset) => asset.kind !== "final"));
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [store.descriptor?.projectId]);
+  const shownKinds = visibleKinds(derivedAssets, hiddenKinds);
+
   const onStatus = useCallback((status: ViewportStatus) => setViewport(status), []);
   const onAnimationStatus = useCallback((status: AnimationStatus) => setAnimationStatus(status), []);
   const busy = htmlBusy || htmlConfirm || cropFreezing || gaussianExporting || !["idle", "completed", "error"].includes(videoPhase);
@@ -1524,6 +1542,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       <div ref={viewportElementRef} inert={htmlBusy || htmlConfirm || videoBusy || gaussianExporting} className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
         <Application key={`${store.descriptor.projectId}-${rendererRevision}`} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
           <SplatScene ref={sceneApiRef} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} onOrthographicViewChange={setOrthographicView} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
+          {derivedAssets.map((asset) => (
+            <DerivedSplatLayer key={asset.kind} asset={asset} assetUrl={asset.assetUrl} visible={shownKinds.includes(asset.kind)} transform={store.transform} />
+          ))}
         </Application>
         {mode === "preview" && <div ref={captureGuideRef} className={`portrait-capture-guide orientation-${orientation}`} style={guideSize} aria-hidden="true">
           <div className="portrait-frame-label"><span>{gaussianVideoDimensions(orientation).width} × {gaussianVideoDimensions(orientation).height}</span><span>30 FPS</span></div>
@@ -1549,6 +1570,14 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
           <small>{videoPhase === "rendering" ? t("viewer.framesProgress", { percent: Math.round(videoProgress.progress * 100), current: videoProgress.currentFrame, total: GAUSSIAN_VIDEO_FRAME_COUNT }) : t("viewer.keepOpen")}</small>
         </div>}
       </div>
+    </div>
+    <div className="preview-asset-panel">
+      <AssetVisibilityPanel
+        assets={derivedAssets}
+        hiddenKinds={hiddenKinds}
+        onHiddenKindsChange={(next) => useAssetVisibilityStore.setState({ hiddenKinds: next })}
+      />
+      {derivedAssets.length === 0 && <span className="preview-asset-empty">{t("viewer.assetsNotSplit")}</span>}
     </div>
     <footer className="preview-statusbar">
       <span><b>{t("viewer.splats")}</b>{formatNumber(store.descriptor.splatCount)}</span>
