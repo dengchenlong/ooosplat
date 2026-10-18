@@ -33,7 +33,6 @@ Main development version: **0.6.1**. Latest published release: **0.5.0**. The cu
 | P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
 | P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
-| P2 | Create projects and import PLY from “02 History” | Import an existing PLY directly as an OOOSplat project for preview and editing without running the generation pipeline. | To be created |
 | P3 | Panoramic video support | Explore a workflow for using panoramic video as input and producing usable Gaussian Splatting results. | To be created |
 
 ## Completed
@@ -57,6 +56,7 @@ Main development version: **0.6.1**. Latest published release: **0.5.0**. The cu
 | Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
 | Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
 | Completed · 0.6.0 | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented in the 0.6.0 main development version |
+| Completed · main | External Gaussian and COLMAP project import | Imports standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group, detects COLMAP automatically, keeps external data read-only, and enables eligible incremental reshoots. | Implemented on main |
 
 ## Tracking and Contributions
 

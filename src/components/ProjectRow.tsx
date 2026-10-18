@@ -1,5 +1,5 @@
 import { CircleAlert, Eye, Film, LoaderCircle, MapPin, Play, Trash2 } from 'lucide-react';
-import { useI18n } from '../i18n';
+import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskBasename, taskFormatBytes, taskStatusLabel } from '../app/taskPresentation';
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useTaskElapsed } from '../app/useTaskElapsed';
@@ -41,6 +41,8 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
   const visiblePath = displayPath(path);
   const failure = task ? task.error?.message : project?.failureMessage;
   const duration = task?.run_id ? taskElapsed : project?.durationMs ?? null;
+  const imported = project?.taskKind === 'import';
+  const missingValue = imported ? '/' : '—';
   return <article className={selected ? 'project-row selected' : 'project-row'} data-task-id={task?.task_id} tabIndex={0} role="button" aria-pressed={selected} onClick={select} onKeyDown={event => {
     if (event.target !== event.currentTarget) return;
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(); }
@@ -50,17 +52,17 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
       <p className="project-path" title={visiblePath}>{visiblePath}</p>
       {task?.source === 'mcp' && <p className="task-origin">{locale === 'zh-CN' ? '由 AI Agent 创建' : 'Created by AI Agent'}</p>}
       {failure && <p className="project-failure"><CompactError message={failure} /></p>}
-      {project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
+      {project?.taskKind !== "import" && project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
     </div>
     <dl className="project-stats">
-      <div><dt>PLY</dt><dd>{taskFormatBytes(project?.fileSize ?? null, locale)}</dd></div>
+      <div><dt>PLY</dt><dd>{project?.fileSize == null ? missingValue : taskFormatBytes(project.fileSize, locale)}</dd></div>
       <div><dt>{t('project.date')}</dt><dd>{formatDate(project?.completedAt ?? project?.createdAt ?? task?.created_at ?? '')}</dd></div>
-      <div><dt>{t('project.elapsed')}</dt><dd>{duration == null ? '—' : formatDuration(duration)}</dd></div>
-      <div><dt>{t('project.quality')}</dt><dd>{t(`quality.${task?.quality ?? project?.quality ?? 'balanced'}`)}</dd></div>
+      <div><dt>{t('project.elapsed')}</dt><dd>{duration == null || imported ? missingValue : formatDuration(duration)}</dd></div>
+      <div><dt>{t('project.quality')}</dt><dd>{imported || (!task?.quality && !project?.quality) ? missingValue : t(`quality.${task?.quality ?? project?.quality ?? 'balanced'}`)}</dd></div>
     </dl>
     {project && <div className="project-actions">
       {status === 'completed' && <button className="preview-link" type="button" disabled={previewDisabled || !project.finalPly} onClick={event => { event.stopPropagation(); select(); onPreview(project); }}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{t(previewing ? 'project.opening' : 'project.preview')}</button>}
-      {status === 'completed' && <button className="reshoot-link" type="button" disabled={previewDisabled || !project.finalPly} onClick={event => { event.stopPropagation(); select(); onReshoot(project); }}><Film size={14} />{t('project.reshoot')}</button>}
+      {status === 'completed' && <button className="reshoot-link" type="button" title={project.taskKind === 'import' && !project.reshootEligible ? project.reshootReason ? localizePipelineMessage(locale, project.reshootReason) : t('reshoot.ineligible') : undefined} disabled={previewDisabled || !project.finalPly || (project.taskKind === 'import' && !project.reshootEligible)} onClick={event => { event.stopPropagation(); select(); onReshoot(project); }}><Film size={14} />{t('project.reshoot')}</button>}
       {canResume && <button className="resume-link" type="button" disabled={busy} onClick={event => { event.stopPropagation(); select(); onResume(project); }}><Play size={14} fill="currentColor" />{t('project.resume')}</button>}
       <button type="button" disabled={revealing} onClick={event => { event.stopPropagation(); select(); onReveal(project); }}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t('project.reveal')}</button>
       <button className="danger-link" type="button" disabled={busy || active || deleting} onClick={event => { event.stopPropagation(); onDelete(project); }}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t('project.delete')}</button>

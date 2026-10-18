@@ -186,6 +186,51 @@ pub struct ProjectOutput {
     pub points_3d: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportedGaussianFormat {
+    Ply,
+    CompressedPly,
+    Sog,
+    Spz,
+    Splat,
+    Ksplat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalFileFingerprint {
+    pub sha256: String,
+    pub file_size: u64,
+    pub modified_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedColmapProvenance {
+    pub root_path: PathBuf,
+    pub sparse_model_path: PathBuf,
+    pub database_path: Option<PathBuf>,
+    pub images_path: Option<PathBuf>,
+    pub registered_images: u64,
+    pub points_3d: u64,
+    pub camera_count: u64,
+    pub reshoot_eligible: bool,
+    pub reshoot_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectProvenance {
+    pub source_model_path: PathBuf,
+    pub source_format: ImportedGaussianFormat,
+    pub source_fingerprint: ExternalFileFingerprint,
+    /// Relative to the OOOSplat project root. Present for converted formats.
+    pub canonical_model_path: Option<PathBuf>,
+    #[serde(default)]
+    pub colmap: Option<ImportedColmapProvenance>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMetadata {
@@ -230,6 +275,10 @@ pub struct ProjectMetadata {
     /// 高清补拍溯源：仅当本项目由补拍派生时存在。源项目始终只读。
     #[serde(default)]
     pub reshoot: Option<ReshootProvenance>,
+    /// Provenance for an externally-owned Gaussian model. External files are
+    /// references only; OOOSplat deletes only its own project and cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<ImportedProjectProvenance>,
 }
 
 /// Where a derived reshoot project came from, and what was added to it.
@@ -266,7 +315,7 @@ pub struct ReshootProvenance {
 }
 
 pub const fn schema_version() -> u32 {
-    7
+    8
 }
 
 fn default_model() -> String {

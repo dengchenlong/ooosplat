@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { brushLock } from "./brush-runtime.mjs";
+import { assertWindowsFfmpegRelease } from "./ffmpeg-release-policy.mjs";
 
 const workspace = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -36,10 +37,13 @@ const requiredFiles = [
   "GENERATED_OUTPUTS.md",
   "licenses/THIRD_PARTY_NOTICES.txt",
   "licenses/FFmpeg-LGPL-2.1.txt",
+  "licenses/FFmpeg-LGPL-3.0.txt",
+  "licenses/FFmpeg-GPL-3.0.txt",
   "licenses/COLMAP-LICENSE.txt",
   "licenses/NVIDIA-CUDA-Runtime.txt",
   "licenses/Brush-LICENSE.txt",
   "licenses/PlayCanvas-MIT.txt",
+  "licenses/Niantic-SPZ-MIT.txt",
   "licenses/Mediabunny-MPL-2.0.txt",
   "engines/manifest.json",
   "engines/manifest.linux.json",
@@ -83,10 +87,13 @@ for (const resource of [
   "../GENERATED_OUTPUTS.md",
   "../licenses/THIRD_PARTY_NOTICES.txt",
   "../licenses/FFmpeg-LGPL-2.1.txt",
+  "../licenses/FFmpeg-LGPL-3.0.txt",
+  "../licenses/FFmpeg-GPL-3.0.txt",
   "../licenses/COLMAP-LICENSE.txt",
   "../licenses/NVIDIA-CUDA-Runtime.txt",
   "../licenses/Brush-LICENSE.txt",
   "../licenses/PlayCanvas-MIT.txt",
+  "../licenses/Niantic-SPZ-MIT.txt",
   "../licenses/Mediabunny-MPL-2.0.txt",
 ]) {
   assert(Object.hasOwn(tauri.bundle?.resources ?? {}, resource), `Tauri resources are missing ${resource}.`);
@@ -130,7 +137,7 @@ for (const resource of [
 }
 
 const expectedEngines = new Map([
-  ["FFmpeg / FFprobe", { license: "LGPL-2.1-or-later", file: "licenses/FFmpeg-LGPL-2.1.txt" }],
+  ["FFmpeg / FFprobe", { license: "LGPL-3.0-or-later", file: "licenses/FFmpeg-LGPL-3.0.txt", additionalFiles: ["licenses/FFmpeg-GPL-3.0.txt"] }],
   ["COLMAP", { license: "BSD-3-Clause", file: "licenses/COLMAP-LICENSE.txt" }],
   ["Brush", { license: "Apache-2.0", file: "licenses/Brush-LICENSE.txt" }],
 ]);
@@ -156,9 +163,13 @@ for (const engine of manifest.engines) {
   const expected = expectedEngines.get(engine.name);
   assert(expected, `Unexpected direct engine in manifest: ${engine.name}`);
   assert(engine.license?.startsWith(expected.license), `${engine.name} license identifier does not match ${expected.license}.`);
-  assert(engine.licenseFiles?.length === 1, `${engine.name} must map to one direct license file.`);
-  assert(engine.licenseFiles[0] === expected.file, `${engine.name} license file mapping is incorrect.`);
-  assert(existsSync(workspacePath(expected.file)), `${engine.name} mapped license file is missing.`);
+  const expectedFiles = [expected.file, ...(expected.additionalFiles ?? [])];
+  assert(engine.licenseFiles?.length === expectedFiles.length, `${engine.name} license file count is incorrect.`);
+  for (const file of expectedFiles) {
+    assert(engine.licenseFiles.includes(file), `${engine.name} license file mapping is incorrect.`);
+    assert(existsSync(workspacePath(file)), `${engine.name} mapped license file is missing.`);
+    assertContains(thirdParty, file, "THIRD_PARTY_NOTICES.txt");
+  }
   assertContains(thirdParty, engine.name, "THIRD_PARTY_NOTICES.txt");
   assertContains(thirdParty, expected.license, "THIRD_PARTY_NOTICES.txt");
   assertContains(thirdParty, expected.file, "THIRD_PARTY_NOTICES.txt");
@@ -174,10 +185,7 @@ for (const platform of ["windows", "linux", "macos"]) {
   assertContains(thirdParty, brush.commit, "THIRD_PARTY_NOTICES.txt");
 }
 assert(windowsFfmpeg, "Windows FFmpeg manifest entry is missing.");
-assert(
-  !windowsFfmpeg.sourceUrl?.includes("/latest/"),
-  "Windows FFmpeg source URL must reference an immutable release asset, not /latest/.",
-);
+assertWindowsFfmpegRelease(windowsFfmpeg);
 assertContains(thirdParty, windowsFfmpeg.actualVersion, "THIRD_PARTY_NOTICES.txt");
 assertContains(thirdParty, windowsFfmpeg.sourceUrl, "THIRD_PARTY_NOTICES.txt");
 
@@ -212,7 +220,9 @@ assert(macosManifest.buildEnvironment?.runner === "macos-15", "macOS engine runn
 assert(macosManifest.buildEnvironment?.usePinnedHomebrewBottles === true, "macOS build dependencies must use pinned Homebrew bottles.");
 assert(macosManifest.engines?.length === 3, "macOS manifest must contain the three direct engines.");
 for (const engine of macosManifest.engines) {
-  const expected = expectedEngines.get(engine.name);
+  const expected = engine.name === "FFmpeg / FFprobe"
+    ? { license: "LGPL-2.1-or-later", file: "licenses/FFmpeg-LGPL-2.1.txt" }
+    : expectedEngines.get(engine.name);
   assert(expected, `Unexpected macOS engine: ${engine.name}`);
   assert(engine.license === expected.license, `${engine.name} macOS license identifier is incorrect.`);
   assert(engine.licenseFiles?.length === 1 && engine.licenseFiles[0] === expected.file, `${engine.name} macOS license mapping is incorrect.`);
@@ -228,7 +238,7 @@ for (const marker of [
   assertContains(thirdParty, marker, "THIRD_PARTY_NOTICES.txt");
 }
 
-for (const component of ["PlayCanvas Engine", "PlayCanvas React", "PlayCanvas splat-transform (adapted algorithm)", "SuperSplat selection workflow (adapted algorithm)"]) {
+for (const component of ["PlayCanvas Engine", "PlayCanvas React", "PlayCanvas splat-transform", "Niantic SPZ / @adobe/spz", "SuperSplat selection workflow (adapted algorithm)"]) {
   assertContains(thirdParty, component, "THIRD_PARTY_NOTICES.txt");
 }
 assertContains(thirdParty, "licenses/PlayCanvas-MIT.txt", "THIRD_PARTY_NOTICES.txt");
@@ -273,6 +283,9 @@ const ffmpegLicense = readText("licenses/FFmpeg-LGPL-2.1.txt");
 assertContains(ffmpegLicense, "GNU LESSER GENERAL PUBLIC LICENSE", "FFmpeg license");
 assertContains(ffmpegLicense, "Version 2.1, February 1999", "FFmpeg license");
 assert(!ffmpegLicense.includes("Version 3, 29 June 2007"), "FFmpeg license still contains the LGPLv3 text.");
+assertContains(readText("licenses/FFmpeg-LGPL-3.0.txt"), "GNU LESSER GENERAL PUBLIC LICENSE", "Windows FFmpeg license");
+assertContains(readText("licenses/FFmpeg-LGPL-3.0.txt"), "Version 3, 29 June 2007", "Windows FFmpeg license");
+assertContains(readText("licenses/FFmpeg-GPL-3.0.txt"), "GNU GENERAL PUBLIC LICENSE", "Windows FFmpeg incorporated terms");
 
 const colmapLicense = readText("licenses/COLMAP-LICENSE.txt");
 for (const marker of [

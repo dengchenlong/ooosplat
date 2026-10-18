@@ -158,9 +158,9 @@ pub async fn begin_gaussian_html_export(
             "Open this project in preview before exporting".into(),
         ));
     }
-    if state.video_export.lock().await.is_some() {
+    if state.video_export.lock().await.is_some() || state.model_export.lock().await.is_some() {
         return Err(SplatError::Process(
-            "A video export is already running".into(),
+            "A model or video export is already running".into(),
         ));
     }
     let mut slot = state.html_export.lock().await;

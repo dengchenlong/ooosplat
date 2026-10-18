@@ -5,6 +5,8 @@ const DEFAULT_YAW = 35;
 const DEFAULT_PITCH = 22;
 const DEFAULT_OCCUPANCY = 0.85;
 const VIEW_TRANSITION_MS = 320;
+const MAX_ORBIT_PITCH = 89.9;
+const ORBIT_POLE_EPSILON = 1e-6;
 
 export interface FitViewOptions {
   resetDirection?: boolean;
@@ -232,9 +234,7 @@ export class ViewerControls {
       lookTarget.lerp(startTarget, destinationTarget, progress);
       up.lerp(startUp, destinationUp, progress).normalize();
       this.camera.orthoHeight = startOrthoHeight + (destinationOrthoHeight - startOrthoHeight) * progress;
-      this.cameraEntity.setPosition(position);
-      this.cameraEntity.lookAt(lookTarget, up);
-      this.updateClipPlanes(position, lookTarget.clone().sub(position).normalize());
+      this.applyCamera(position, lookTarget, up);
       if (linear < 1) {
         this.transitionFrame = requestAnimationFrame(tick);
       } else {
@@ -329,13 +329,10 @@ export class ViewerControls {
       if (this.orthographicView === "side") position.x += this.distance;
       else if (this.orthographicView === "front") position.z += this.distance;
       else position.y += this.distance;
-      this.cameraEntity.setPosition(position);
-      this.cameraEntity.lookAt(this.target, this.orthographicView === "top" ? new Vec3(0, 0, -1) : Vec3.UP);
-      const forward = this.target.clone().sub(position).normalize();
-      this.updateClipPlanes(position, forward);
+      this.applyCamera(position, this.target, this.orthographicView === "top" ? new Vec3(0, 0, -1) : Vec3.UP);
       return;
     }
-    const { offset, forward, right } = this.cameraBasis();
+    const { offset, right, up } = this.cameraBasis();
     const canvasAspect = this.canvas.clientWidth / Math.max(this.canvas.clientHeight, 1);
     const aspect = canvasAspect > 0 ? canvasAspect : Math.max(this.camera.aspectRatio || 16 / 9, 0.01);
     const halfVerticalFov = (this.camera.fov * Math.PI) / 360;
@@ -343,8 +340,27 @@ export class ViewerControls {
       right.mulScalar(this.distance * Math.tan(halfVerticalFov) * aspect * this.horizontalFrameOffset),
     );
     const position = viewTarget.clone().add(offset.mulScalar(this.distance));
+    this.applyCamera(position, viewTarget, up);
+  }
+
+  private applyCamera(position: Vec3, lookTarget: Vec3, up: Vec3) {
+    const forward = lookTarget.clone().sub(position).normalize();
+    const bounds = this.sceneBounds;
+    if (this.camera.projection === PROJECTION_ORTHOGRAPHIC && bounds) {
+      const half = bounds.halfExtents;
+      const radius = Math.abs(forward.x) * half.x
+        + Math.abs(forward.y) * half.y
+        + Math.abs(forward.z) * half.z;
+      const minimumDepth = bounds.center.clone().sub(position).dot(forward) - radius;
+      const margin = Math.max(half.length() * 0.01, 0.001);
+      if (minimumDepth < margin) {
+        // Orthographic scale depends on orthoHeight, not camera distance. Move only along the
+        // viewing axis to keep the whole scene in front without changing its screen framing.
+        position.sub(forward.clone().mulScalar(margin - minimumDepth));
+      }
+    }
     this.cameraEntity.setPosition(position);
-    this.cameraEntity.lookAt(viewTarget);
+    this.cameraEntity.lookAt(lookTarget, up);
     this.updateClipPlanes(position, forward);
   }
 
@@ -416,19 +432,22 @@ export class ViewerControls {
     if (this.mode === "orbit") {
       if (this.orthographicView) {
         const direction = this.cameraEntity.getPosition().clone().sub(this.target).normalize();
-        this.distance = Math.max(
-          this.camera.orthoHeight / Math.max(Math.tan(this.camera.fov * Math.PI / 360), 0.001),
-          0.01,
+        const horizontalLength = Math.hypot(direction.x, direction.z);
+        this.yaw = horizontalLength < ORBIT_POLE_EPSILON
+          ? 0
+          : Math.atan2(direction.x, direction.z) * 180 / Math.PI;
+        this.pitch = Math.max(
+          -MAX_ORBIT_PITCH,
+          Math.min(
+            MAX_ORBIT_PITCH,
+            Math.asin(Math.max(-1, Math.min(1, direction.y))) * 180 / Math.PI,
+          ),
         );
-        this.yaw = Math.atan2(direction.x, direction.z) * 180 / Math.PI;
-        this.pitch = Math.asin(Math.max(-1, Math.min(1, direction.y))) * 180 / Math.PI;
         this.orthographicView = null;
-        this.camera.projection = PROJECTION_PERSPECTIVE;
-        this.horizontalFrameOffset = 0;
         this.onOrthographicViewChange?.(null);
       }
       this.yaw -= dx * 0.3;
-      this.pitch = Math.max(-89, Math.min(89, this.pitch + dy * 0.3));
+      this.pitch = Math.max(-MAX_ORBIT_PITCH, Math.min(MAX_ORBIT_PITCH, this.pitch + dy * 0.3));
     } else {
       const speed = this.distance * 0.0016;
       this.target.add(this.cameraEntity.right.clone().mulScalar(-dx * speed));

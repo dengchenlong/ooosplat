@@ -10,6 +10,9 @@ function readJson(relative) {
 }
 
 const common = readJson("src-tauri/tauri.conf.json");
+// Worker resources are bundled by Vite on all platforms, not loaded from a CDN.
+if (!fs.existsSync(path.join(workspace, "node_modules/@playcanvas/splat-transform/lib/webp.wasm"))) throw new Error("Local model-export WebP WASM is missing; restore the locked npm dependencies.");
+if (!common.app.security.csp.includes("'wasm-unsafe-eval'") || common.app.security.csp.includes("'unsafe-eval'")) throw new Error("Model codecs require WASM, not unrestricted JavaScript evaluation.");
 const viewerSource = "../.cache/html-viewer/runtime.js";
 if (common.bundle?.resources?.[viewerSource] !== "html-viewer/runtime.js") throw new Error("The shared offline HTML viewer resource must be bundled on every platform.");
 if (!fs.existsSync(path.resolve(configDirectory, viewerSource))) throw new Error("Offline HTML viewer not built. Run npm run build:html-viewer first.");

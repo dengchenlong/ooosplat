@@ -51,12 +51,13 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ## Key Features
 
 - **One-click generation**: Create a Gaussian Splat from MP4/MOV video or a JPG, JPEG, and PNG image folder. OOOSplat handles image preparation, camera reconstruction, training, and PLY publishing.
+- **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically and can enable incremental high-resolution reshoots for eligible single-camera projects.
 - **Three quality presets**: Fast, Balanced, and Detailed are available. Auto Optimize selects suitable extraction, resolution, and training settings for the source and available VRAM.
 - **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
 - **Multi-task workspace**: Group tasks into New Tasks, Completed, and Unfinished. Keep multiple drafts, reorder them, and automatically run the next task. Only one generation task runs at a time; tasks can be cancelled or resumed.
 - **Reshoots**: Create a task from a completed project, reuse its camera and reconstruction for new media, then retrain from all registered images. The derived project does not overwrite the original.
 - **Preview and editing**: Prefer WebGPU with a WebGL2 fallback. Use model translation axes and rotation rings, crop tools, point deletion, selection inversion, undo, and redo.
-- **Multiple export formats**: Export portrait or landscape MP4, standalone offline HTML, and original or edited PLY files.
+- **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML.
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
 - **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
 
@@ -148,7 +149,7 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 5. Select the Fast, Balanced, or Detailed quality preset.
 6. Review the automatically detected COLMAP acceleration status and its explanation, then select “Start Generation.”
 7. Follow the selected task's stages, progress, and logs on the left. Click any task on the right to switch details. Generated projects appear under Completed or Unfinished; completed projects offer Preview.
-8. Edit the model in “Preview → Adjust.” Transforms, crops, and deletions are saved automatically in the project; each project's view is stored locally on this device. “Save edits” confirms that the current edits and view have been saved. To create or update `edit.ply`, choose “Export → Export PLY.”
+8. Edit the model in “Preview → Adjust.” Transforms, crops, and deletions are saved automatically in the project; each project's view is stored locally on this device. “Save edits” confirms that the current edits and view have been saved. Choose standard PLY, compressed PLY, SPZ, or SOG directly from “Export,” with no second format confirmation. Both Adjust and Animation support model export.
 9. Switch to Animation, choose Portrait or Landscape, and use Export → Export video for a 30 FPS, 23-second MP4 at 1080×1920 or 1920×1080 respectively. Both Adjust and Animation can export offline HTML. Exports use the current edits, can be cancelled, and provide access to the output folder on completion.
 10. To add detail, choose Reshoot on a completed project. A reshoot draft appears in New Tasks instead of a separate configuration dialog. Choose new media in the left panel and start generation after validation. Use the original device, lens, and camera settings, with plenty of overlap between new and existing views.
 
@@ -190,6 +191,9 @@ Each generation creates a separate directory under the projects root:
   final.ply             Final Gaussian Splatting file
   project.json          Project metadata and result metrics
   edit.ply              Exported edits; safely replaced on later PLY exports (optional)
+  edit.compressed.ply   Compressed PLY export (optional)
+  edit.spz              SPZ v4 export (optional)
+  edit.sog              Bundled SOG export (optional)
   preview.mp4           First optional animation-preview video export
   preview-2.mp4         Later video exports are automatically numbered
   preview-landscape.mp4 Landscape video (later exports are automatically numbered)
@@ -251,7 +255,7 @@ Consent is separate and one-time: you can send a report even with anonymous anal
 
 | Engine | Pinned version/build | Purpose |
 | --- | --- | --- |
-| FFmpeg / FFprobe | Windows x64 pinned 8.1-series LGPL shared build (n8.1.3-14-g330caae0c1); macOS arm64 8.1.2 LGPL shared; Ubuntu system packages | Video analysis and frame extraction |
+| FFmpeg / FFprobe | Windows x64 pinned 8.1-series LGPL shared month-end build (n8.1.3-9-g29e619e767); macOS arm64 8.1.2 LGPL shared; Ubuntu system packages | Video analysis and frame extraction |
 | COLMAP | 4.2.1 same commit; Windows/Linux CUDA + Caspar/Ceres; macOS Ceres CPU | Feature extraction, matching, and camera reconstruction |
 | Brush | OOOBrush ooo-v1.0.0; Windows/Linux x64, macOS arm64 | Headless Gaussian Splatting training and PLY export |
 
@@ -259,7 +263,7 @@ Windows, Ubuntu, and macOS source and integrity policies are recorded in [`engin
 
 Third-party licenses and notices are in [`licenses/`](licenses/):
 
-- FFmpeg: LGPL-2.1-or-later; the selected build disables GPL/nonfree components.
+- FFmpeg: LGPL-3.0-or-later on Windows, LGPL-2.1-or-later on macOS; both builds disable GPL/nonfree components.
 - COLMAP: BSD-3-Clause.
 - Brush: Apache-2.0.
 
@@ -442,7 +446,7 @@ Each project keeps source copies, input images, COLMAP data, and Brush intermedi
 
 ### Can I view final.ply directly in OOOSplat?
 
-Yes. Select “Preview” on a completed project in the task list to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, inversion, undo, and redo. Edits are saved automatically in the project; “Save edits” confirms that the current edits and view have been saved without creating a model file. “Export → Export PLY” creates or updates the single `edit.ply`, while the original `final.ply` remains unchanged. Reopening restores the edits and the view saved on this device; yellow selections and undo history do not persist between sessions. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, watermarked portrait/landscape MP4 export, and offline HTML export. `.sog` and `.spz` are not supported yet.
+Yes. Select “Preview” on a completed project in the task list to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, inversion, undo, and redo. Edits are saved automatically in the project; “Save edits” confirms that the current edits and view have been saved without creating a model file. Choosing a model format directly from “Export” creates or safely replaces the edited model, while the original `final.ply` remains unchanged. Reopening restores the edits and the view saved on this device; yellow selections and undo history do not persist between sessions. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, watermarked portrait/landscape MP4 export, and offline HTML export. External standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT files can be imported from “Completed → Import”; LCC/LCC2, Streamed SOG, 2DGS, and ordinary point-cloud PLY files are not supported.
 
 ### Can I preview very large PLY files?
 
@@ -450,7 +454,24 @@ PLY files larger than 256 MiB load through Range requests of about 1 MB each to 
 
 ## Technology
 
-The preview Export menu supports PLY, portrait/landscape video, and single-file offline HTML. HTML preserves all undeleted Gaussians and SH data, initially displays the complete edited result, and supports offline orbit, pan, zoom, and manual animation playback. Mouse interaction pauses animation. It prefers WebGPU and falls back to WebGL2, offers no model editing, and contains no project paths, source media, logs, or telemetry. The file is about 4/3 of the corresponding PLY size plus viewer resources; large models still depend on device capacity. Development and build commands generate the offline runtime first; before running Rust alone, run `npm run build:html-viewer` if needed.
+The preview Export menu supports models, portrait/landscape video, and single-file offline HTML. Model options:
+
+| Format | Purpose and size |
+| --- | --- |
+| Standard PLY | Full precision, usually largest; archiving and continued editing |
+| Compressed PLY | Smaller, lossy; requires a compatible viewer |
+| SPZ v4 | Very small, lossy; sharing |
+| Bundled SOG | Typically higher compression, lossy; web presentation |
+
+SOG and SPZ are typically smaller, but size depends on the model and compression can affect detail. No fixed ratio or universally smallest format is guaranteed. Exports keep all undeleted Gaussians and the original SH degree without downsampling; codecs may quantize and reorder data, and custom extra attributes may not survive. See the [SOG](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/) and [SPZ](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/spz/) specifications.
+
+The current SPZ encoder supports coordinates within approximately ±2048 scene units. Models outside this range are rejected for SPZ export with a prompt to choose another format, preventing coordinate overflow. They are not automatically scaled, centered, or stripped of distant points.
+
+Opening “Export” does not scan the model or create files. Selecting a format saves edits and starts the export. Rust writes standard PLY directly to the final format's atomic-publication temporary file. For compressed formats, a dedicated CPU Worker reads the edited virtual data view on demand; no intermediate PLY is written or buffered in full. Without deletions, cropping, or transforms, chunks come directly from the source file; filtering and transforms run only when needed.
+
+SOG uses 10 SH compression iterations and may take a long time; it can be cancelled. All three compressed formats still require whole-model encoding memory, rather than fully streaming encoding. Estimated extra memory is `6 × equivalent edited PLY bytes + 128 × point count + 64 MiB`, plus retained-point indices. The budget is 25% of available system memory, capped at 512 MiB, or 256 MiB when detection fails. After selection, an over-budget check stops the export; choose standard PLY instead. Preflight cannot guarantee that runtime allocation will succeed. The final output still needs disk space. Only validated results replace the corresponding export; failure or cancellation preserves existing exports and the source model.
+
+HTML preserves all undeleted Gaussians and SH data, initially displays the complete edited result, and supports offline orbit, pan, zoom, and manual animation playback. Mouse interaction pauses animation. It prefers WebGPU and falls back to WebGL2, offers no model editing, and contains no project paths, source media, logs, or telemetry. The file is about 4/3 of the corresponding PLY size plus viewer resources; large models still depend on device capacity. Development and build commands generate the offline runtime first; before running Rust alone, run `npm run build:html-viewer` if needed.
 
 - Desktop framework: Tauri 2
 - Backend: Rust and Tokio

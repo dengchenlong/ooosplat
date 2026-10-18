@@ -5,6 +5,15 @@ installation rules, reported versions, and executable hashes are pinned in
 `manifest.json` (Windows), `manifest.linux.json` (Ubuntu 24.04 Alpha,
 x86_64 only), and `manifest.macos.json` (macOS 15+ Apple Silicon Alpha).
 
+Windows FFmpeg uses a pinned BtbN month-end 8.1 LGPL shared build. Upstream
+keeps month-end builds for two years, but only the last 14 daily builds;
+even a dated daily URL can expire. Do not replace it with a daily or floating
+`latest` asset. Review the archive, executable/DLL hashes, `-version` and `-L`
+output before changing the pin. The Windows binary declares LGPLv3-or-later
+(`--enable-version3`); the macOS source build retains its separate LGPLv2.1
+notice. Before upstream retention expires, review another month-end build or
+arrange a reviewed mirror; there is no silent latest-version fallback.
+
 Restore the pinned release inputs before normal release packaging. For manually
 placed development COLMAP packages, use the local commands described below:
 

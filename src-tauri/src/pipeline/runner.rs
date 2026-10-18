@@ -115,6 +115,7 @@ pub struct ReshootSourceInfo {
     pub source_image_count: u64,
     pub eligible: bool,
     pub reason: Option<String>,
+    pub imported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1060,9 +1061,43 @@ impl PipelineRunner {
             source_image_count: 0,
             eligible: false,
             reason: None,
+            imported: metadata.imported.is_some(),
         };
         if !catalog::project_is_durably_completed(&project, &metadata).await {
             info.reason = Some("只有已完成且结果完整的项目可以进行高清补拍".into());
+            return Ok(info);
+        }
+        if let Some(imported) = &metadata.imported {
+            let Some(colmap) = imported.colmap.as_ref() else {
+                info.reason = Some("外部项目没有可复用的 COLMAP 数据".into());
+                return Ok(info);
+            };
+            if !colmap.reshoot_eligible {
+                info.reason = colmap
+                    .reshoot_reason
+                    .clone()
+                    .or_else(|| Some("外部 COLMAP 数据不满足高清补拍条件".into()));
+                return Ok(info);
+            }
+            let colmap = colmap.clone();
+            let parsed = match crate::presets::spawn_pipeline_blocking(move || {
+                crate::imports::revalidate_imported_colmap(&colmap)
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("读取外部相机信息失败：{error}")))?
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    info.reason = Some(error.to_string());
+                    return Ok(info);
+                }
+            };
+            info.camera_id = parsed.0.id;
+            info.camera_model = parsed.0.model;
+            info.width = parsed.0.width;
+            info.height = parsed.0.height;
+            info.source_image_count = parsed.1.len() as u64;
+            info.eligible = true;
             return Ok(info);
         }
         let source_state: PipelineStateFile =
@@ -1254,6 +1289,7 @@ impl PipelineRunner {
         reshoot_input: &Path,
         input_type: ReshootInputType,
         projects_root: &Path,
+        requested_quality: Quality,
     ) -> Result<PipelineResult> {
         let source = self.inspect_reshoot_source(source_project_id).await?;
         if !source.eligible {
@@ -1281,8 +1317,19 @@ impl PipelineRunner {
         self.events.acceleration(acceleration.clone());
         let (source_root, source_metadata) =
             catalog::load_registered_project(source_project_id).await?;
-        let source_state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+        let source_state: PipelineStateFile = if source_metadata.imported.is_some() {
+            let mut state =
+                PipelineStateFile::created_for(requested_quality, ProjectInputType::Images);
+            state.planner_enabled = self.planner_enabled;
+            state
+        } else {
+            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?
+        };
+        let quality = if source_metadata.imported.is_some() {
+            requested_quality
+        } else {
+            source_metadata.quality
+        };
         let project_manager = ProjectManager::with_root(projects_root.to_path_buf());
         let (paths, mut metadata) = if input_type == ReshootInputType::Images {
             let events = self.events.clone();
@@ -1311,15 +1358,13 @@ impl PipelineRunner {
             project_manager
                 .create_with_progress(
                     reshoot_input,
-                    source_metadata.quality,
+                    quality,
                     Some(observer),
                     Some(self.process_manager.child_token()),
                 )
                 .await?
         } else {
-            project_manager
-                .create(reshoot_input, source_metadata.quality)
-                .await?
+            project_manager.create(reshoot_input, quality).await?
         };
         let stored_source = metadata.source_path.clone();
         metadata.name = reshoot_project_name(&source_metadata.name);
@@ -1329,7 +1374,8 @@ impl PipelineRunner {
         metadata.reshoot = Some(ReshootProvenance {
             source_project_id,
             source_project_path: source_root.clone(),
-            source_final_ply: source_root.join("final.ply"),
+            source_final_ply: catalog::project_model_path(&source_root, &source_metadata)
+                .unwrap_or_else(|| source_root.join("final.ply")),
             reshoot_source_path: stored_source,
             camera_id: source.camera_id,
             camera_model: source.camera_model,
@@ -1345,7 +1391,11 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
-        inherit_reshoot_planner_settings(&source_state, &mut state);
+        if source_metadata.imported.is_some() {
+            state.planner_enabled = self.planner_enabled;
+        } else {
+            inherit_reshoot_planner_settings(&source_state, &mut state);
+        }
         state.reshoot = Some(ReshootState {
             source_image_count: source.source_image_count,
             reshoot_frame_count: input.estimated_frames,
@@ -1485,35 +1535,71 @@ impl PipelineRunner {
             .ok_or_else(|| SplatError::Process("补拍项目缺少来源信息".into()))?;
         let mut checkpoint = state.reshoot.clone().unwrap_or_default();
         let source_root = &provenance.source_project_path;
-        let source_frames = source_root.join("work/frames");
-        let source_colmap_frames = source_root.join("work/colmap_frames");
-        let source_database = source_root.join("work/colmap/database.db");
         let source_metadata: ProjectMetadata =
             serde_json::from_slice(&tokio::fs::read(source_root.join("project.json")).await?)?;
-        let source_state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
-        if source_state
-            .frames
-            .as_ref()
-            .and_then(|frames| frames.colmap_input_version)
-            != Some(COLMAP_INPUT_VERSION)
+        let (source_frames, source_colmap_frames, source_database, source_model) = if let Some(
+            imported,
+        ) =
+            &source_metadata.imported
         {
-            return Err(SplatError::Process(
-                "原项目使用旧版或未知的 COLMAP 图片处理语义，不能与新版补拍特征缓存混用。请先从原素材重新生成基线项目。"
-                    .into(),
-            ));
-        }
-        validate_current_colmap_input_snapshot(source_root, &source_state)
-            .await
-            .map_err(|error| {
-                SplatError::Process(format!(
-                    "原项目的 COLMAP 专用图片不完整或与原始帧不一致，不能作为补拍基线：{error}"
-                ))
+            let colmap = imported.colmap.as_ref().ok_or_else(|| {
+                SplatError::Process("外部导入项目没有可复用的 COLMAP 数据".into())
             })?;
+            if !colmap.reshoot_eligible {
+                return Err(SplatError::Process(
+                    colmap
+                        .reshoot_reason
+                        .clone()
+                        .unwrap_or_else(|| "外部 COLMAP 数据不满足高清补拍条件".into()),
+                ));
+            }
+            let images = colmap
+                .images_path
+                .clone()
+                .filter(|path| path.is_dir())
+                .ok_or_else(|| SplatError::Process("外部 COLMAP 项目缺少原始图片".into()))?;
+            let database = colmap
+                .database_path
+                .clone()
+                .filter(|path| path.is_file())
+                .ok_or_else(|| SplatError::Process("外部 COLMAP 项目缺少 database.db".into()))?;
+            (
+                images.clone(),
+                images,
+                database,
+                colmap.sparse_model_path.clone(),
+            )
+        } else {
+            let state: PipelineStateFile =
+                serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+            if state
+                .frames
+                .as_ref()
+                .and_then(|frames| frames.colmap_input_version)
+                != Some(COLMAP_INPUT_VERSION)
+            {
+                return Err(SplatError::Process("原项目使用旧版或未知的 COLMAP 图片处理语义，不能与新版补拍特征缓存混用。请先从原素材重新生成基线项目。".into()));
+            }
+            validate_current_colmap_input_snapshot(source_root, &state)
+                .await
+                .map_err(|error| {
+                    SplatError::Process(format!(
+                        "原项目的 COLMAP 专用图片不完整或与原始帧不一致，不能作为补拍基线：{error}"
+                    ))
+                })?;
+            let frames = source_root.join("work/frames");
+            let colmap_frames = source_root.join("work/colmap_frames");
+            let reconstruction =
+                reusable_reconstruction(source_root, &frames, source_metadata.output.as_ref())
+                    .await?;
+            (
+                frames,
+                colmap_frames,
+                source_root.join("work/colmap/database.db"),
+                reconstruction.model,
+            )
+        };
         archive_incompatible_colmap_input_cache(paths, &state).await?;
-        let source_reconstruction =
-            reusable_reconstruction(source_root, &source_frames, source_metadata.output.as_ref())
-                .await?;
         if !source_database.is_file()
             || std::fs::metadata(&source_database).map_or(true, |value| value.len() == 0)
         {
@@ -1521,15 +1607,26 @@ impl PipelineRunner {
                 "原项目缺少可复用的 COLMAP 数据库".into(),
             ));
         }
-        let source_model_for_validation = source_reconstruction.model.clone();
+        let source_model_for_validation = source_model.clone();
         let source_database_for_validation = source_database.clone();
+        if let Some(colmap) = source_metadata
+            .imported
+            .as_ref()
+            .and_then(|imported| imported.colmap.clone())
+        {
+            crate::presets::spawn_pipeline_blocking(move || {
+                crate::imports::revalidate_imported_colmap(&colmap).map(|_| ())
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("复检外部 COLMAP 数据失败：{error}")))??;
+        }
         crate::presets::spawn_pipeline_blocking(move || {
             let camera = read_single_camera(&source_model_for_validation)?;
             validate_database_camera(&source_database_for_validation, &camera)
         })
         .await
         .map_err(|error| SplatError::Process(format!("校验补拍基线模型失败：{error}")))??;
-        let source_model_files = reusable_model_files(&source_reconstruction.model)?;
+        let source_model_files = reusable_model_files(&source_model)?;
         let base_model = paths.colmap.join("base-model");
         let database = paths.colmap.join("database.db");
         let base_database = paths.colmap.join("base-database.db");
@@ -4390,25 +4487,36 @@ fn validate_database_camera(database: &Path, camera: &ColmapCamera) -> Result<()
     .map_err(|error| SplatError::Process(format!("无法读取原项目 COLMAP 数据库：{error}")))?;
     let stored = connection
         .query_row(
-            "SELECT model, width, height FROM cameras WHERE camera_id = ?1",
+            "SELECT model, width, height, params FROM cameras WHERE camera_id = ?1",
             [camera.id],
             |row| {
                 Ok((
                     row.get::<_, i32>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| SplatError::Process(format!("校验原项目相机数据库失败：{error}")))?;
-    let Some((model, width, height)) = stored else {
+    let Some((model, width, height, params)) = stored else {
         return Err(SplatError::Process(format!(
             "原项目 COLMAP 数据库缺少相机 ID {}",
             camera.id
         )));
     };
-    if model != camera.model_id || width != camera.width as i64 || height != camera.height as i64 {
+    let (chunks, remainder) = params.as_chunks::<8>();
+    let stored_params = chunks
+        .iter()
+        .map(|bytes| f64::from_le_bytes(*bytes))
+        .collect::<Vec<_>>();
+    if model != camera.model_id
+        || width != camera.width as i64
+        || height != camera.height as i64
+        || !remainder.is_empty()
+        || stored_params != camera.params
+    {
         return Err(SplatError::Process(
             "原项目 COLMAP 数据库与最终稀疏模型的相机信息不一致".into(),
         ));
@@ -4836,14 +4944,14 @@ mod tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
-                "CREATE TABLE cameras (camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)",
+                "CREATE TABLE cameras (camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, params BLOB NOT NULL)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO cameras(camera_id, model, width, height) VALUES (1, 2, 1920, 1080)",
-                [],
+                "INSERT INTO cameras(camera_id, model, width, height, params) VALUES (1, 2, 1920, 1080, ?1)",
+                [vec![0_u8; 32]],
             )
             .unwrap();
         drop(connection);
@@ -4853,9 +4961,20 @@ mod tests {
             model: "SIMPLE_RADIAL".into(),
             width: 1920,
             height: 1080,
+            params: vec![0.0; 4],
         };
 
         validate_database_camera(&database, &camera).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for malformed in [vec![0_u8; 33], vec![0_u8; 31], vec![0_u8; 24], Vec::new()] {
+            connection
+                .execute("UPDATE cameras SET params = ?1", [&malformed])
+                .unwrap();
+            assert!(validate_database_camera(&database, &camera).is_err());
+        }
+        connection
+            .execute("UPDATE cameras SET params = ?1", [vec![0_u8; 32]])
+            .unwrap();
         assert!(validate_database_camera(
             &database,
             &ColmapCamera {

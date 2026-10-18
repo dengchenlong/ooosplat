@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost asset: http://asset.localhost; worker-src 'self' blob:",
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost; worker-src 'self' blob:",
       "assetProtocol": {
         "enable": true,
         "scope": []
@@ -47,10 +47,13 @@
       "../.cache/html-viewer/runtime.js": "html-viewer/runtime.js",
       "../licenses/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
       "../licenses/FFmpeg-LGPL-2.1.txt": "licenses/FFmpeg-LGPL-2.1.txt",
+      "../licenses/FFmpeg-LGPL-3.0.txt": "licenses/FFmpeg-LGPL-3.0.txt",
+      "../licenses/FFmpeg-GPL-3.0.txt": "licenses/FFmpeg-GPL-3.0.txt",
       "../licenses/COLMAP-LICENSE.txt": "licenses/COLMAP-LICENSE.txt",
       "../licenses/NVIDIA-CUDA-Runtime.txt": "licenses/NVIDIA-CUDA-Runtime.txt",
       "../licenses/Brush-LICENSE.txt": "licenses/Brush-LICENSE.txt",
       "../licenses/PlayCanvas-MIT.txt": "licenses/PlayCanvas-MIT.txt",
+      "../licenses/Niantic-SPZ-MIT.txt": "licenses/Niantic-SPZ-MIT.txt",
       "../licenses/Mediabunny-MPL-2.0.txt": "licenses/Mediabunny-MPL-2.0.txt",
       "../LICENSE": "LICENSE",
       "../NOTICE": "NOTICE",

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod html_export;
+pub mod model_export;
 
 use crate::{
     engines::{
@@ -290,7 +291,8 @@ pub struct PreviewController {
     active: Mutex<Option<GaussianPreviewSession>>,
     lifecycle: Mutex<()>,
     metadata_write: Mutex<()>,
-    export: Mutex<()>,
+    export: std::sync::Arc<Mutex<()>>,
+    model_export: Mutex<Option<std::sync::Arc<model_export::ModelExportSession>>>,
     video_export: Mutex<Option<GaussianVideoExportSession>>,
     html_export: Mutex<Option<html_export::HtmlExportSession>>,
     edit_save: Mutex<Option<GaussianEditSaveSession>>,
@@ -319,19 +321,34 @@ pub struct ProjectTaskLogLine {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTaskDetail {
     project: ProjectSummary,
-    input_type: ProjectInputType,
+    input_type: Option<ProjectInputType>,
     source_path: PathBuf,
     projects_root: PathBuf,
-    planner_enabled: bool,
+    planner_enabled: Option<bool>,
     estimated_frames: Option<u64>,
-    stage: PipelineStage,
-    progress: f64,
+    stage: Option<PipelineStage>,
+    progress: Option<f64>,
     input_images: Option<u64>,
     registered_images: Option<u64>,
     video: Option<VideoInfo>,
     image_sequence: Option<ImageSequenceInfo>,
     source_project_id: Option<String>,
     logs: Vec<ProjectTaskLogLine>,
+    imported: Option<ImportedProjectDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectDetail {
+    source_model_path: PathBuf,
+    format: crate::project::ImportedGaussianFormat,
+    source_available: bool,
+    colmap_root: Option<PathBuf>,
+    sparse_model_path: Option<PathBuf>,
+    database_available: bool,
+    images_available: bool,
+    reshoot_eligible: bool,
+    reshoot_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -339,12 +356,17 @@ pub struct ProjectTaskDetail {
 pub enum ProjectLocation {
     Project,
     Logs,
+    Source,
 }
 
 #[derive(Debug, Clone)]
 struct GaussianPreviewSession {
     project_id: Uuid,
     asset_paths: Vec<PathBuf>,
+    read_token: Option<Uuid>,
+    read_path: Option<PathBuf>,
+    read_size: Option<u64>,
+    read_modified_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +421,7 @@ pub struct GaussianPreviewDescriptor {
     transform: GaussianTransform,
     editing: GaussianEditing,
     edit_mask_asset_path: Option<PathBuf>,
+    read_token: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -899,15 +922,62 @@ pub async fn get_project_task_detail(
     {
         project.status = task.status.project_status();
     }
-    let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
-    let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
-    let progress = if project.status == ProjectStatus::Completed {
-        100.0
+    let imported_detail = metadata
+        .imported
+        .as_ref()
+        .map(|imported| ImportedProjectDetail {
+            source_model_path: imported.source_model_path.clone(),
+            format: imported.source_format,
+            source_available: project.source_available.unwrap_or(false),
+            colmap_root: imported
+                .colmap
+                .as_ref()
+                .map(|value| value.root_path.clone()),
+            sparse_model_path: imported
+                .colmap
+                .as_ref()
+                .map(|value| value.sparse_model_path.clone()),
+            database_available: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.database_path.as_ref())
+                .is_some_and(|path| path.is_file()),
+            images_available: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.images_path.as_ref())
+                .is_some_and(|path| path.is_dir()),
+            reshoot_eligible: imported
+                .colmap
+                .as_ref()
+                .is_some_and(|value| value.reshoot_eligible),
+            reshoot_reason: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.reshoot_reason.clone()),
+        });
+    let is_imported = imported_detail.is_some();
+    let state = if is_imported {
+        None
     } else {
-        resume_checkpoint_fraction(&state).0 * 100.0
+        let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
+        Some(serde_json::from_slice::<PipelineStateFile>(&state_bytes)?)
     };
-    let stage = persisted_task_stage(&state, project.status);
-    let logs = read_project_log_tail(&project_root.join("logs")).await?;
+    let progress = state.as_ref().map(|state| {
+        if project.status == ProjectStatus::Completed {
+            100.0
+        } else {
+            resume_checkpoint_fraction(state).0 * 100.0
+        }
+    });
+    let stage = state
+        .as_ref()
+        .map(|state| persisted_task_stage(state, project.status));
+    let logs = if is_imported {
+        Vec::new()
+    } else {
+        read_project_log_tail(&project_root.join("logs")).await?
+    };
     let input_images = metadata.output.as_ref().map(|output| output.input_images);
     let registered_images = metadata
         .output
@@ -915,25 +985,31 @@ pub async fn get_project_task_detail(
         .map(|output| output.registered_images);
     Ok(ProjectTaskDetail {
         project,
-        input_type: metadata.input_type,
+        input_type: (!is_imported).then_some(metadata.input_type),
         source_path: metadata.source_path,
         projects_root: project_root
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default(),
-        planner_enabled: state.planner_enabled,
-        estimated_frames: state.frames.as_ref().map(|frames| frames.estimated_frames),
+        planner_enabled: state.as_ref().map(|state| state.planner_enabled),
+        estimated_frames: state
+            .as_ref()
+            .and_then(|state| state.frames.as_ref())
+            .map(|frames| frames.estimated_frames),
         stage,
         progress,
         input_images,
         registered_images,
-        video: state.video,
-        image_sequence: state.image_sequence,
+        video: state.as_ref().and_then(|state| state.video.clone()),
+        image_sequence: state
+            .as_ref()
+            .and_then(|state| state.image_sequence.clone()),
         source_project_id: metadata
             .reshoot
             .as_ref()
             .map(|reshoot| reshoot.source_project_id.to_string()),
         logs,
+        imported: imported_detail,
     })
 }
 
@@ -1044,8 +1120,16 @@ pub async fn start_gui_task(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     task_id: Uuid,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再启动任务",
+        ));
+    }
     state
         .start(
             task_id,
@@ -1090,8 +1174,16 @@ pub async fn resume_gui_task(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     project_id: Uuid,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再继续任务",
+        ));
+    }
     state
         .resume(
             project_id,
@@ -1107,12 +1199,19 @@ pub async fn start_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     path: String,
     quality: Quality,
     projects_root: String,
     planner_enabled: Option<bool>,
     workspace_task_id: Option<String>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(PipelineCommandError::from(SplatError::Process(
+            "已有 Gaussian 导入正在进行，请等待完成后再启动任务".into(),
+        )));
+    }
     let id = workspace_task_id
         .map(|v| Uuid::parse_str(&v))
         .transpose()
@@ -1227,6 +1326,17 @@ pub async fn open_project_location(
     let target = match location {
         ProjectLocation::Project => project,
         ProjectLocation::Logs => project.join("logs"),
+        ProjectLocation::Source => {
+            let (_, metadata) = catalog::load_registered_project(id).await?;
+            let source = metadata
+                .imported
+                .ok_or_else(|| SplatError::Process("该项目没有外部源文件".into()))?
+                .source_model_path;
+            source
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or(SplatError::InvalidPath(source))?
+        }
     };
     if !target.is_dir() {
         return Err(SplatError::InvalidPath(target));
@@ -1352,7 +1462,10 @@ pub async fn prepare_gaussian_preview(
     project_id: String,
 ) -> Result<GaussianPreviewDescriptor> {
     let _lifecycle = state.lifecycle.lock().await;
-    if state.html_export.lock().await.is_some() || state.video_export.lock().await.is_some() {
+    if state.html_export.lock().await.is_some()
+        || state.video_export.lock().await.is_some()
+        || state.model_export.lock().await.is_some()
+    {
         return Err(SplatError::Process(
             "导出期间不能重新加载或切换预览项目".into(),
         ));
@@ -1372,16 +1485,32 @@ pub async fn prepare_gaussian_preview(
     if let Some(previous) = previous {
         discard_preview_asset(&app, previous).await;
     }
-    let asset_path = create_preview_asset(&project_root, &path).await?;
-    app.asset_protocol_scope()
-        .allow_file(&asset_path)
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&asset_path);
-            SplatError::Process(format!("无法开放本地 PLY 预览资源：{error}"))
-        })?;
-    let mut asset_paths = vec![asset_path.clone()];
+    let direct_external = metadata
+        .imported
+        .as_ref()
+        .is_some_and(|imported| imported.canonical_model_path.is_none());
+    let read_token = direct_external.then(Uuid::new_v4);
+    let asset_path = if direct_external {
+        path.clone()
+    } else {
+        let asset = create_preview_asset(&project_root, &path).await?;
+        app.asset_protocol_scope()
+            .allow_file(&asset)
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&asset);
+                SplatError::Process(format!("无法开放本地 PLY 预览资源：{error}"))
+            })?;
+        asset
+    };
+    let mut asset_paths = if direct_external {
+        Vec::new()
+    } else {
+        vec![asset_path.clone()]
+    };
     let edit_mask_asset_path = if editing.revision > 0 || editing.deleted_count > 0 {
-        let path = asset_path.with_extension("mask.bin");
+        let directory = project_root.join("work").join("preview");
+        tokio::fs::create_dir_all(&directory).await?;
+        let path = directory.join(format!("preview-{}.mask.bin", Uuid::new_v4().simple()));
         tokio::fs::write(&path, &edit_mask).await?;
         app.asset_protocol_scope()
             .allow_file(&path)
@@ -1397,6 +1526,14 @@ pub async fn prepare_gaussian_preview(
     *state.active.lock().await = Some(GaussianPreviewSession {
         project_id: id,
         asset_paths,
+        read_token,
+        read_path: direct_external.then_some(path.clone()),
+        read_size: direct_external.then_some(info.file_size),
+        read_modified_ms: metadata
+            .imported
+            .as_ref()
+            .filter(|_| direct_external)
+            .and_then(|imported| imported.source_fingerprint.modified_ms),
     });
 
     Ok(GaussianPreviewDescriptor {
@@ -1409,7 +1546,77 @@ pub async fn prepare_gaussian_preview(
         transform,
         editing,
         edit_mask_asset_path,
+        read_token,
     })
+}
+
+#[tauri::command]
+pub async fn read_gaussian_preview_chunk(
+    state: State<'_, PreviewController>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response> {
+    let token = request
+        .headers()
+        .get("x-ooosplat-preview-token")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取令牌无效".into()))?;
+    let offset = request
+        .headers()
+        .get("x-ooosplat-offset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取偏移无效".into()))?;
+    let length = request
+        .headers()
+        .get("x-ooosplat-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_024_000)
+        .min(1_024_000);
+    let active = state.active.lock().await;
+    let session = active
+        .as_ref()
+        .filter(|session| session.read_token == Some(token))
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let path = session
+        .read_path
+        .clone()
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let file_size = session
+        .read_size
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let expected_modified_ms = session.read_modified_ms;
+    if length == 0 || offset >= file_size {
+        return Err(SplatError::Process("Gaussian 预览读取范围无效".into()));
+    }
+    let remaining = usize::try_from(file_size - offset).unwrap_or(usize::MAX);
+    let length = length.min(remaining);
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let metadata = path.metadata()?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64);
+        if metadata.len() != file_size
+            || expected_modified_ms.is_some_and(|expected| modified_ms != Some(expected))
+        {
+            return Err(SplatError::Process(
+                "外部 Gaussian 文件在预览加载期间发生变化，请重新打开项目".into(),
+            ));
+        }
+        let mut file = std::fs::File::open(path)?;
+        use std::io::{Read, Seek};
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; length];
+        let read = file.read(&mut bytes)?;
+        bytes.truncate(read);
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| SplatError::Process(error.to_string()))??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -1420,6 +1627,16 @@ pub async fn release_gaussian_preview(
 ) -> Result<()> {
     let _lifecycle = state.lifecycle.lock().await;
     let id = parse_project_id(&project_id)?;
+    let model_id = state
+        .model_export
+        .lock()
+        .await
+        .as_ref()
+        .filter(|session| session.project_id == id)
+        .map(|session| session.id);
+    if let Some(export_id) = model_id {
+        model_export::cancel_gaussian_model_export(state.clone(), export_id).await?;
+    }
     let mut html_export = state.html_export.lock().await;
     if let Some(session) = html_export
         .as_ref()
@@ -1751,9 +1968,9 @@ pub async fn begin_gaussian_video_export(
     }
     drop(active);
 
-    if state.html_export.lock().await.is_some() {
+    if state.html_export.lock().await.is_some() || state.model_export.lock().await.is_some() {
         return Err(SplatError::Process(
-            "已有 HTML 正在导出，请等待或取消。".into(),
+            "已有模型或 HTML 正在导出，请等待或取消。".into(),
         ));
     }
 
@@ -2345,6 +2562,8 @@ pub struct IncrementalReshootRequest {
     input_type: ReshootInputType,
     projects_root: String,
     workspace_task_id: Option<String>,
+    quality: Option<Quality>,
+    planner_enabled: Option<bool>,
 }
 
 #[tauri::command]
@@ -2378,8 +2597,16 @@ pub async fn start_gui_reshoot(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再启动补拍",
+        ));
+    }
     let source = Uuid::parse_str(&request.source_project_id)
         .map_err(|_| crate::tasks::ServiceError::new("INVALID_ARGUMENT", "原项目 ID 无效"))?;
     let (project, metadata) = catalog::load_registered_project(source).await?;
@@ -2392,6 +2619,17 @@ pub async fn start_gui_reshoot(
     }
     let checkpoint: PipelineStateFile =
         serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
+    let imported = metadata.imported.is_some();
+    let quality = if imported {
+        request.quality.unwrap_or(Quality::Balanced)
+    } else {
+        metadata.quality
+    };
+    let planner_enabled = if imported {
+        request.planner_enabled.unwrap_or(true)
+    } else {
+        checkpoint.planner_enabled
+    };
     let id = request
         .workspace_task_id
         .map(|v| Uuid::parse_str(&v))
@@ -2401,9 +2639,9 @@ pub async fn start_gui_reshoot(
         .create(
             id,
             request.reshoot_path.into(),
-            metadata.quality,
+            quality,
             request.projects_root.into(),
-            checkpoint.planner_enabled,
+            planner_enabled,
             "gui",
             None,
             None,
@@ -2423,9 +2661,10 @@ pub async fn start_incremental_reshoot_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let receipt = start_gui_reshoot(app, state.clone(), telemetry, request)
+    let receipt = start_gui_reshoot(app, state.clone(), telemetry, imports, request)
         .await
         .map_err(service_command_error)?;
     wait_task_result(state.inner(), receipt.task_id).await

@@ -79,6 +79,7 @@ export interface ReshootSourceInfo {
   sourceImageCount: number;
   eligible: boolean;
   reason: string | null;
+  imported: boolean;
 }
 
 export interface ReshootInputInfo {
@@ -169,7 +170,7 @@ export interface PipelineResult {
 export interface ProjectSummary {
   id: string;
   workspaceTaskId?: string | null;
-  taskKind?: "generation" | "reshoot";
+  taskKind?: "generation" | "reshoot" | "import";
   name: string;
   status: ProjectStatus;
   projectPath: string;
@@ -179,8 +180,12 @@ export interface ProjectSummary {
   createdAt: string;
   completedAt: string | null;
   durationMs: number | null;
-  quality: Quality;
+  quality: Quality | null;
   sourceName: string;
+  modelFormat?: ImportedGaussianFormat | null;
+  sourceAvailable?: boolean | null;
+  reshootEligible?: boolean | null;
+  reshootReason?: string | null;
   registeredRatio: number | null;
   points3d: number | null;
   failureMessage: string | null;
@@ -201,20 +206,29 @@ export interface AppRuntimeStatus {
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
   project: ProjectSummary;
-  inputType: InputType;
+  inputType: InputType | null;
   sourcePath: string;
   projectsRoot: string;
-  plannerEnabled: boolean;
+  plannerEnabled: boolean | null;
   estimatedFrames: number | null;
-  stage: string;
-  progress: number;
+  stage: string | null;
+  progress: number | null;
   inputImages: number | null;
   registeredImages: number | null;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
   sourceProjectId: string | null;
   logs: ProjectTaskLogLine[];
+  imported: ImportedProjectDetail | null;
 }
+
+export type ImportedGaussianFormat = "ply" | "compressedPly" | "sog" | "spz" | "splat" | "ksplat";
+export interface ImportedProjectDetail { sourceModelPath: string; format: ImportedGaussianFormat; sourceAvailable: boolean; colmapRoot: string | null; sparseModelPath: string | null; databaseAvailable: boolean; imagesAvailable: boolean; reshootEligible: boolean; reshootReason: string | null; }
+export interface GaussianImportCandidate { id: string; name: string; format: ImportedGaussianFormat; fileSize: number; directPly: boolean; splatCount: number | null; }
+export interface ColmapImportCandidate { id: string; label: string; registeredImages: number; points3d: number; cameraCount: number; reshootEligible: boolean; reason: string | null; }
+export interface GaussianImportProbe { probeId: string; suggestedName: string; models: GaussianImportCandidate[]; colmapModels: ColmapImportCandidate[]; defaultModelId: string | null; defaultColmapId: string | null; }
+export interface GaussianImportSelection { selectionId: string; displayName: string; }
+export interface GaussianImportSession { importId: string; sourceName: string; sourceSize: number; sourceTotalSize: number; sourceFormat: ImportedGaussianFormat; needsConversion: boolean; outputName: string; }
 
 export type GaussianFormat = "ply" | "sog" | "spz";
 export interface GaussianTransform {
@@ -248,6 +262,7 @@ export interface GaussianPreviewDescriptor {
   transform: GaussianTransform;
   editing: GaussianEditState;
   editMaskAssetPath: string | null;
+  readToken?: string | null;
 }
 export interface GaussianExportProgress {
   projectId: string;

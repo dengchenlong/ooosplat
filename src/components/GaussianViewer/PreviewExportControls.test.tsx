@@ -17,16 +17,22 @@ describe("preview export controls", () => {
         root = createRoot(container);
     });
     afterEach(async () => { await act(async () => root.unmount()); container.remove(); localStorage.clear(); });
-    const button = (text: string) => Array.from(container.querySelectorAll("button")).find(b => b.textContent === text)!;
+    const button = (text: string) => Array.from(container.querySelectorAll("button")).find(b => (b.querySelector("b")?.textContent ?? b.textContent) === text)!;
     const click = async (text: string) => act(async () => button(text).click());
     it("offers PLY and HTML in Adjust, and closes after choosing either", async () => {
         const onHtml = vi.fn();
-        const onPly = vi.fn();
-        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="adjust" disabled={false} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={onHtml} onPly={onPly}/></LanguageProvider>));
+        const onModel = vi.fn();
+        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="adjust" disabled={false} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={onHtml} onModel={onModel}/></LanguageProvider>));
         await click("导出");
         expect(button("导出视频")).toBeUndefined();
-        await click("导出 PLY");
-        expect(onPly).toHaveBeenCalledOnce();
+        expect(onModel).not.toHaveBeenCalled();
+        expect(container.textContent).toContain("实际大小取决于模型");
+        for (const [label,format] of [["标准 PLY","ply"],["压缩 PLY","compressedPly"],["SPZ","spz"],["SOG","sog"]]) {
+          await click(label); expect(onModel).toHaveBeenLastCalledWith(format);
+          expect(container.querySelector("#preview-export-options")).toBeNull(); await click("导出");
+        }
+        expect(onModel).toHaveBeenCalledTimes(4);
+        await click("标准 PLY");
         expect(container.querySelector("#preview-export-options")).toBeNull();
         await click("导出");
         await click("导出离线 HTML");
@@ -34,17 +40,17 @@ describe("preview export controls", () => {
         expect(container.querySelector("#preview-export-options")).toBeNull();
     });
     it("offers video and HTML in Animation, while unsupported video does not block HTML", async () => {
-        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="preview" disabled={false} videoSupported={false} videoReason="unsupported" onVideo={vi.fn()} onHtml={vi.fn()} onPly={vi.fn()}/></LanguageProvider>));
+        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="preview" disabled={false} videoSupported={false} videoReason="unsupported" onVideo={vi.fn()} onHtml={vi.fn()} onModel={vi.fn()}/></LanguageProvider>));
         await click("导出");
         expect(button("导出视频").disabled).toBe(true);
         expect(button("导出离线 HTML").disabled).toBe(false);
-        expect(button("导出 PLY").disabled).toBe(false);
+        expect(button("标准 PLY").disabled).toBe(false);
         await act(async () => button("导出离线 HTML").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
         expect(container.querySelector("#preview-export-options")).toBeNull();
         expect(document.activeElement).toBe(button("导出"));
     });
     it("disables repeated export while busy and closes an existing menu", async () => {
-        const render = (disabled: boolean) => <LanguageProvider><PreviewExportMenu mode="preview" disabled={disabled} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={vi.fn()} onPly={vi.fn()}/></LanguageProvider>;
+        const render = (disabled: boolean) => <LanguageProvider><PreviewExportMenu mode="preview" disabled={disabled} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={vi.fn()} onModel={vi.fn()}/></LanguageProvider>;
         await act(async () => root.render(render(false)));
         await click("导出");
         await act(async () => root.render(render(true)));
@@ -64,10 +70,19 @@ describe("preview export controls", () => {
     });
     it("uses the English labels", async () => {
         localStorage.setItem("ooo-splat-language", "en");
-        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="preview" disabled={false} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={vi.fn()} onPly={vi.fn()}/></LanguageProvider>));
+        await act(async () => root.render(<LanguageProvider><PreviewExportMenu mode="preview" disabled={false} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={vi.fn()} onModel={vi.fn()}/></LanguageProvider>));
         await click("Export");
         expect(button("Export video")).toBeDefined();
         expect(button("Export offline HTML")).toBeDefined();
-        expect(button("Export PLY")).toBeDefined();
+        expect(button("Standard PLY")).toBeDefined();
+    });
+    it("navigates formats without starting an export until selection", async () => {
+        const onModel=vi.fn();
+        await act(async()=>root.render(<LanguageProvider><PreviewExportMenu mode="adjust" disabled={false} videoSupported videoReason={null} onVideo={vi.fn()} onHtml={vi.fn()} onModel={onModel}/></LanguageProvider>));
+        await act(async()=>button("导出").dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true})));
+        expect(document.activeElement).toBe(button("标准 PLY")); expect(onModel).not.toHaveBeenCalled();
+        await act(async()=>button("标准 PLY").dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true})));
+        expect(document.activeElement).toBe(button("压缩 PLY")); expect(onModel).not.toHaveBeenCalled();
+        await click("压缩 PLY"); expect(onModel).toHaveBeenCalledExactlyOnceWith("compressedPly");
     });
 });

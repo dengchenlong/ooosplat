@@ -19,6 +19,7 @@ use crate::{
 
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const ROWS_PER_CHUNK: usize = 4096;
+pub mod export_view;
 
 #[cfg(windows)]
 fn publish_export(source: &Path, destination: &Path) -> Result<()> {
@@ -355,74 +356,87 @@ fn header_with_vertex_count(header: &[u8], count: u64) -> Vec<u8> {
     output.into_bytes()
 }
 
-fn transform_row(
-    row: &mut [u8],
-    layout: &PlyLayout,
+/// Cached offsets and fixed scratch buffers: no allocation/name lookup per row.
+struct RowTransform {
     transform: GaussianTransform,
     rotation: Quaternion,
-    sh_rotation: &ShRotation,
-) -> Result<()> {
-    let offset = |name: &str| *layout.offsets.get(name).expect("validated property");
-    let source = [
-        read_float(row, offset("x")) * transform.scale,
-        read_float(row, offset("y")) * transform.scale,
-        read_float(row, offset("z")) * transform.scale,
-    ];
-    let point = rotation.transform_point(source);
-    for (name, value, translation) in [
-        ("x", point[0], transform.position[0]),
-        ("y", point[1], transform.position[1]),
-        ("z", point[2], transform.position[2]),
-    ] {
-        let result = value + translation;
-        if !result.is_finite() {
-            return Err(unsupported("Transform 导致 position 溢出"));
-        }
-        write_float(row, offset(name), result);
-    }
-
-    let gaussian = Quaternion {
-        w: read_float(row, offset("rot_0")),
-        x: read_float(row, offset("rot_1")),
-        y: read_float(row, offset("rot_2")),
-        z: read_float(row, offset("rot_3")),
-    };
-    let composed = rotation.mul(gaussian);
-    for (name, value) in [
-        ("rot_0", composed.w),
-        ("rot_1", composed.x),
-        ("rot_2", composed.y),
-        ("rot_3", composed.z),
-    ] {
-        write_float(row, offset(name), value);
-    }
-
-    let log_scale = transform.scale.ln();
-    for name in ["scale_0", "scale_1", "scale_2"] {
-        write_float(row, offset(name), read_float(row, offset(name)) + log_scale);
-    }
-
-    if layout.rest_count > 0 {
-        let per_channel = layout.rest_count / 3;
-        let mut source = vec![0.0_f64; per_channel];
-        for channel in 0..3 {
-            for (coefficient, value) in source.iter_mut().enumerate() {
-                *value = read_float(
-                    row,
-                    offset(&format!("f_rest_{}", channel * per_channel + coefficient)),
-                );
-            }
-            let result = sh_rotation.apply(&source);
-            for (coefficient, value) in result.into_iter().enumerate() {
-                write_float(
-                    row,
-                    offset(&format!("f_rest_{}", channel * per_channel + coefficient)),
-                    value,
-                );
-            }
+    rotated: bool,
+    identity: bool,
+    xyz: [usize; 3],
+    quaternion: [usize; 4],
+    scales: [usize; 3],
+    log_scale: f64,
+    sh: Vec<usize>,
+    sh_rotation: Option<ShRotation>,
+}
+impl RowTransform {
+    fn new(layout: &PlyLayout, transform: GaussianTransform, rotation: Quaternion) -> Self {
+        let rotated =
+            rotation.x.abs() > 1e-12 || rotation.y.abs() > 1e-12 || rotation.z.abs() > 1e-12;
+        let offset = |name: &str| layout.offsets[name];
+        Self {
+            identity: !rotated && transform.scale == 1.0 && transform.position == [0.0; 3],
+            transform,
+            rotation,
+            rotated,
+            xyz: ["x", "y", "z"].map(offset),
+            quaternion: ["rot_0", "rot_1", "rot_2", "rot_3"].map(offset),
+            scales: ["scale_0", "scale_1", "scale_2"].map(offset),
+            log_scale: transform.scale.ln(),
+            sh: (0..layout.rest_count)
+                .map(|i| offset(&format!("f_rest_{i}")))
+                .collect(),
+            sh_rotation: (rotated && layout.rest_count > 0)
+                .then(|| ShRotation::new(rotation.matrix())),
         }
     }
-    Ok(())
+    fn apply(&self, row: &mut [u8]) -> Result<()> {
+        if self.identity {
+            return Ok(());
+        }
+        let point = self
+            .xyz
+            .map(|offset| read_float(row, offset) * self.transform.scale);
+        let point = if self.rotated {
+            self.rotation.transform_point(point)
+        } else {
+            point
+        };
+        for (i, value) in point.into_iter().enumerate() {
+            let value = value + self.transform.position[i];
+            if !value.is_finite() {
+                return Err(unsupported("Transform 导致 position 溢出"));
+            }
+            write_float(row, self.xyz[i], value);
+        }
+        if self.rotated {
+            let [w, x, y, z] = self.quaternion.map(|offset| read_float(row, offset));
+            let q = self.rotation.mul(Quaternion { w, x, y, z });
+            for (offset, value) in self.quaternion.into_iter().zip([q.w, q.x, q.y, q.z]) {
+                write_float(row, offset, value);
+            }
+        }
+        if self.transform.scale != 1.0 {
+            for offset in self.scales {
+                write_float(row, offset, read_float(row, offset) + self.log_scale);
+            }
+        }
+        if let Some(rotation) = &self.sh_rotation {
+            let n = self.sh.len() / 3;
+            let mut source = [0.0; 15];
+            let mut result = [0.0; 15];
+            for channel in 0..3 {
+                for (i, value) in source[..n].iter_mut().enumerate() {
+                    *value = read_float(row, self.sh[channel * n + i]);
+                }
+                rotation.apply_into(&source[..n], &mut result[..n]);
+                for (i, value) in result[..n].iter().enumerate() {
+                    write_float(row, self.sh[channel * n + i], *value);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn export_transformed_ply(
@@ -476,7 +490,7 @@ pub fn export_transformed_ply_to(
             ));
         }
     }
-    let sh_rotation = ShRotation::new(rotation.matrix());
+    let row_transform = RowTransform::new(&layout, transform, rotation);
 
     let mut retained = 0_u64;
     let mut row = vec![0_u8; layout.stride];
@@ -521,7 +535,7 @@ pub fn export_transformed_ply_to(
                 if !keep_row(row, index, &layout, transform, rotation, edits) {
                     continue;
                 }
-                transform_row(row, &layout, transform, rotation, &sh_rotation)?;
+                row_transform.apply(row)?;
                 output_chunk.extend_from_slice(row);
             }
             writer.write_all(&output_chunk)?;
@@ -587,8 +601,13 @@ impl ShRotation {
         }
     }
 
+    #[cfg(test)]
     fn apply(&self, source: &[f64]) -> Vec<f64> {
         let mut result = source.to_vec();
+        self.apply_into(source, &mut result);
+        result
+    }
+    fn apply_into(&self, source: &[f64], result: &mut [f64]) {
         if source.len() >= 3 {
             multiply_band(&mut result[0..3], &source[0..3], &self.band1);
         }
@@ -598,7 +617,6 @@ impl ShRotation {
         if source.len() >= 15 {
             multiply_band(&mut result[8..15], &source[8..15], &self.band3);
         }
-        result
     }
 }
 

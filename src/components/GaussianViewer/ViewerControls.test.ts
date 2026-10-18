@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
-import { BoundingBox, PROJECTION_ORTHOGRAPHIC, Vec3, type Entity } from "playcanvas";
+import { BoundingBox, GraphNode, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Vec3, type Entity } from "playcanvas";
 import { describe, expect, it, vi } from "vitest";
 import { ViewerControls } from "./ViewerControls";
+import { buildGroundGrid } from "./GroundGrid";
 
 function pointerEvent(type: string, x: number, y: number, button = 0) {
   const event = new MouseEvent(type, { bubbles: true, cancelable: true, button, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y });
@@ -20,29 +21,15 @@ function setup() {
     releasePointerCapture: { value: (id: number) => captures.delete(id) },
     hasPointerCapture: { value: (id: number) => captures.has(id) },
   });
-  const position = new Vec3();
-  const setPosition = vi.fn((value: Vec3) => position.copy(value));
-  const lookAt = vi.fn();
-  const camera: {
-    fov: number;
-    aspectRatio: number;
-    nearClip: number;
-    farClip: number;
-    projection?: number;
-    orthoHeight?: number;
-  } = { fov: 52, aspectRatio: 1.5, nearClip: 0.01, farClip: 10_000 };
-  const entity = {
-    camera,
-    setPosition,
-    getPosition: () => position,
-    lookAt,
-    right: new Vec3(1, 0, 0),
-    up: new Vec3(0, 1, 0),
-    forward: new Vec3(0, 0, -1),
-  } as unknown as Entity;
+  const camera = { fov: 52, aspectRatio: 1.5, nearClip: 0.01, farClip: 10_000,
+    projection: PROJECTION_PERSPECTIVE, orthoHeight: 5 };
+  const entity = new GraphNode();
+  Object.defineProperty(entity, "camera", { value: camera });
+  const setPosition = vi.spyOn(entity, "setPosition");
+  const lookAt = vi.spyOn(entity, "lookAt");
   const onOrthographicViewChange = vi.fn();
-  const controls = new ViewerControls(canvas, entity, onOrthographicViewChange);
-  return { canvas, camera, controls, setPosition, lookAt, onOrthographicViewChange };
+  const controls = new ViewerControls(canvas, entity as Entity, onOrthographicViewChange);
+  return { canvas, camera, controls, entity, setPosition, lookAt, onOrthographicViewChange };
 }
 
 describe("ViewerControls", () => {
@@ -107,13 +94,95 @@ describe("ViewerControls", () => {
     controls.destroy();
   });
 
-  it("keeps the full ground grid inside dynamically updated clip planes", () => {
+  it("extends the perspective far plane to include the ground grid", () => {
     const { camera, controls } = setup();
     controls.setSceneBounds(new BoundingBox(new Vec3(0, 1, 0), new Vec3(50, 1, 50)));
     controls.fit(new BoundingBox(new Vec3(), new Vec3(1, 1, 1)), { occupancy: 0.85 });
 
     expect(camera.nearClip).toBeLessThanOrEqual(0.001);
     expect(camera.farClip).toBeGreaterThan(50);
+    controls.destroy();
+  });
+
+  it("keeps the original grid inside the orthographic depth range without changing screen framing", () => {
+    const { camera, controls, entity } = setup();
+    const model = new BoundingBox(new Vec3(), new Vec3(1.5, 1, 1));
+    const grid = buildGroundGrid(model);
+    controls.alignOrthographic("front", model, 0.85, false);
+    controls.restore({ ...controls.snapshot(), orthographicView: null, yaw: 45, pitch: 22 });
+    const saved = controls.snapshot();
+    const points = [...grid.positions, new Vec3(0.5, 1, -0.5)];
+    const project = (point: Vec3) => {
+      const view = new Mat4().invert(entity.getWorldTransform());
+      const local = view.transformPoint(point);
+      return [local.x / (camera.orthoHeight * camera.aspectRatio), local.y / camera.orthoHeight];
+    };
+    const before = points.map(project);
+    expect(Math.min(...grid.positions.map(point => point.clone().sub(entity.getPosition()).dot(entity.forward)))).toBeLessThan(0);
+
+    const scene = model.clone();
+    scene.add(grid.bounds);
+    controls.setSceneBounds(scene);
+
+    for (const [index, point] of points.entries()) {
+      const depth = point.clone().sub(entity.getPosition()).dot(entity.forward);
+      expect(depth).toBeGreaterThan(camera.nearClip);
+      expect(depth).toBeLessThan(camera.farClip);
+      const after = project(point);
+      expect(after[0]).toBeCloseTo(before[index][0], 5);
+      expect(after[1]).toBeCloseTo(before[index][1], 5);
+    }
+    expect(controls.snapshot()).toEqual(saved);
+    controls.restore(saved);
+    for (const point of grid.positions) {
+      expect(point.clone().sub(entity.getPosition()).dot(entity.forward)).toBeGreaterThan(camera.nearClip);
+    }
+    controls.destroy();
+  });
+
+  it("keeps the full grid and translated model in range while orbiting, panning, zooming and realigning", () => {
+    const { camera, controls, entity, canvas } = setup();
+    const model = new BoundingBox(new Vec3(2, -1, 3), new Vec3(1.5, 1, 1));
+    const grid = buildGroundGrid(model);
+    const scene = model.clone();
+    scene.add(grid.bounds);
+    controls.setSceneBounds(scene);
+    const points = [...grid.positions];
+    for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) {
+      points.push(new Vec3(model.center.x + x * model.halfExtents.x, model.center.y + y * model.halfExtents.y, model.center.z + z * model.halfExtents.z));
+    }
+    const checkDepths = () => {
+      for (const point of points) {
+        const depth = point.clone().sub(entity.getPosition()).dot(entity.forward);
+        expect(depth).toBeGreaterThan(camera.nearClip);
+        expect(depth).toBeLessThan(camera.farClip);
+      }
+    };
+    for (const view of ["front", "side", "top"] as const) {
+      controls.alignOrthographic(view, model, 0.85, false);
+      checkDepths();
+      canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+      canvas.dispatchEvent(pointerEvent("pointermove", 60, 30));
+      canvas.dispatchEvent(pointerEvent("pointerup", 60, 30));
+      checkDepths();
+      for (const pitch of [-70, -5, 0.1, 22, 70, 89.9]) {
+        for (const yaw of [0, 45, 90, 180, 270]) {
+          controls.restore({ ...controls.snapshot(), pitch, yaw });
+          checkDepths();
+        }
+      }
+      canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40, 2));
+      canvas.dispatchEvent(pointerEvent("pointermove", 100, 80, 2));
+      canvas.dispatchEvent(pointerEvent("pointerup", 100, 80, 2));
+      checkDepths();
+      canvas.dispatchEvent(new WheelEvent("wheel", { cancelable: true, deltaY: 240 }));
+      checkDepths();
+    }
+    const transformed = new BoundingBox(new Vec3(-10, 5, -8), new Vec3(4, 3, 2));
+    const updated = transformed.clone();
+    updated.add(grid.bounds);
+    controls.setSceneBounds(updated);
+    checkDepths();
     controls.destroy();
   });
 
@@ -192,17 +261,79 @@ describe("ViewerControls", () => {
     clock.mockRestore();
   });
 
-  it("returns to perspective and clears the selected view when orbiting", () => {
+  it("keeps grid vertices in front of the near plane on every orthographic transition frame", () => {
+    const frames: FrameRequestCallback[] = [];
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation(callback => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const { camera, controls, entity } = setup();
+    const model = new BoundingBox(new Vec3(), new Vec3(1.5, 1, 1));
+    const grid = buildGroundGrid(model);
+    const scene = model.clone();
+    scene.add(grid.bounds);
+    controls.setSceneBounds(scene);
+    try {
+      for (const view of ["front", "side", "top"] as const) {
+        controls.alignOrthographic(view, model);
+        for (let time = 0; time <= 320; time += 40) {
+          frames.shift()?.(time);
+          for (const point of grid.positions) {
+            const depth = point.clone().sub(entity.getPosition()).dot(entity.forward);
+            expect(depth).toBeGreaterThan(camera.nearClip);
+            expect(depth).toBeLessThan(camera.farClip);
+          }
+        }
+        expect(frames).toHaveLength(0);
+      }
+    } finally {
+      controls.destroy();
+      request.mockRestore();
+      cancel.mockRestore();
+      clock.mockRestore();
+    }
+  });
+
+  it.each(["front", "side"] as const)("keeps the %s orthographic framing continuous when orbiting", (view) => {
     const { canvas, camera, controls, onOrthographicViewChange } = setup();
-    controls.alignOrthographic("front", new BoundingBox(new Vec3(), new Vec3(2, 1, 3)), 0.85, false);
+    controls.alignOrthographic(view, new BoundingBox(new Vec3(), new Vec3(2, 1, 3)), 0.85, false);
+    const aligned = controls.snapshot();
     expect(camera.projection).toBe(PROJECTION_ORTHOGRAPHIC);
-    expect(onOrthographicViewChange).toHaveBeenLastCalledWith("front");
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(view);
 
     canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
     canvas.dispatchEvent(pointerEvent("pointermove", 60, 48));
     canvas.dispatchEvent(pointerEvent("pointerup", 60, 48));
 
-    expect(camera.projection).not.toBe(PROJECTION_ORTHOGRAPHIC);
+    const orbited = controls.snapshot();
+    expect(camera.projection).toBe(PROJECTION_ORTHOGRAPHIC);
+    expect(orbited.projection).toBe(PROJECTION_ORTHOGRAPHIC);
+    expect(orbited.orthoHeight).toBe(aligned.orthoHeight);
+    expect(orbited.distance).toBe(aligned.distance);
+    expect(orbited.orthographicView).toBeNull();
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null);
+    controls.destroy();
+  });
+
+  it("leaves the top view through a stable pole without flipping the screen direction", () => {
+    const { canvas, camera, controls, lookAt, onOrthographicViewChange } = setup();
+    controls.alignOrthographic("top", new BoundingBox(new Vec3(), new Vec3(2, 1, 3)), 0.85, false);
+    const aligned = controls.snapshot();
+
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    canvas.dispatchEvent(pointerEvent("pointermove", 60, 40));
+    canvas.dispatchEvent(pointerEvent("pointerup", 60, 40));
+
+    const orbited = controls.snapshot();
+    const up = lookAt.mock.calls.at(-1)?.[1] as Vec3;
+    expect(camera.projection).toBe(PROJECTION_ORTHOGRAPHIC);
+    expect(orbited.orthographicView).toBeNull();
+    expect(orbited.orthoHeight).toBe(aligned.orthoHeight);
+    expect(orbited.distance).toBe(aligned.distance);
+    expect(orbited.pitch).toBeCloseTo(89.9);
+    expect(up.z).toBeLessThan(-0.99);
     expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null);
     controls.destroy();
   });

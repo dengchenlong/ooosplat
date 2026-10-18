@@ -1,8 +1,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { spzCspPlugin } from "./scripts/spz-csp-plugin.mjs";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), spzCspPlugin()],
+  worker: { plugins: () => [spzCspPlugin()] },
   clearScreen: false,
   server: {
     port: 1420,

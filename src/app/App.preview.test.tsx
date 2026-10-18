@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => ({
   setTelemetryConsent: vi.fn(),
   selectVideo: vi.fn(),
   selectImageSequence: vi.fn(),
+  selectGaussianImportSource: vi.fn(),
   probeAndPlan: vi.fn(),
   confirmLargeImageSequence: vi.fn(),
   confirmSmallImageSequence: vi.fn(),
@@ -75,6 +76,7 @@ vi.mock("../lib/backend", () => ({
   revealFile: mocks.revealFile,
   selectProjectsRoot: vi.fn(),
   selectImageSequence: mocks.selectImageSequence,
+  selectGaussianImportSource: mocks.selectGaussianImportSource,
   selectVideo: mocks.selectVideo,
   setProjectsRoot: vi.fn(),
   setTelemetryConsent: mocks.setTelemetryConsent,
@@ -141,6 +143,7 @@ describe("App preview workspace", () => {
     });
     mocks.prepareGaussianPreview.mockReset();
     mocks.classifyDroppedInput.mockReset().mockResolvedValue({ inputType: "video" });
+    mocks.selectGaussianImportSource.mockReset().mockResolvedValue(null);
     mocks.onInputDragDrop.mockReset().mockResolvedValue(() => undefined);
     mocks.cancelPipeline.mockReset().mockResolvedValue(undefined);
     mocks.estimateProjectRuntime.mockReset().mockResolvedValue({
@@ -202,6 +205,7 @@ describe("App preview workspace", () => {
       sourceImageCount: 100,
       eligible: true,
       reason: null,
+      imported: false,
     });
     mocks.probeReshootInput.mockReset();
     mocks.startReshootPipeline.mockReset();
@@ -291,6 +295,92 @@ describe("App preview workspace", () => {
     await act(async () => remove[1].click());
     await act(async () => container.querySelector<HTMLButtonElement>(".draft-row .danger-link")?.click());
     expect(container.querySelectorAll(".draft-row")).toHaveLength(1);
+  });
+
+  it("offers file and folder imports from the completed group", async () => {
+    const heading = container.querySelector<HTMLElement>(".completed-task-group .group-heading")!;
+    const toggle = heading.querySelector<HTMLButtonElement>(".group-toggle")!;
+    const add = container.querySelector<HTMLButtonElement>(".completed-import-actions .group-add-action")!;
+    const count = heading.querySelector<HTMLElement>(".group-count")!;
+    expect(add.textContent).toContain("导入");
+    expect(heading.children[0]).toBe(toggle);
+    expect(heading.children[1]).toBe(add.parentElement);
+    expect(heading.children[2]).toBe(count);
+    await act(async () => add.click());
+    const actions = container.querySelectorAll<HTMLButtonElement>(".completed-import-menu button");
+    expect(Array.from(actions, button => button.textContent)).toEqual(["导入文件", "导入文件夹"]);
+    await act(async () => actions[0].click());
+    expect(mocks.selectGaussianImportSource).toHaveBeenCalledWith("file");
+  });
+
+  it("uses the completed-project layout for imported models and hides irrelevant detail sections", async () => {
+    const importedProject: ProjectSummary = {
+      ...project,
+      id: "33333333-3333-3333-3333-333333333333",
+      name: "WuKong",
+      taskKind: "import",
+      durationMs: null,
+      quality: null,
+      modelFormat: "ply",
+      registeredRatio: null,
+      points3d: 618_770,
+    };
+    mocks.getProjectTaskDetail.mockResolvedValueOnce({
+      project: importedProject,
+      inputType: null,
+      sourcePath: "E:\\GaussianSplatting\\WuKong\\wukong_final.ply",
+      projectsRoot: "E:\\Projects",
+      plannerEnabled: null,
+      estimatedFrames: null,
+      stage: null,
+      progress: null,
+      inputImages: null,
+      registeredImages: null,
+      video: null,
+      imageSequence: null,
+      sourceProjectId: null,
+      logs: [],
+      imported: {
+        sourceModelPath: "E:\\GaussianSplatting\\WuKong\\wukong_final.ply",
+        format: "ply",
+        sourceAvailable: true,
+        colmapRoot: "E:\\GaussianSplatting\\WuKong",
+        sparseModelPath: "E:\\GaussianSplatting\\WuKong",
+        databaseAvailable: false,
+        imagesAvailable: false,
+        reshootEligible: false,
+        reshootReason: "缺少 database.db",
+      },
+    });
+    await act(async () => useAppStore.getState().setProjects([importedProject]));
+    await flush();
+
+    const row = container.querySelector<HTMLElement>("#completed-task-group-content .project-row")!;
+    expect(Array.from(row.querySelectorAll(".project-stats dt"), node => node.textContent)).toEqual(["PLY", "生成日期", "耗时", "档位"]);
+    expect(Array.from(row.querySelectorAll(".project-stats dd"), node => node.textContent).slice(2)).toEqual(["/", "/"]);
+    expect(row.querySelector(".project-stats")?.textContent).not.toContain("Gaussian 模型");
+
+    await act(async () => row.click());
+    await flush();
+    const detail = container.querySelector<HTMLElement>(".project-detail-page")!;
+    expect(detail.querySelector(".project-detail-stats")?.children).toHaveLength(4);
+    expect(detail.querySelector(".project-configuration-detail")).not.toBeNull();
+    expect(detail.querySelector(".path-picker")?.textContent).toContain("wukong_final.ply");
+    expect(detail.querySelectorAll(".form-section")).toHaveLength(1);
+    expect(detail.textContent).not.toContain("COLMAP");
+    expect(detail.querySelector(".quality-settings")).toBeNull();
+    expect(detail.querySelector(".acceleration-status")).toBeNull();
+    expect(detail.querySelector(".live-process")).toBeNull();
+  });
+
+  it("sorts completed projects newest first so a fresh import appears at the top", async () => {
+    const oldest = { ...project, id: "00000000-0000-0000-0000-000000000001", name: "Old", completedAt: "2026-10-15T08:00:00Z" };
+    const generated = { ...project, id: "00000000-0000-0000-0000-000000000002", name: "Generated", completedAt: "2026-10-16T08:00:00Z" };
+    const imported = { ...project, id: "00000000-0000-0000-0000-000000000003", name: "Imported", taskKind: "import" as const, quality: null, completedAt: "2026-10-17T08:00:00Z" };
+    await act(async () => useAppStore.getState().setProjects([generated, oldest, imported]));
+    await flush();
+
+    expect(Array.from(container.querySelectorAll("#completed-task-group-content .project-title-line strong"), node => node.textContent)).toEqual(["Imported", "Generated", "Old"]);
   });
 
   it("keeps auto-run session-only and uses a non-button drag indicator", async () => {
@@ -725,6 +815,43 @@ describe("App preview workspace", () => {
     expect(planner?.disabled).toBe(true);
     expect(planner?.getAttribute("aria-checked")).toBe("false");
     expect(planner?.textContent).not.toContain("继承源任务");
+  });
+
+  it("lets imported projects choose the reshoot quality and automatic optimization", async () => {
+    const importedProject: ProjectSummary = {
+      ...project,
+      taskKind: "import",
+      quality: null,
+      modelFormat: "spz",
+      reshootEligible: true,
+    };
+    mocks.inspectReshootSource.mockResolvedValueOnce({
+      projectId: importedProject.id,
+      projectName: importedProject.name,
+      quality: "balanced",
+      plannerEnabled: true,
+      cameraId: 1,
+      cameraModel: "SIMPLE_RADIAL",
+      width: 1920,
+      height: 1080,
+      sourceImageCount: 100,
+      eligible: true,
+      reason: null,
+      imported: true,
+    });
+    await act(async () => useAppStore.setState({ projects: [importedProject] }));
+    await act(async () => container.querySelector<HTMLButtonElement>(".reshoot-link")?.click());
+    await flush();
+
+    const qualityButtons = container.querySelectorAll<HTMLButtonElement>(".reshoot-task-page .quality-option");
+    expect(Array.from(qualityButtons).every(button => !button.disabled)).toBe(true);
+    expect(container.querySelector(".reshoot-task-page .locked-setting")).toBeNull();
+    await act(async () => qualityButtons[2].click());
+    expect(qualityButtons[2].getAttribute("aria-checked")).toBe("true");
+    const planner = container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")!;
+    expect(planner.disabled).toBe(false);
+    await act(async () => planner.click());
+    expect(planner.getAttribute("aria-checked")).toBe("false");
   });
 
   it("probes Alpha reshoot media and blocks a mismatched camera resolution", async () => {
@@ -1569,6 +1696,14 @@ describe("App preview workspace", () => {
     });
     await flush();
     expect(container.querySelector(".project-quality-warning")?.textContent).toContain("62.0%");
+  });
+
+  it("does not treat imported COLMAP provenance as this task's registration rate", async () => {
+    await act(async () => {
+      useAppStore.getState().setProjects([{ ...project, taskKind: "import", registeredRatio: 0 }]);
+    });
+    await flush();
+    expect(container.querySelector(".project-quality-warning")).toBeNull();
   });
 
   it("summarizes long errors in both task panes and reveals their full detail on hover", async () => {

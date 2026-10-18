@@ -22,12 +22,15 @@ import { UpdateNoticeDialog, UpdateSettingsRow } from "../components/UpdateNotic
 import { useUpdateNotice } from "./useUpdateNotice";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
+import { GaussianImportDialog } from "../components/GaussianImportDialog";
+import { ImportedProjectDetails } from "../components/ImportedProjectDetails";
 import {
   cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
   estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, inspectReshootSource, onInputDragDrop, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
+  selectGaussianImportSource, revealImportedSource, relinkImportedProject,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { useTaskElapsed } from "./useTaskElapsed";
@@ -355,6 +358,8 @@ export function App() {
   const [dismissedErrorRevision, setDismissedErrorRevision] = useState(0);
   const [expandedGroups, setExpandedGroups] = useState<TaskGroupVisibility>(loadTaskGroupVisibility);
   const [reshootBusy, setReshootBusy] = useState(false);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [gaussianImportSelectionId, setGaussianImportSelectionId] = useState<string | null>(null);
   const drafts = taskWorkspace.drafts;
   const selectedTask = taskWorkspace.selected;
   const selectedSharedTask = selectedTask.kind === "task" ? sharedTasks[selectedTask.id] : selectedTask.kind === "project" ? Object.values(sharedTasks).find(task => task.project_id === selectedTask.id && !task.project_deleted) : null;
@@ -367,6 +372,7 @@ export function App() {
   submittedIdsRef.current = new Set(Object.keys(sharedTasks));
   const submittedIdsKey = Object.keys(sharedTasks).sort().join('|');
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
+  const selectedReshootSourceProject = selectedDraft?.kind === "reshoot" ? store.projects.find(project => project.id === selectedDraft.sourceProjectId) ?? null : null;
   const selectedProject = selectedTask.kind === "project"
     ? store.projects.find((project) => project.id === selectedTask.id)
       ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
@@ -375,6 +381,10 @@ export function App() {
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const sharedProjectIds = new Set(Object.values(sharedTasks).filter(task => !task.project_deleted).map(task => task.project_id));
   const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
+  const completedRows = [
+    ...submittedCompleted.map(task => ({ kind: "task" as const, id: task.task_id, time: timestampOf(task.result?.completedAt ?? task.updated_at), task })),
+    ...completed.map(project => ({ kind: "project" as const, id: project.id, time: timestampOf(project.completedAt ?? project.createdAt), project })),
+  ].sort((left, right) => right.time - left.time || right.id.localeCompare(left.id));
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
   const projectSyncKey = Object.values(sharedTasks).filter(task => task.project_id && !task.project_deleted)
     .map(task => `${task.project_id}:${task.run_id}:${task.status}`).sort().join("|");
@@ -544,6 +554,36 @@ export function App() {
   const toggleTaskGroup = useCallback((group: TaskGroupKey) => {
     setExpandedGroups((groups) => ({ ...groups, [group]: !groups[group] }));
   }, []);
+
+  const chooseGaussianImport = useCallback(async (kind: "file" | "folder") => {
+    setImportMenuOpen(false);
+    try {
+      const selection = await selectGaussianImportSource(kind);
+      if (selection) setGaussianImportSelectionId(selection.selectionId);
+    } catch (error) {
+      useAppStore.getState().setError(messageOf(error));
+    }
+  }, [messageOf]);
+
+  const finishGaussianImport = useCallback((project: ProjectSummary) => {
+    useAppStore.getState().setProjects([project, ...useAppStore.getState().projects.filter(item => item.id !== project.id)]);
+    setGaussianImportSelectionId(null);
+    setExpandedGroups(groups => ({ ...groups, completed: true }));
+    selectProject(project);
+  }, [selectProject]);
+
+  const relinkImportedSource = useCallback(async (projectId: string) => {
+    try {
+      const selection = await selectGaussianImportSource("file");
+      if (!selection) return;
+      const updated = await relinkImportedProject(projectId, selection.selectionId);
+      const projects = useAppStore.getState().projects;
+      useAppStore.getState().setProjects(projects.map(item => item.id === updated.id ? updated : item));
+      setProjectDetail(null);
+    } catch (error) {
+      setProjectActionError({ projectId, message: messageOf(error), occurredAt: Date.now() });
+    }
+  }, [messageOf]);
 
   const removeDraft = useCallback((id: string) => {
     queueRevisionRef.current += 1;
@@ -1003,7 +1043,7 @@ export function App() {
       try {
         const source = await inspectReshootSource(sourceProjectId);
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { reshootSource: source, plannerEnabled: source.plannerEnabled });
+        updateDraft(draftId, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }) });
         if (!source.eligible) {
           updateDraft(draftId, { error: source.reason ?? t("reshoot.ineligible"), inputChecking: false });
           return false;
@@ -1047,7 +1087,7 @@ export function App() {
   };
 
   const chooseInput = async (inputType: InputType) => {
-    if (!selectedDraft || selectedDraft.kind !== "generation") return;
+    if (!selectedDraft || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     try {
       const selected = inputType === "images" ? await selectImageSequence() : await selectVideo();
       if (selected) await applyInputToDraft(selectedDraft.id, selected, inputType);
@@ -1117,18 +1157,18 @@ export function App() {
   };
 
   const chooseQuality = async (quality: Quality) => {
-    if (!selectedDraft || selectedDraft.kind !== "generation") return;
+    if (!selectedDraft || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
-    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled);
+    if (selectedDraft.kind === "generation" && selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled);
   };
 
   const changePlannerEnabled = async () => {
-    if (!selectedDraft || selectedDraft.kind !== "generation" || selectedDraft.running) return;
+    if (!selectedDraft || selectedDraft.running || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     const enabled = !selectedDraft.plannerEnabled;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { plannerEnabled: enabled, plannerDefaultPending: false, plan: null, estimate: null, error: null });
-    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled);
+    if (selectedDraft.kind === "generation" && selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled);
   };
 
   const requestCancellation = async () => {
@@ -1396,7 +1436,7 @@ export function App() {
   const openReshoot = (project: ProjectSummary) => {
     if (reshootBusy) return;
     queueRevisionRef.current += 1;
-    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality, useAppStore.getState().plannerEnabled);
+    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality ?? "balanced", useAppStore.getState().plannerEnabled);
     setExpandedGroups((groups) => ({ ...groups, new: true }));
     setProjectActionError(null);
     setTaskWorkspace((workspace) => ({ drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: workspace.nextOrdinal + 1 }));
@@ -1418,7 +1458,7 @@ export function App() {
     try {
       const source = await inspectReshootSource(draft.sourceProjectId);
       if (!source.eligible) {
-        updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.reason ?? t("reshoot.ineligible") });
+        updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.reason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
@@ -1455,6 +1495,8 @@ export function App() {
         inputType: draft.inputType,
         projectsRoot: store.projectsRoot,
         workspaceTaskId: draft.id,
+        quality: draft.quality,
+        plannerEnabled: draft.plannerEnabled,
       });
       store.setResult(result);
       store.setPhase("completed");
@@ -1538,7 +1580,7 @@ export function App() {
     else {
       updateDraft(draft.id, { inputChecking: true, needsValidation: false });
       void inspectReshootSource(draft.sourceProjectId)
-        .then((source) => updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
+        .then((source) => updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
         .catch((error) => updateDraft(draft.id, { error: messageOf(error), inputChecking: false }));
     }
   // Validation is intentionally lazy and keyed only by selection.
@@ -1617,10 +1659,14 @@ export function App() {
     ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
     : null;
   const projectConfigurationDetails = selectedProject && projectDetail
-    ? <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType} quality={selectedProject.quality} plannerEnabled={projectDetail.plannerEnabled} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
+    ? projectDetail.imported
+      ? <ImportedProjectDetails detail={projectDetail} onRevealSource={() => void revealImportedSource(selectedProject.id).catch(error => setProjectActionError({ projectId: selectedProject.id, message: messageOf(error), occurredAt: Date.now() }))} onRelink={() => void relinkImportedSource(selectedProject.id)} />
+      : <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
     : null;
   const historicalTaskProgress = selectedProject && projectDetail
-    ? <TaskProgress historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
+    ? projectDetail.imported || projectDetail.stage == null || projectDetail.progress == null
+      ? null
+      : <TaskProgress historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
     : null;
 
   const renderSharedNewRows = () => submittedNew.map(task => {
@@ -1634,9 +1680,9 @@ export function App() {
       onSelect={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))} />;
   });
 
-  const renderSharedRows = (items: import("../types/tasks").SharedTask[]) => items.map(task => {
+  const renderSharedRow = (task: import("../types/tasks").SharedTask) => {
     const project = taskProjectSummary(task, store.projects.find(item => item.id === task.project_id));
-    return <ProjectRow key={task.task_id} task={task} project={project}
+    return <ProjectRow key={`task:${task.task_id}`} task={task} project={project}
       selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
       busy={runBusy} previewing={openingPreviewProjectId === task.project_id}
       previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === task.project_id}
@@ -1644,7 +1690,9 @@ export function App() {
       onSelect={selectProject} onSelectTask={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))}
       onPreview={item => void previewProject(item)} onReshoot={item => void openReshoot(item)}
       onResume={item => void resume(item)} onReveal={item => void showProject(item)} onDelete={item => void removeProject(item)} />;
-  });
+  };
+  const renderSharedRows = (items: import("../types/tasks").SharedTask[]) => items.map(renderSharedRow);
+  const renderCompletedProjectRow = (project: ProjectSummary) => <ProjectRow key={`project:${project.id}`} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />;
 
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
@@ -1786,14 +1834,14 @@ export function App() {
           </div>
 
           <div className="form-section">
-            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label><span className="locked-setting"><Lock size={12} />{t("reshoot.inheritedReadonly")}</span></div>
-            <div className="quality-settings locked-quality-settings">
+            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label>{selectedReshootSourceProject?.taskKind !== "import" && <span className="locked-setting"><Lock size={12} />{t("reshoot.inheritedReadonly")}</span>}</div>
+            <div className={`quality-settings ${selectedReshootSourceProject?.taskKind === "import" ? "" : "locked-quality-settings"}`}>
               <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>
-                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"}>
+                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                   <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
                 </button>)}
               </div>
-              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.reshootSource?.plannerEnabled ?? false} disabled>
+              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} onClick={() => void changePlannerEnabled()}>
                 <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
                 <i aria-hidden="true"><span /></i>
               </button>
@@ -1824,7 +1872,7 @@ export function App() {
           {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : selectedProject.status === "completed" ? <>
             <ProjectResultStats project={selectedProject} detail={projectDetail} />
             {projectConfigurationDetails}
-            {selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
+            {selectedProject.taskKind !== "import" && selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
             {detailErrorBanner}
             {historicalTaskProgress}
           </> : projectDetail ? <div className="unfinished-task-detail">
@@ -1884,9 +1932,9 @@ export function App() {
           }} onDelete={() => removeDraft(draft.id)} onPointerDown={(event) => beginDraftDrag(event, draft.id)} onPointerMove={updateDraftDrag} onPointerEnd={endDraftDrag} onKeyboardMove={(offset) => moveDraftWithKeyboard(draft.id, offset)} />)}</div>
           <span className="visually-hidden" aria-live="polite">{reorderAnnouncement}</span>
         </div>
-        <div className="project-group">
-          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length + submittedCompleted.length })}</small></button></div>
-          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{renderSharedRows(submittedCompleted)}{completed.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
+        <div className="project-group completed-task-group">
+          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span></button><div className="completed-import-actions"><button className="group-add-action" type="button" disabled={runBusy} aria-haspopup="menu" aria-expanded={!runBusy && importMenuOpen} onClick={() => setImportMenuOpen(open => !open)}><Plus size={13} />{t("import.add")}</button>{!runBusy && importMenuOpen && <div className="completed-import-menu" role="menu"><button type="button" role="menuitem" onClick={() => void chooseGaussianImport("file")}><Upload size={14} />{t("import.file")}</button><button type="button" role="menuitem" onClick={() => void chooseGaussianImport("folder")}><FolderOpen size={14} />{t("import.folder")}</button></div>}</div><small className="group-count">{t("history.projects", { count: completed.length + submittedCompleted.length })}</small></div>
+          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{completedRows.map(item => item.kind === "task" ? renderSharedRow(item.task) : renderCompletedProjectRow(item.project))}</div>
         </div>
         <div className="project-group unfinished">
           <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.unfinished} aria-controls="unfinished-task-group-content" aria-label={t(expandedGroups.unfinished ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.unfinished") })} onClick={() => toggleTaskGroup("unfinished")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length + submittedUnfinished.length })}</small></button></div>
@@ -1917,5 +1965,6 @@ export function App() {
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
     {settingsOpen && <SettingsDialog preferences={telemetryPreferences} telemetryBusy={telemetryBusy} showRuntimePanel={uiPreferences.showRuntimePanel} onTelemetryChange={(enabled) => void changeTelemetryConsent(enabled)} onRuntimePanelChange={changeRuntimePanelPreference} onClose={() => setSettingsOpen(false)} updatePanel={<UpdateSettingsRow result={updates.result} busy={updates.busy} failed={updates.failed} cooldownSeconds={updates.cooldownSeconds} onCheck={() => void checkUpdatesManually()} />} />}
     {updates.dialogRequested && updates.release && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
+    {gaussianImportSelectionId && <GaussianImportDialog selectionId={gaussianImportSelectionId} onClose={() => setGaussianImportSelectionId(null)} onImported={finishGaussianImport} />}
   </main>;
 }

@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianImportProbe, GaussianImportSelection, GaussianImportSession, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -28,6 +28,17 @@ export async function selectImageSequence(): Promise<string | null> {
   const selected = await open({ title: translate(locale, "dialog.selectImagesTitle"), multiple: false, directory: true });
   return typeof selected === "string" ? selected : null;
 }
+
+export async function selectGaussianImportSource(kind: "file" | "folder"): Promise<GaussianImportSelection | null> { return inTauri() ? invoke("select_gaussian_import_source", { kind }) : null; }
+export async function probeGaussianImport(selectionId: string): Promise<GaussianImportProbe> { return invoke("probe_gaussian_import", { selectionId }); }
+export async function beginGaussianImport(request: { probeId: string; modelId: string; colmapId: string | null; projectName: string }): Promise<GaussianImportSession> { return invoke("begin_gaussian_import", { request }); }
+export async function readGaussianImportChunk(importId: string, filename: string, offset: number, length: number): Promise<ArrayBuffer | Uint8Array> {
+  return invoke("read_gaussian_import_chunk", undefined, { headers: { "x-ooosplat-import-id": importId, "x-ooosplat-import-file": filename, "x-ooosplat-offset": String(offset), "x-ooosplat-length": String(length) } });
+}
+export async function writeGaussianImportChunk(importId: string, offset: number, bytes: Uint8Array): Promise<number> { return invoke("write_gaussian_import_chunk", bytes, { headers: { "x-ooosplat-import-id": importId, "x-ooosplat-offset": String(offset) } }); }
+export async function completeGaussianImport(request: { importId: string; splatCount: number; shBands: number; model: string | null }): Promise<ProjectSummary> { return invoke("complete_gaussian_import", { request }); }
+export async function cancelGaussianImport(importId: string): Promise<void> { return invoke("cancel_gaussian_import", { importId }); }
+export async function relinkImportedProject(projectId: string, selectionId: string): Promise<ProjectSummary> { return invoke("relink_imported_project", { projectId, selectionId }); }
 
 
 export async function confirmLargeImageSequence(imageCount: number): Promise<boolean> {
@@ -115,7 +126,7 @@ export async function resumePipeline(projectId: string): Promise<PipelineResult>
 }
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId }); }
 export async function probeReshootInput(projectId: string, path: string, inputType: InputType): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType }); }
-export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string }): Promise<PipelineResult> {
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean }): Promise<PipelineResult> {
   const receipt = await invoke<StartReceipt>("start_gui_reshoot", { request });
   return waitForSharedTask(receipt.task_id);
 }
@@ -147,11 +158,14 @@ export async function prepareGaussianPreview(projectId: string): Promise<Gaussia
   }
   return {
     ...descriptor,
-    assetUrl: previewAssetUrl(convertFileSrc(descriptor.assetPath), "previewSession", crypto.randomUUID()),
+    assetUrl: descriptor.readToken ? `ooosplat-import-${descriptor.readToken}.ply` : previewAssetUrl(convertFileSrc(descriptor.assetPath), "previewSession", crypto.randomUUID()),
     editMaskAssetUrl: descriptor.editMaskAssetPath
       ? previewAssetUrl(convertFileSrc(descriptor.editMaskAssetPath), "editSession", crypto.randomUUID())
       : null,
   };
+}
+export async function readGaussianPreviewChunk(readToken: string, offset: number, length: number): Promise<ArrayBuffer | Uint8Array> {
+  return invoke("read_gaussian_preview_chunk", undefined, { headers: { "x-ooosplat-preview-token": readToken, "x-ooosplat-offset": String(offset), "x-ooosplat-length": String(length) } });
 }
 export async function releaseGaussianPreview(projectId: string): Promise<void> { return invoke("release_gaussian_preview", { projectId }); }
 export async function saveGaussianTransform(projectId: string, transform: GaussianTransform): Promise<GaussianTransform> { return invoke("save_gaussian_transform", { projectId, transform }); }
@@ -182,6 +196,7 @@ export async function revealProject(project: ProjectSummary): Promise<void> {
 }
 
 export async function revealProjectLogs(projectId: string): Promise<void> { await invoke("open_project_location", { projectId, location: "logs" }); }
+export async function revealImportedSource(projectId: string): Promise<void> { await invoke("open_project_location", { projectId, location: "source" }); }
 
 export async function revealFile(path: string): Promise<void> {
   await revealItemInDir(path);

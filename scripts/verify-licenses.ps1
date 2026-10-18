@@ -59,6 +59,8 @@ $requiredFiles = @(
     "GENERATED_OUTPUTS.md",
     "licenses/THIRD_PARTY_NOTICES.txt",
     "licenses/FFmpeg-LGPL-2.1.txt",
+    "licenses/FFmpeg-LGPL-3.0.txt",
+    "licenses/FFmpeg-GPL-3.0.txt",
     "licenses/COLMAP-LICENSE.txt",
     "licenses/NVIDIA-CUDA-Runtime.txt",
     "licenses/Brush-LICENSE.txt",
@@ -124,8 +126,9 @@ Assert-True ($manifest.engines.Count -eq 3) "License verification expects exactl
 
 $expectedEngines = @{
     "FFmpeg / FFprobe" = @{
-        License = "LGPL-2.1-or-later"
-        File = "licenses/FFmpeg-LGPL-2.1.txt"
+        License = "LGPL-3.0-or-later"
+        File = "licenses/FFmpeg-LGPL-3.0.txt"
+        AdditionalFiles = @("licenses/FFmpeg-GPL-3.0.txt")
     }
     "COLMAP" = @{
         License = "BSD-3-Clause"
@@ -145,9 +148,14 @@ foreach ($engine in $manifest.engines) {
     Assert-True ($expectedEngines.ContainsKey($engine.name)) "Unexpected direct engine in manifest: $($engine.name)"
     $expected = $expectedEngines[$engine.name]
     Assert-True ($engine.license.StartsWith($expected.License)) "$($engine.name) license identifier does not match $($expected.License)."
-    Assert-True (@($engine.licenseFiles).Count -eq 1) "$($engine.name) must map to one direct license file."
-    Assert-True ($engine.licenseFiles[0] -eq $expected.File) "$($engine.name) license file mapping is incorrect."
-    Assert-True (Test-Path -LiteralPath (Resolve-WorkspacePath $expected.File) -PathType Leaf) "$($engine.name) mapped license file is missing."
+    $expectedFiles = @($expected.File)
+    if ($expected.ContainsKey('AdditionalFiles')) { $expectedFiles += @($expected.AdditionalFiles) }
+    Assert-True (@($engine.licenseFiles).Count -eq $expectedFiles.Count) "$($engine.name) license file count is incorrect."
+    foreach ($file in $expectedFiles) {
+        Assert-True ($engine.licenseFiles -contains $file) "$($engine.name) license file mapping is incorrect."
+        Assert-True (Test-Path -LiteralPath (Resolve-WorkspacePath $file) -PathType Leaf) "$($engine.name) mapped license file is missing."
+        Assert-Contains $thirdParty $file "THIRD_PARTY_NOTICES.txt"
+    }
     Assert-Contains $thirdParty $engine.name "THIRD_PARTY_NOTICES.txt"
     Assert-Contains $thirdParty $expected.License "THIRD_PARTY_NOTICES.txt"
     Assert-Contains $thirdParty $expected.File "THIRD_PARTY_NOTICES.txt"
@@ -182,6 +190,9 @@ Assert-True ($macosManifest.engines.Count -eq 3) "macOS manifest must contain th
 foreach ($engine in $macosManifest.engines) {
     Assert-True ($expectedEngines.ContainsKey($engine.name)) "Unexpected macOS engine: $($engine.name)"
     $expected = $expectedEngines[$engine.name]
+    if ($engine.name -eq 'FFmpeg / FFprobe') {
+        $expected = @{ License = 'LGPL-2.1-or-later'; File = 'licenses/FFmpeg-LGPL-2.1.txt' }
+    }
     Assert-True ($engine.license -eq $expected.License) "$($engine.name) macOS license identifier is incorrect."
     Assert-True (@($engine.licenseFiles).Count -eq 1 -and $engine.licenseFiles[0] -eq $expected.File) "$($engine.name) macOS license mapping is incorrect."
     Assert-True ($engine.sourceSha256 -match '^[A-F0-9]{64}$') "$($engine.name) macOS source SHA-256 is invalid."
@@ -193,7 +204,7 @@ foreach ($marker in "macOS 15+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COL
 & node (Join-Path $PSScriptRoot 'verify-licenses.mjs')
 Assert-True ($LASTEXITCODE -eq 0) 'Pinned OOOBrush platform identities, binary hashes and license mappings must pass the shared checks.'
 
-foreach ($component in "PlayCanvas Engine", "PlayCanvas React", "PlayCanvas splat-transform (adapted algorithm)", "SuperSplat selection workflow (adapted algorithm)") {
+foreach ($component in "PlayCanvas Engine", "PlayCanvas React", "PlayCanvas splat-transform", "SuperSplat selection workflow (adapted algorithm)") {
     Assert-Contains $thirdParty $component "THIRD_PARTY_NOTICES.txt"
 }
 Assert-Contains $thirdParty "licenses/PlayCanvas-MIT.txt" "THIRD_PARTY_NOTICES.txt"
@@ -223,6 +234,9 @@ $ffmpegLicense = Read-Utf8Text "licenses/FFmpeg-LGPL-2.1.txt"
 Assert-Contains $ffmpegLicense "GNU LESSER GENERAL PUBLIC LICENSE" "FFmpeg license"
 Assert-Contains $ffmpegLicense "Version 2.1, February 1999" "FFmpeg license"
 Assert-True (-not $ffmpegLicense.Contains("Version 3, 29 June 2007")) "FFmpeg license still contains the LGPLv3 text."
+$windowsFfmpegLicense = Read-Utf8Text "licenses/FFmpeg-LGPL-3.0.txt"
+Assert-Contains $windowsFfmpegLicense "Version 3, 29 June 2007" "Windows FFmpeg license"
+Assert-Contains (Read-Utf8Text "licenses/FFmpeg-GPL-3.0.txt") "GNU GENERAL PUBLIC LICENSE" "Windows FFmpeg incorporated terms"
 
 $colmapLicense = Read-Utf8Text "licenses/COLMAP-LICENSE.txt"
 Assert-Contains $colmapLicense "ETH Zurich and UNC Chapel Hill" "COLMAP license"

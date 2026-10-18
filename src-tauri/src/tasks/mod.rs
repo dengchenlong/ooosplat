@@ -914,6 +914,7 @@ impl TaskService {
                                     ReshootInputType::Video
                                 },
                                 &execution.projects_root,
+                                execution.quality,
                             )
                             .await
                     } else {
