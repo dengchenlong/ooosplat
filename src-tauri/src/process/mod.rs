@@ -254,6 +254,7 @@ impl ProcessOutput {
 
 #[derive(Clone, Default)]
 pub struct ProcessManager {
+    output_capture_limit: Option<usize>,
     lifecycle: Option<ProcessObserver>,
     cancellation: CancellationToken,
 }
@@ -261,6 +262,7 @@ pub struct ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
+            output_capture_limit: None,
             cancellation: CancellationToken::new(),
             lifecycle: None,
         }
@@ -268,6 +270,13 @@ impl ProcessManager {
 
     pub fn with_lifecycle(mut self, observer: ProcessObserver) -> Self {
         self.lifecycle = Some(observer);
+        self
+    }
+
+    /// Streaming probes consume every observer event but retain only a bounded
+    /// diagnostic tail. Ordinary engine callers retain their existing behavior.
+    pub(crate) fn with_output_capture_limit(mut self, limit: usize) -> Self {
+        self.output_capture_limit = Some(limit);
         self
     }
 
@@ -397,12 +406,14 @@ impl ProcessManager {
             ProcessStream::Stdout,
             spec.observer.clone(),
             log_file.clone(),
+            self.output_capture_limit,
         ));
         let stderr_task = tokio::spawn(pump_stream(
             child.stderr.take().expect("stderr is piped"),
             ProcessStream::Stderr,
             spec.observer.clone(),
             log_file.clone(),
+            self.output_capture_limit,
         ));
         let finished = Arc::new(AtomicBool::new(false));
         let resource_task = spec
@@ -516,9 +527,10 @@ async fn pump_stream<R: AsyncRead + Unpin>(
     stream: ProcessStream,
     observer: Option<ProcessObserver>,
     log: Option<Arc<Mutex<tokio::fs::File>>>,
+    capture_limit: Option<usize>,
 ) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::new(reader);
-    let mut collected = Vec::new();
+    let mut collected = std::collections::VecDeque::new();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -526,7 +538,11 @@ async fn pump_stream<R: AsyncRead + Unpin>(
         if read == 0 {
             break;
         }
-        collected.extend_from_slice(&line);
+        collected.extend(line.iter().copied());
+        if let Some(limit) = capture_limit {
+            let discard = collected.len().saturating_sub(limit);
+            collected.drain(..discard);
+        }
         if let Some(file) = &log {
             file.lock().await.write_all(&line).await?;
         }
@@ -537,13 +553,33 @@ async fn pump_stream<R: AsyncRead + Unpin>(
             });
         }
     }
-    Ok(collected)
+    Ok(collected.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bounded_capture_preserves_all_observer_lines() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = lines.clone();
+        let output = pump_stream(
+            &b"frame=0\nframe=1\nframe=2\n"[..],
+            ProcessStream::Stdout,
+            Some(Arc::new(move |update| {
+                if let ProcessUpdate::Line { line, .. } = update {
+                    seen.lock().unwrap().push(line);
+                }
+            })),
+            None,
+            Some(8),
+        )
+        .await;
+        assert_eq!(output.unwrap(), b"frame=2\n");
+        assert_eq!(lines.lock().unwrap().len(), 3);
+    }
 
     #[test]
     fn failure_detail_prefers_stderr_and_keeps_only_a_bounded_tail() {
@@ -707,12 +743,14 @@ mod tests {
             ProcessStream::Stdout,
             Some(observer.clone()),
             Some(log.clone()),
+            None,
         ));
         let stderr_task = tokio::spawn(pump_stream(
             stderr_reader,
             ProcessStream::Stderr,
             Some(observer),
             Some(log.clone()),
+            None,
         ));
         stdout_writer
             .write_all(b"frame=1\nframe=2\n")

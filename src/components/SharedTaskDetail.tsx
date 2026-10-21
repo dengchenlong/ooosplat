@@ -9,6 +9,7 @@ import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskProjectSummary } from '../app/taskPresentation';
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useProgressMessage } from '../app/useProgressMessage';
+import { isProgressEvent } from '../lib/progressState';
 import { useTaskElapsed } from '../app/useTaskElapsed';
 import { CompactError } from './CompactError';
 import { TaskConfiguration } from './TaskConfiguration';
@@ -71,30 +72,30 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     finally { setBusy(false); }
   };
   const events = task.recent_events;
-  const runtime = task.runtime ?? [...events].reverse().find(event => event.runtime)?.runtime;
+  const runtime = task.runtime;
   const stage = task.error?.failed_stage ?? (['failed', 'cancelled', 'interrupted'].includes(task.status)
-    ? [...events].reverse().find(event => !['failed', 'cancelled', 'completed'].includes(event.stage))?.stage ?? detail?.stage
+    ? [...events].reverse().find(event => isProgressEvent(event) && !['failed', 'cancelled', 'completed'].includes(event.stage))?.stage ?? detail?.stage
     : task.stage) ?? null;
   const logs = useMemo(() => {
     const rawKeys = new Set(fileLogs.map(line => `${line.source}:${line.text.trim()}`));
     const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.engine}:${event.message.trim()}`)).map(event => ({
       key: `event:${event.sequence}`, source: event.engine, timestamp: event.timestamp, level: event.level,
-      text: event.kind === 'log' ? event.message : localizePipelineMessage(locale, event.message),
+      text: event.kind === 'log' && event.engine !== 'system' ? event.message : localizePipelineMessage(locale, event.message),
     }));
     return boundLogLines([...fileLogs, ...eventLogs]);
   }, [events, fileLogs, locale]);
   const resumable = project && detail && !active && ['failed', 'cancelled', 'interrupted'].includes(task.status);
   const error = actionError ?? externalError ?? task.error?.message;
-  const message = useProgressMessage(task.status, stage, events, runtime, { current: task.current, total: task.total });
+  const message = useProgressMessage(task.status, stage, events, runtime, { current: task.current, total: task.total, substage: task.substage, unit: task.unit });
   return <section className="project-detail-page shared-task-detail" aria-label={locale === 'zh-CN' ? '任务详情' : 'Task details'}>
     {task.source === 'mcp' && <p className="task-origin">{locale === 'zh-CN' ? '由 AI Agent 创建' : 'Created by AI Agent'}</p>}
     {task.status === 'completed' && project && <ProjectResultStats project={project} detail={detail} inputImages={task.result?.inputImages} registeredImages={task.result?.registeredImages} />}
-    <TaskConfiguration sourcePath={task.input_path} projectsRoot={task.projects_root} inputType={task.input_type ?? detail?.inputType ?? (/\.(mp4|mov)$/i.test(task.input_path) ? 'video' : 'images')} quality={task.quality} plannerEnabled={task.planner_enabled} completed={task.status === 'completed'} inheritedFrom={task.task_kind === 'reshoot' ? 'reshoot' : task.runs?.find(run => run.run_id === task.run_id)?.kind === 'resume' ? 'resume' : null} acceleration={[...events].reverse().find(event => event.acceleration)?.acceleration ?? acceleration} video={detail?.video} imageSequence={detail?.imageSequence} estimatedFrames={detail?.estimatedFrames} />
+    <TaskConfiguration sourcePath={task.input_path} projectsRoot={task.projects_root} inputType={task.input_type ?? detail?.inputType ?? (/\.(mp4|mov)$/i.test(task.input_path) ? 'video' : 'images')} quality={task.quality} plannerEnabled={task.planner_enabled} completed={task.status === 'completed'} inheritedFrom={task.task_kind === 'reshoot' ? 'reshoot' : task.runs?.find(run => run.run_id === task.run_id)?.kind === 'resume' ? 'resume' : null} acceleration={[...events].reverse().find(event => event.acceleration)?.acceleration ?? acceleration} videoProjection={detail?.videoProjection} inputProjection={detail?.inputProjection} video={detail?.video} imageSequence={detail?.imageSequence} estimatedFrames={detail?.estimatedFrames} />
     {project?.taskKind !== "import" && project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
     {error && <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={error} /></div>}
     {task.error?.classification_is_heuristic && <p className="project-failure">{locale === 'zh-CN' ? '错误分类为启发式判断，请结合日志确认。' : 'Error classification is heuristic; inspect logs for evidence.'}</p>}
     {task.status === 'created' && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => startGuiTask(task.task_id))}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('generate.start')}</button>}
     {resumable && onResume && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => onResume(project))}><Play size={16} fill="currentColor" />{t('project.continue')}</button>}
-    <TaskProgress status={task.status} stage={stage} progress={task.estimated_progress} estimated stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={logs} logsTruncated={(task.dropped_event_count ?? 0) > 0} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
+    <TaskProgress progressKey={`${task.task_id}:${task.run_id ?? 'pending'}`} operationAttempt={task.operation?.attempt} substage={task.substage} status={task.status} stage={stage} progress={task.display_progress ?? task.estimated_progress} stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={logs} logsTruncated={(task.dropped_event_count ?? 0) > 0} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
   </section>;
 }

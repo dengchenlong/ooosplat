@@ -139,17 +139,38 @@ impl ProjectManager {
         observer: Option<ProjectImportObserver>,
         cancellation: Option<CancellationToken>,
     ) -> Result<(ProjectPaths, ProjectMetadata)> {
+        let import_identity = if input.is_dir() {
+            Some(crate::video::image_projection::source_identity(input)?)
+        } else {
+            None
+        };
         let image_scan = if input.is_dir() {
             let source = input.to_path_buf();
             let token = cancellation.clone();
             let boundary = self.input_boundary.clone();
             Some(
                 crate::presets::spawn_pipeline_blocking(move || {
-                    crate::video::image_sequence::scan_image_sequence_with_boundary(
-                        &source,
-                        token.as_ref(),
-                        boundary.as_deref(),
-                    )
+                    for path in crate::video::list_images(&source)? {
+                        if token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                            return Err(SplatError::Cancelled);
+                        }
+                        if let Some(root) = &boundary {
+                            crate::tasks::authorize_input(&path, std::slice::from_ref(root))
+                                .map_err(|e| SplatError::Process(e.to_string()))?;
+                        }
+                    }
+                    let scan = crate::video::image_projection::analyze(&source)?;
+                    Ok(crate::video::image_sequence::ImageSequenceScan {
+                        info: scan.info,
+                        images: scan
+                            .images
+                            .into_iter()
+                            .map(|image| crate::video::image_sequence::ScannedImage {
+                                path: image.path,
+                                has_alpha_channel: image.alpha,
+                            })
+                            .collect(),
+                    })
                 })
                 .await
                 .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??,
@@ -201,6 +222,8 @@ impl ProjectManager {
                 .expect("image projects have a completed header scan");
             let total = scan.images.len() as u64;
             let mut last_percent = -1_i32;
+            let source_identity = import_identity.as_ref().expect("image import identity");
+            let mut origins = std::collections::BTreeMap::new();
             if let Some(observer) = &observer {
                 observer(ProjectImportProgress { current: 0, total });
             }
@@ -218,10 +241,25 @@ impl ProjectManager {
                 }
                 let dest =
                     images_dir.join(crate::video::normalized_image_name(index, &image.path)?);
+                let stat = tokio::fs::metadata(&image.path).await?;
+                let original = crate::video::image_projection::OriginalImageIdentity {
+                    path: std::fs::canonicalize(&image.path)?,
+                    size: stat.len(),
+                    modified_nanos: stat
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| SplatError::Process(e.to_string()))?
+                        .as_nanos()
+                        .to_string(),
+                };
                 if let Err(error) = tokio::fs::copy(&image.path, &dest).await {
                     let _ = tokio::fs::remove_dir_all(&project).await;
                     return Err(error.into());
                 }
+                origins.insert(
+                    dest.file_name().unwrap().to_string_lossy().into_owned(),
+                    original,
+                );
                 let current = index as u64 + 1;
                 let percent = (current.saturating_mul(100) / total.max(1)) as i32;
                 if percent != last_percent || current == total {
@@ -231,6 +269,12 @@ impl ProjectManager {
                     }
                 }
             }
+            if &crate::video::image_projection::source_identity(input)? != source_identity {
+                return Err(SplatError::Process(
+                    "素材文件已发生变化，请重新分析后再生成".into(),
+                ));
+            }
+            atomic_write_json(&source.join("image-origins.json"), &origins).await?;
             images_dir
         } else {
             let extension = input
@@ -592,6 +636,21 @@ mod tests {
         assert!(metadata.source_path.is_dir());
         assert!(metadata.source_path.join("frame_000001.png").is_file());
         assert!(metadata.source_path.join("frame_000002.jpg").is_file());
+        let origins: std::collections::BTreeMap<
+            String,
+            crate::video::image_projection::OriginalImageIdentity,
+        > = serde_json::from_slice(
+            &std::fs::read(paths.source.join("image-origins.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            origins["frame_000001.png"].path,
+            std::fs::canonicalize(input.join("image2.png")).unwrap()
+        );
+        assert_eq!(
+            origins["frame_000002.jpg"].size,
+            std::fs::metadata(input.join("image10.jpg")).unwrap().len()
+        );
         let state: PipelineStateFile =
             serde_json::from_slice(&tokio::fs::read(paths.state).await.unwrap()).unwrap();
         assert_eq!(state.input_type, ProjectInputType::Images);

@@ -60,12 +60,27 @@ export interface RuntimeEstimate {
   basis: string;
 }
 export interface ProbeAndPlan {
+  projectionDetection?: ProjectionDetection | null;
   inputType: InputType;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
   plan: FramePlan;
   estimate: RuntimeEstimate;
 }
+export interface VideoAnalysis {
+  video: VideoInfo;
+  projectionDetection: ProjectionDetection;
+}
+export interface InputAnalysis {
+  inputType: InputType;
+  video: VideoInfo | null;
+  imageSequence: ImageSequenceInfo | null;
+  projectionDetection: ProjectionDetection;
+}
+export interface PipelineOperation { id: number; attempt: number; }
+export type VideoProjection = "auto" | "perspective" | "equirectangular";
+export type ImageMatchingStrategy = "sequential" | "exhaustive";
+export interface ProjectionDetection { sourceIdentity?: string; unsupported?: boolean; confirmedErp: boolean; requiresChoice: boolean; supportedErp: boolean; reason: string; previewJpeg: number[]; }
 
 export interface ReshootSourceInfo {
   projectId: string;
@@ -97,12 +112,14 @@ export interface ReshootInputInfo {
 }
 
 export interface PipelineEvent {
+  operation?: PipelineOperation | null;
   taskId?: string | null; runId?: string | null; revision?: number;
   sequence: number;
   timestamp: string;
   kind: "stage" | "progress" | "log" | "heartbeat" | "capability" | "runtime";
   level: "info" | "warning" | "error";
   stage: string;
+  substage?: string | null;
   engine: "system" | "ffmpeg" | "colmap" | "brush" | null;
   progress: number;
   stageProgress: number | null;
@@ -205,6 +222,8 @@ export interface AppRuntimeStatus {
 
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
+  videoProjection?: VideoProjection | null;
+  inputProjection?: VideoProjection | null;
   project: ProjectSummary;
   inputType: InputType | null;
   sourcePath: string;
@@ -263,6 +282,17 @@ export interface GaussianPreviewDescriptor {
   editing: GaussianEditState;
   editMaskAssetPath: string | null;
   readToken?: string | null;
+  referenceView?: TrainingReferenceView | null;
+  referenceViewUnavailable?: "imported" | "unavailable" | null;
+}
+export interface TrainingReferenceView {
+  imageName: string;
+  position: [number, number, number];
+  forward: [number, number, number];
+  up: [number, number, number];
+  fov: number;
+  projectionOffset: [number, number];
+  projectionScaleX: number;
 }
 export interface GaussianExportProgress {
   projectId: string;
@@ -291,6 +321,9 @@ export interface GaussianHtmlView {
   projection: number;
   orthoHeight: number;
   orthographicView: GaussianOrthographicView | null;
+  roll?: number;
+  projectionOffset?: [number, number];
+  projectionScaleX?: number;
   fov: number;
   nearClip: number;
   farClip: number;

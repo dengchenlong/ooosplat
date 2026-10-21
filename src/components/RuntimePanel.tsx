@@ -33,7 +33,7 @@ const settings: Record<string, TranslationKey> = {
   every: "runtime.configExport",
 };
 
-export function RuntimePanel({ snapshot, running }: { snapshot: RuntimeSnapshot; running: boolean }) {
+export function RuntimePanel({ snapshot, running, waitingMessage }: { snapshot: RuntimeSnapshot | null; running: boolean; waitingMessage?: string | null }) {
   const { t, locale } = useI18n();
   const [now, setNow] = useState(Date.now);
 
@@ -42,6 +42,12 @@ export function RuntimePanel({ snapshot, running }: { snapshot: RuntimeSnapshot;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [running]);
+
+  if (!snapshot) return <div className="runtime-panel" role="status">
+    <div className="runtime-heading"><strong>{t('runtime.waiting')}</strong><span>—</span></div>
+    <p className="runtime-note">{waitingMessage || t('runtime.waitingHint')}</p>
+    <dl className="runtime-metrics runtime-resources"><div><dt>{t('runtime.cpu')}</dt><dd>—</dd></div><div><dt>{t('runtime.memory')}</dt><dd>—</dd></div></dl>
+  </div>;
 
   const unavailable = t("runtime.unavailable");
   const number = (value: number) => value.toLocaleString(locale, { maximumFractionDigits: 1 });

@@ -1,4 +1,4 @@
-import { BoundingBox, Entity, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Vec3, type CameraComponent } from "playcanvas";
+import { BoundingBox, Entity, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Quat, Vec3, type CameraComponent } from "playcanvas";
 import type { GaussianOrthographicView } from "../../types/pipeline";
 
 const DEFAULT_YAW = 35;
@@ -7,6 +7,7 @@ const DEFAULT_OCCUPANCY = 0.85;
 const VIEW_TRANSITION_MS = 320;
 const MAX_ORBIT_PITCH = 89.9;
 const ORBIT_POLE_EPSILON = 1e-6;
+const ROAM_VISIBLE_HEIGHT_PER_SECOND = 0.15;
 
 export interface FitViewOptions {
   resetDirection?: boolean;
@@ -23,6 +24,20 @@ export interface ViewerCameraState {
   projection: number;
   orthoHeight: number;
   orthographicView: GaussianOrthographicView | null;
+  roll?: number;
+  fov?: number;
+  /** Principal-point offset in source-image-height units (image Y points down). */
+  projectionOffset?: [number, number];
+  projectionScaleX?: number;
+}
+
+export interface ReferenceView {
+  position: Vec3;
+  forward: Vec3;
+  up: Vec3;
+  fov: number;
+  projectionOffset: [number, number];
+  projectionScaleX: number;
 }
 
 export interface ViewerOrbitGuideState {
@@ -41,6 +56,16 @@ export class ViewerControls {
   private yaw = DEFAULT_YAW;
   private pitch = DEFAULT_PITCH;
   private distance = 5;
+  private roll = 0;
+  private projectionOffset: [number, number] = [0, 0];
+  private projectionScaleX = 1;
+  private roamingEnabled = false;
+  private readonly keys = new Set<string>();
+  private roamFrame = 0;
+  private roamLastAt = 0;
+  private roamMoved = false;
+  private shifted = false;
+  private readonly previousTabIndex: number;
   private sceneBounds: BoundingBox | null = null;
   private horizontalFrameOffset = 0;
   private pointerId: number | null = null;
@@ -56,18 +81,29 @@ export class ViewerControls {
   private orthographicView: GaussianOrthographicView | null = null;
   private transitionFrame = 0;
   private transitioning = false;
+  private locating = false;
 
   constructor(
     canvas: HTMLCanvasElement,
     cameraEntity: Entity,
-    private readonly onOrthographicViewChange?: (view: GaussianOrthographicView | null) => void,
+    private readonly onOrthographicViewChange?: (view: GaussianOrthographicView | null, orthographic: boolean) => void,
     cameraError = "The preview camera component is unavailable",
     private readonly onViewChange?: () => void,
+    private readonly onMotion?: () => void,
   ) {
     if (!cameraEntity.camera) throw new Error(cameraError);
     this.canvas = canvas;
     this.cameraEntity = cameraEntity;
     this.camera = cameraEntity.camera;
+    this.previousTabIndex = canvas.tabIndex;
+    canvas.tabIndex = 0;
+    canvas.addEventListener("pointerdown", this.focusCanvas, true);
+    canvas.addEventListener("blur", this.stopRoaming);
+    canvas.addEventListener("pointercancel", this.stopRoaming);
+    window.addEventListener("keydown", this.onKeyDown);
+    window.addEventListener("keyup", this.onKeyUp);
+    window.addEventListener("blur", this.stopRoaming);
+    document.addEventListener("visibilitychange", this.stopRoaming);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerup", this.onPointerUp);
@@ -80,6 +116,7 @@ export class ViewerControls {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.stopRoaming();
     this.cancelViewTransition();
     this.cancelGesture();
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -88,6 +125,15 @@ export class ViewerControls {
     this.canvas.removeEventListener("pointercancel", this.onPointerUp);
     this.canvas.removeEventListener("wheel", this.onWheel);
     this.canvas.removeEventListener("contextmenu", this.preventContextMenu);
+    this.canvas.removeEventListener("pointerdown", this.focusCanvas, true);
+    this.canvas.removeEventListener("blur", this.stopRoaming);
+    this.canvas.removeEventListener("pointercancel", this.stopRoaming);
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("blur", this.stopRoaming);
+    document.removeEventListener("visibilitychange", this.stopRoaming);
+    this.canvas.tabIndex = this.previousTabIndex;
+    this.camera.calculateProjection = null!;
   }
 
   get enabled() {
@@ -96,7 +142,15 @@ export class ViewerControls {
 
   set enabled(value: boolean) {
     this._enabled = value;
-    if (!value) this.cancelGesture();
+    if (!value) {
+      this.cancelGesture(); this.stopRoaming();
+      if (this.locating) this.stopNavigation();
+    }
+  }
+
+  setRoamingEnabled(value: boolean) {
+    this.roamingEnabled = value;
+    if (!value) { this.stopRoaming(); if (this.locating) this.stopNavigation(); }
   }
 
   get cameraDistance() {
@@ -117,6 +171,10 @@ export class ViewerControls {
       projection: this.camera.projection,
       orthoHeight: this.camera.orthoHeight,
       orthographicView: this.orthographicView,
+      roll: this.roll,
+      fov: this.camera.fov,
+      projectionOffset: [...this.projectionOffset],
+      projectionScaleX: this.projectionScaleX,
     };
   }
 
@@ -138,17 +196,83 @@ export class ViewerControls {
   }
 
   restore(state: ViewerCameraState) {
+    this.stopRoaming();
     this.cancelViewTransition();
     this.target.set(...state.target);
     this.yaw = state.yaw;
     this.pitch = state.pitch;
     this.distance = state.distance;
+    this.roll = state.roll ?? 0;
+    this.camera.fov = state.fov ?? 52;
+    this.projectionOffset = [...(state.projectionOffset ?? [0, 0])];
+    this.projectionScaleX = state.projectionScaleX ?? 1;
     this.horizontalFrameOffset = state.horizontalFrameOffset;
     this.camera.projection = state.projection;
     this.camera.orthoHeight = state.orthoHeight;
     this.orthographicView = state.orthographicView;
-    this.onOrthographicViewChange?.(state.orthographicView);
+    this.onOrthographicViewChange?.(state.orthographicView, state.projection === PROJECTION_ORTHOGRAPHIC);
     this.updateCamera();
+  }
+
+  locate(reference: ReferenceView, bounds: BoundingBox, animate = true) {
+    if (this.destroyed || !this.enabled) return;
+    this.stopRoaming();
+    this.cancelGesture();
+    const startPosition = this.cameraEntity.getPosition().clone();
+    const startRotation = this.cameraEntity.getRotation().clone();
+    const startFov = this.camera.fov;
+    const startHeight = this.camera.orthoHeight;
+    const startDistance = this.distance;
+    const depth = bounds.center.clone().sub(reference.position).dot(reference.forward);
+    const distance = depth > 0.0001 ? depth : Math.max(bounds.halfExtents.length(), 0.01);
+    const destination = this.snapshot();
+    destination.horizontalFrameOffset = 0;
+    // Locate always restores the actual training camera, including when invoked
+    // from a fixed or freely rotated orthographic view.
+    const forward = reference.forward.clone().normalize();
+    destination.target = reference.position.clone().add(forward.clone().mulScalar(distance)).toArray() as [number, number, number];
+    destination.distance = distance;
+    destination.yaw = Math.hypot(forward.x, forward.z) < ORBIT_POLE_EPSILON ? 0 : Math.atan2(-forward.x, -forward.z) * 180 / Math.PI;
+    destination.pitch = Math.asin(Math.max(-1, Math.min(1, -forward.y))) * 180 / Math.PI;
+    const yaw = destination.yaw * Math.PI / 180;
+    const right = new Vec3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const up = new Vec3().cross(right, forward).normalize();
+    destination.roll = Math.atan2(reference.up.dot(right), reference.up.dot(up)) * 180 / Math.PI;
+    destination.projection = PROJECTION_PERSPECTIVE;
+    destination.orthographicView = null;
+    destination.fov = reference.fov;
+    destination.projectionOffset = [...reference.projectionOffset];
+    destination.projectionScaleX = reference.projectionScaleX;
+    this.restore(destination);
+    // A button click transfers focus away from the canvas. Return it synchronously,
+    // never at animation completion where it could steal a newer dialog's focus.
+    this.focusCanvas();
+    if (!animate || this.destroyed) { this.onViewChange?.(); return; }
+    const endPosition = this.cameraEntity.getPosition().clone();
+    const endRotation = this.cameraEntity.getRotation().clone();
+    const endHeight = this.camera.orthoHeight;
+    const endFov = this.camera.fov;
+    const started = performance.now();
+    this.transitioning = true;
+    this.locating = true;
+    const tick = (now: number) => {
+      if (this.destroyed || !this.transitioning) return;
+      if (!this.enabled) { this.cancelViewTransition(); this.updateCamera(); this.onViewChange?.(); return; }
+      const linear = Math.max(0, Math.min(1, (now - started) / VIEW_TRANSITION_MS));
+      const t = 1 - (1 - linear) ** 3;
+      const position = new Vec3().lerp(startPosition, endPosition, t);
+      const rotation = new Quat().slerp(startRotation, endRotation, t);
+      const forward = rotation.transformVector(new Vec3(0, 0, -1));
+      const up = rotation.transformVector(Vec3.UP);
+      this.camera.fov = startFov + (endFov - startFov) * t;
+      this.camera.orthoHeight = startHeight + (endHeight - startHeight) * t;
+      this.distance = startDistance + (distance - startDistance) * t;
+      this.applyCamera(position, position.clone().add(forward), up);
+      this.onMotion?.();
+      if (linear < 1) this.transitionFrame = requestAnimationFrame(tick);
+      else { this.transitioning = false; this.locating = false; this.transitionFrame = 0; this.updateCamera(); this.onViewChange?.(); }
+    };
+    this.transitionFrame = requestAnimationFrame(tick);
   }
 
   orbitBy(degrees: number) {
@@ -176,11 +300,13 @@ export class ViewerControls {
   }
 
   setRectangleSelectionMode(enabled: boolean) {
+    this.stopNavigation();
     this.orbitButton = enabled ? 1 : 0;
     this.cancelGesture();
   }
 
   alignOrthographic(view: GaussianOrthographicView, bounds: BoundingBox, occupancy = 0.85, animate = true) {
+    this.stopRoaming();
     this.cancelViewTransition();
     this.cancelGesture();
     const startPosition = this.cameraEntity.getPosition().clone();
@@ -190,7 +316,7 @@ export class ViewerControls {
       ? this.camera.orthoHeight
       : Math.max(this.distance * Math.tan(this.camera.fov * Math.PI / 360), 0.001);
     this.orthographicView = view;
-    this.onOrthographicViewChange?.(view);
+    this.onOrthographicViewChange?.(view, true);
     this.camera.projection = PROJECTION_ORTHOGRAPHIC;
     const destinationTarget = bounds.center.clone();
     const aspect = this.canvas.clientWidth / Math.max(this.canvas.clientHeight, 1) || 1;
@@ -207,6 +333,9 @@ export class ViewerControls {
     this.camera.orthoHeight = destinationOrthoHeight;
     this.distance = destinationDistance;
     this.horizontalFrameOffset = 0;
+    this.roll = 0;
+    this.projectionOffset = [0, 0];
+    this.projectionScaleX = 1;
     this.onViewChange?.();
     if (!animate || this.destroyed) {
       this.updateCamera();
@@ -250,7 +379,7 @@ export class ViewerControls {
   usePerspective() {
     this.cancelViewTransition();
     this.orthographicView = null;
-    this.onOrthographicViewChange?.(null);
+    this.onOrthographicViewChange?.(null, false);
     this.camera.projection = PROJECTION_PERSPECTIVE;
     this.updateCamera();
   }
@@ -318,8 +447,11 @@ export class ViewerControls {
       Math.cos(yaw) * Math.cos(pitch),
     );
     const forward = offset.clone().mulScalar(-1);
-    const right = new Vec3().cross(forward, Vec3.UP).normalize();
-    const up = new Vec3().cross(right, forward).normalize();
+    const baseRight = new Vec3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const baseUp = new Vec3().cross(baseRight, forward).normalize();
+    const roll = this.roll * Math.PI / 180;
+    const right = baseRight.clone().mulScalar(Math.cos(roll)).sub(baseUp.clone().mulScalar(Math.sin(roll)));
+    const up = baseUp.mulScalar(Math.cos(roll)).add(baseRight.mulScalar(Math.sin(roll)));
     return { offset, forward, right, up };
   }
 
@@ -362,7 +494,89 @@ export class ViewerControls {
     this.cameraEntity.setPosition(position);
     this.cameraEntity.lookAt(lookTarget, up);
     this.updateClipPlanes(position, forward);
+    this.camera.calculateProjection = this.projectionOffset.some(value => value !== 0) || this.projectionScaleX !== 1
+      ? this.calculateProjection : null!;
+    this.onMotion?.();
   }
+
+  private calculateProjection = (matrix: Mat4) => {
+    const aspect = Math.max(this.camera.aspectRatio || 1, 0.0001);
+    if (this.camera.projection === PROJECTION_ORTHOGRAPHIC) {
+      const h = this.camera.orthoHeight;
+      matrix.setOrtho(-h * aspect, h * aspect, -h, h, this.camera.nearClip, this.camera.farClip);
+      matrix.data[0] *= this.projectionScaleX;
+    } else {
+      matrix.setPerspective(this.camera.fov, aspect, this.camera.nearClip, this.camera.farClip);
+      matrix.data[0] *= this.projectionScaleX;
+      matrix.data[8] = -2 * this.projectionOffset[0] / aspect;
+      matrix.data[9] = 2 * this.projectionOffset[1];
+    }
+  };
+
+  private visibleHeight() {
+    return this.camera.projection === PROJECTION_ORTHOGRAPHIC ? this.camera.orthoHeight * 2
+      : 2 * this.distance * Math.tan(this.camera.fov * Math.PI / 360);
+  }
+
+  private focusCanvas = () => { if (this.enabled) this.canvas.focus({ preventScroll: true }); };
+  private stopRoaming = () => {
+    if (this.roamFrame) cancelAnimationFrame(this.roamFrame);
+    this.roamFrame = 0;
+    this.keys.clear();
+    if (this.roamMoved) { this.roamMoved = false; this.onViewChange?.(); }
+  };
+
+  private onKeyDown = (event: KeyboardEvent) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) { this.stopRoaming(); return; }
+    if (this.destroyed || !this.enabled || !this.roamingEnabled || this.camera.projection !== PROJECTION_PERSPECTIVE
+      || document.activeElement !== this.canvas || event.target !== this.canvas || this.pointerId !== null) return;
+    this.shifted = event.shiftKey;
+    if (!["KeyW", "KeyA", "KeyS", "KeyD"].includes(event.code)) return;
+    if (event.repeat && !this.keys.has(event.code)) return;
+    event.preventDefault();
+    this.cancelViewTransition(true);
+    this.keys.add(event.code);
+    if (!this.roamFrame) { this.roamLastAt = performance.now(); this.roamFrame = requestAnimationFrame(this.roam); }
+  };
+
+  private onKeyUp = (event: KeyboardEvent) => {
+    this.shifted = event.shiftKey;
+    this.keys.delete(event.code);
+    if (!this.keys.size) this.stopRoaming();
+  };
+
+  private roam = (now: number) => {
+    this.roamFrame = 0;
+    if (this.destroyed || !this.enabled || !this.roamingEnabled || document.activeElement !== this.canvas
+      || this.camera.projection !== PROJECTION_PERSPECTIVE || !this.keys.size) { this.stopRoaming(); return; }
+    // A queued frame can predate keydown. Never move the clock backwards and
+    // count that stale interval again on the next frame.
+    const sampleAt = Math.max(this.roamLastAt, now);
+    const dt = Math.min(0.05, (sampleAt - this.roamLastAt) / 1000);
+    this.roamLastAt = sampleAt;
+    const forward = Number(this.keys.has("KeyW")) - Number(this.keys.has("KeyS"));
+    const right = Number(this.keys.has("KeyD")) - Number(this.keys.has("KeyA"));
+    // Ground-plane navigation follows yaw only: pitch/roll must never change
+    // elevation, reduce horizontal speed, or make movement unstable at a pole.
+    const yaw = this.yaw * Math.PI / 180;
+    const movement = new Vec3(
+      -Math.sin(yaw) * forward + Math.cos(yaw) * right,
+      0,
+      -Math.cos(yaw) * forward - Math.sin(yaw) * right,
+    );
+    if (movement.lengthSq() > 0) {
+      movement.normalize().mulScalar(ROAM_VISIBLE_HEIGHT_PER_SECOND * this.visibleHeight() * dt * (this.shifted ? 3 : 1));
+      this.target.add(movement);
+      // A rigid translation does not need lookAt again; at a vertical view its
+      // tiny horizontal direction components can otherwise perturb the roll.
+      const position = this.cameraEntity.getPosition().clone().add(movement);
+      this.cameraEntity.setPosition(position);
+      this.updateClipPlanes(position, this.cameraEntity.forward);
+      this.onMotion?.();
+      this.roamMoved = true;
+    }
+    this.roamFrame = requestAnimationFrame(this.roam);
+  };
 
   private updateClipPlanes(cameraPosition: Vec3, forward: Vec3) {
     const bounds = this.sceneBounds;
@@ -400,14 +614,40 @@ export class ViewerControls {
 
   private preventContextMenu = (event: MouseEvent) => event.preventDefault();
 
-  private cancelViewTransition() {
+  private cancelViewTransition(preservePose = false) {
+    if (preservePose && this.transitioning) {
+      const forward = this.cameraEntity.forward.clone();
+      const up = this.cameraEntity.up.clone();
+      this.yaw = Math.hypot(forward.x, forward.z) < ORBIT_POLE_EPSILON ? 0 : Math.atan2(-forward.x, -forward.z) * 180 / Math.PI;
+      this.pitch = Math.asin(Math.max(-1, Math.min(1, -forward.y))) * 180 / Math.PI;
+      const yaw = this.yaw * Math.PI / 180;
+      const right = new Vec3(Math.cos(yaw), 0, -Math.sin(yaw));
+      const baseUp = new Vec3().cross(right, forward).normalize();
+      this.roll = Math.atan2(up.dot(right), up.dot(baseUp)) * 180 / Math.PI;
+      this.target.copy(this.cameraEntity.getPosition()).add(forward.mulScalar(this.distance));
+      this.horizontalFrameOffset = 0;
+      this.orthographicView = null;
+      this.onOrthographicViewChange?.(null, this.camera.projection === PROJECTION_ORTHOGRAPHIC);
+    }
     if (this.transitionFrame) cancelAnimationFrame(this.transitionFrame);
     this.transitionFrame = 0;
     this.transitioning = false;
+    this.locating = false;
+  }
+
+  stopNavigation() {
+    this.stopRoaming(); this.cancelGesture();
+    if (this.transitioning) {
+      this.cancelViewTransition(true);
+      this.updateCamera();
+      this.onViewChange?.();
+    }
   }
 
   private onPointerDown = (event: PointerEvent) => {
-    if (this.destroyed || this.transitioning || !this.enabled || (event.button !== this.orbitButton && event.button !== 2)) return;
+    this.stopRoaming();
+    if (this.destroyed || !this.enabled || (event.button !== this.orbitButton && event.button !== 2)) return;
+    this.cancelViewTransition(true);
     this.pointerId = event.pointerId;
     this.mode = event.button === this.orbitButton ? "orbit" : "pan";
     this.startX = event.clientX;
@@ -444,13 +684,13 @@ export class ViewerControls {
           ),
         );
         this.orthographicView = null;
-        this.onOrthographicViewChange?.(null);
+        this.onOrthographicViewChange?.(null, true);
       }
       this.yaw -= dx * 0.3;
       this.pitch = Math.max(-MAX_ORBIT_PITCH, Math.min(MAX_ORBIT_PITCH, this.pitch + dy * 0.3));
     } else {
-      const speed = this.distance * 0.0016;
-      this.target.add(this.cameraEntity.right.clone().mulScalar(-dx * speed));
+      const speed = this.visibleHeight() / Math.max(this.canvas.clientHeight, 1);
+      this.target.add(this.cameraEntity.right.clone().mulScalar(-dx * speed / this.projectionScaleX));
       this.target.add(this.cameraEntity.up.clone().mulScalar(dy * speed));
     }
     this.updateCamera();
@@ -464,7 +704,8 @@ export class ViewerControls {
   };
 
   private onWheel = (event: WheelEvent) => {
-    if (this.destroyed || this.transitioning || !this.enabled) return;
+    if (this.destroyed || !this.enabled) return;
+    this.cancelViewTransition(true);
     event.preventDefault();
     const modeScale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? Math.max(this.canvas.clientHeight, 800) : 1;
     const delta = Math.max(-240, Math.min(240, event.deltaY * modeScale));

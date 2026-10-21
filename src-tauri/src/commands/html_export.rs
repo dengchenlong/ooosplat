@@ -41,9 +41,18 @@ pub struct HtmlView {
     projection: u32,
     ortho_height: f64,
     orthographic_view: Option<String>,
+    #[serde(default)]
+    roll: f64,
+    #[serde(default)]
+    projection_offset: [f64; 2],
+    #[serde(default = "unit_projection_scale")]
+    projection_scale_x: f64,
     fov: f64,
     near_clip: f64,
     far_clip: f64,
+}
+fn unit_projection_scale() -> f64 {
+    1.0
 }
 impl HtmlView {
     fn validate(&self) -> Result<()> {
@@ -56,9 +65,14 @@ impl HtmlView {
             self.fov,
             self.near_clip,
             self.far_clip,
+            self.roll,
+            self.projection_offset[0],
+            self.projection_offset[1],
+            self.projection_scale_x,
         ]);
         if values.into_iter().any(|v| !v.is_finite() || v.abs() > 1e15)
             || self.distance <= 0.0
+            || self.projection_scale_x <= 0.0
             || self.ortho_height <= 0.0
             || !(0.0..180.0).contains(&self.fov)
             || self.fov == 0.0
@@ -560,6 +574,9 @@ mod tests {
             projection: 0,
             ortho_height: 5.0,
             orthographic_view: None,
+            roll: 0.0,
+            projection_offset: [0.0, 0.0],
+            projection_scale_x: 1.0,
             fov: 52.0,
             near_clip: 0.01,
             far_clip: 10000.0,
@@ -580,6 +597,38 @@ mod tests {
         camera = view();
         camera.far_clip = camera.near_clip;
         assert!(camera.validate().is_err());
+        camera = view();
+        camera.projection_scale_x = 0.0;
+        assert!(camera.validate().is_err());
+        camera = view();
+        camera.roll = f64::NAN;
+        assert!(camera.validate().is_err());
+        camera = view();
+        camera.projection_offset[0] = f64::INFINITY;
+        assert!(camera.validate().is_err());
+    }
+
+    #[test]
+    fn preserves_reference_camera_fields_and_accepts_legacy_html_views() {
+        let mut camera = view();
+        camera.roll = 35.;
+        camera.projection_offset = [0.01, -0.02];
+        camera.projection_scale_x = 1.1;
+        let json = serde_json::to_value(&camera).unwrap();
+        let restored: HtmlView = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.roll, 35.);
+        assert_eq!(restored.projection_offset, [0.01, -0.02]);
+        assert_eq!(restored.projection_scale_x, 1.1);
+        assert!(restored.validate().is_ok());
+        let mut legacy = json.as_object().unwrap().clone();
+        for field in ["roll", "projectionOffset", "projectionScaleX"] {
+            legacy.remove(field);
+        }
+        let legacy: HtmlView = serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        assert_eq!(legacy.roll, 0.);
+        assert_eq!(legacy.projection_offset, [0.; 2]);
+        assert_eq!(legacy.projection_scale_x, 1.);
+        assert!(legacy.validate().is_ok());
     }
 
     #[test]

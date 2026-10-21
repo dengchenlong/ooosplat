@@ -22,6 +22,14 @@ pub enum ProjectInputType {
     Images,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMatchingStrategy {
+    Sequential,
+    #[default]
+    Exhaustive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GaussianTransform {
@@ -315,7 +323,7 @@ pub struct ReshootProvenance {
 }
 
 pub const fn schema_version() -> u32 {
-    8
+    9
 }
 
 fn default_model() -> String {
@@ -383,6 +391,16 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    /// Frozen at creation. Legacy image projects retain exhaustive matching.
+    #[serde(default)]
+    pub image_matching_strategy: ImageMatchingStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) temporary_png_focal:
+        Option<crate::video::temporary_png_focal_workaround::Checkpoint>,
+    #[serde(default = "legacy_video_projection")]
+    pub video_projection: crate::video::panorama::VideoProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panorama: Option<crate::video::panorama::PanoramaCheckpoint>,
     #[serde(default)]
     pub configuration: Option<crate::presets::PipelineOptimizationConfig>,
     pub stage: PipelineStage,
@@ -438,6 +456,10 @@ pub struct ReshootState {
     pub registered_reshoot_count: u64,
 }
 
+fn legacy_video_projection() -> crate::video::panorama::VideoProjection {
+    crate::video::panorama::VideoProjection::Perspective
+}
+
 impl PipelineStateFile {
     pub fn created(preset: Quality) -> Self {
         Self::created_for(preset, ProjectInputType::Video)
@@ -445,6 +467,11 @@ impl PipelineStateFile {
 
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
+            // Older projects were always perspective. Never reinterpret their caches.
+            temporary_png_focal: None,
+            image_matching_strategy: ImageMatchingStrategy::default(),
+            video_projection: crate::video::panorama::VideoProjection::Perspective,
+            panorama: None,
             configuration: None,
             stage: PipelineStage::Created,
             preset,
@@ -470,10 +497,48 @@ impl PipelineStateFile {
 mod tests {
     use super::*;
     #[test]
+    fn image_matching_strategy_is_frozen_and_legacy_defaults_to_exhaustive() {
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.image_matching_strategy = ImageMatchingStrategy::Sequential;
+        state.matching_complete = true;
+        let mut json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["imageMatchingStrategy"], "sequential");
+        let restored: PipelineStateFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            restored.image_matching_strategy,
+            ImageMatchingStrategy::Sequential
+        );
+        assert!(restored.matching_complete);
+        json.as_object_mut()
+            .unwrap()
+            .remove("imageMatchingStrategy");
+        let legacy: PipelineStateFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            legacy.image_matching_strategy,
+            ImageMatchingStrategy::Exhaustive
+        );
+        json["imageMatchingStrategy"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<PipelineStateFile>(json).is_err());
+    }
+
+    #[test]
     fn state_uses_frame_strategy_vocabulary_only() {
         let json = serde_json::to_string(&PipelineStateFile::created(Quality::Balanced)).unwrap();
         assert!(json.contains("\"preset\":\"balanced\""));
         assert!(!json.contains("targetFrames"));
+    }
+
+    #[test]
+    fn legacy_projects_do_not_reinterpret_two_to_one_frames_as_panorama() {
+        let mut value = serde_json::to_value(PipelineStateFile::created(Quality::Fast)).unwrap();
+        value.as_object_mut().unwrap().remove("videoProjection");
+        value.as_object_mut().unwrap().remove("panorama");
+        let legacy: PipelineStateFile = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            legacy.video_projection,
+            crate::video::panorama::VideoProjection::Perspective
+        );
+        assert!(legacy.panorama.is_none());
     }
 
     #[test]
@@ -551,6 +616,53 @@ mod tests {
         let restored: PipelineStateFile = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.brush_training, state.brush_training);
+    }
+
+    #[test]
+    fn panorama_recipe_snapshot_survives_resume_and_legacy_presets_stay_legacy() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        let initial = crate::presets::resolve_panorama_training_preset(
+            Quality::High,
+            true,
+            Some(8192),
+            1024,
+            10_192,
+        )
+        .unwrap();
+        state.brush_training.initial_resolved = Some(initial);
+        state.brush_training.resolved = initial.downgrade_after_oom(10_192);
+        state.brush_training.oom_retry_used = true;
+        let json = serde_json::to_vec(&state).unwrap();
+        let restored: PipelineStateFile = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.brush_training, state.brush_training);
+        assert_eq!(
+            restored
+                .brush_training
+                .initial_resolved
+                .unwrap()
+                .preset
+                .max_splats,
+            Some(3_000_000)
+        );
+        assert_eq!(
+            restored.brush_training.resolved.unwrap().preset.max_splats,
+            Some(1_500_000)
+        );
+
+        let mut old = serde_json::to_value(crate::presets::resolve_brush_training_preset(
+            Quality::Fast,
+            true,
+            Some(8192),
+            512,
+            10_192,
+        ))
+        .unwrap();
+        old.as_object_mut().unwrap().remove("panorama");
+        let restored: crate::presets::ResolvedBrushTrainingPreset =
+            serde_json::from_value(old).unwrap();
+        assert_eq!(restored.preset.total_steps, 8000);
+        assert_eq!(restored.preset.max_splats, Some(500_000));
+        assert!(restored.panorama.is_none());
     }
 
     #[test]

@@ -13,6 +13,8 @@ npm run dev:local
 
 修改配置后需要重启应用。`schemaVersion` 当前必须为 `1`。
 
+全景视频／图片另用可选 `panoramaTraining` 配置，不复用下文普通素材的 Brush 配方。三档 `maxSplatsWithoutOptimization` 默认 100 万／200 万／300 万，只用于关闭自动优化；`maxSplats` 仍为开启时的档位总上限 100 万／500 万／1,000 万，再按质量档位与显存取预算。训练仍为 12,000／30,000／45,000 步；完整预算表、初始化点覆盖和单次 OOM 重试见[全景训练配方](PANORAMA_IMAGES_V1.md#全景训练配方-v1)。旧外部配置缺少整个全景配置或新增关闭上限字段时，使用相应内置默认值；既有任务的已保存训练参数保持不变。
+
 ## 自动优化关闭
 
 关闭后保留旧版流程：视频按固定比例均匀抽帧，初次特征提取和增量补拍使用相同的档位 SFM 限制，不执行候选帧池、Bridge Backfill、分档分辨率规划、Caspar BA 或 High 的 OOM 自动重试。图片输入仍保留全部有效图片并使用 Exhaustive Matching。

@@ -21,3 +21,14 @@ it("rounds only standalone preview action buttons and gives update text an intri
   expect(css.match(/\.update-settings-row\s*\{[^}]+\}/)?.[0]).toContain("minmax(0, 1fr) max-content");
   expect(css.match(/\.update-check-button\s*\{[^}]+\}/)?.[0]).toContain("white-space: nowrap");
 });
+
+it("mutes readonly media captions and icons without changing new-task icons or reserving filename icon space", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const readonlyRule = css.match(/\.source-input-card\.readonly \.media-source-copy > strong,[^}]+\}/)?.[0];
+  expect(readonlyRule).toContain(".source-input-card.readonly .media-source-copy > p");
+  expect(readonlyRule).toContain(".source-input-card.readonly .media-source-type-icon");
+  expect(readonlyRule).toContain("color: #7f8999");
+  expect(css.match(/\.media-source-type-icon\s*\{[^}]+\}/)?.[0]).toContain("color: var(--blue)");
+  expect(css.match(/\.media-source-heading\s*\{[^}]+\}/)?.[0]).toContain("align-items: center");
+  expect(css.match(/\.path-picker\.media-path\s*\{[^}]+\}/)?.[0]).toContain("grid-template-columns: minmax(0, 1fr)");
+});

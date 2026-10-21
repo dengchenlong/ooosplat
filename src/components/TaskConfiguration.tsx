@@ -1,7 +1,8 @@
-import { Blend, CircleAlert, Clapperboard, Cpu, FolderOpen, Images, LoaderCircle, Lock, Zap } from 'lucide-react';
+import { Blend, CircleAlert, Cpu, FolderOpen, LoaderCircle, Lock, Zap } from 'lucide-react';
 import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskBasename } from '../app/taskPresentation';
 import { displayPath } from '../lib/displayPath';
+import { MediaSourceStatus } from './MediaSourceStatus';
 import type { ColmapAccelerationStatus, ImageSequenceInfo, InputType, Quality, RuntimeEstimate, VideoInfo } from '../types/pipeline';
 
 interface Props {
@@ -17,9 +18,11 @@ interface Props {
   estimatedFrames?: number | null;
   estimate?: RuntimeEstimate | null;
   inheritedFrom?: 'resume' | 'reshoot' | null;
+  videoProjection?: import('../types/pipeline').VideoProjection | null;
+  inputProjection?: import('../types/pipeline').VideoProjection | null;
 }
 
-export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom }: Props) {
+export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection }: Props) {
   const { locale, t, formatNumber, formatDuration } = useI18n();
   const temporary = acceleration?.detectionState === 'temporarilyUnavailable';
   const warning = acceleration?.backend === 'cpu';
@@ -28,7 +31,7 @@ export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality
   const visibleProjectsRoot = displayPath(projectsRoot);
   return <div className="project-configuration-detail">
     <div className="form-section"><label className="field-label">{t('input.label')}</label>
-      <div className="path-picker readonly" title={visibleSourcePath}>{inputType === 'images' ? <Images size={18} /> : <Clapperboard size={18} />}<span><strong>{taskBasename(visibleSourcePath)}</strong><small>{visibleSourcePath}</small></span></div>
+      <div className="source-input-card readonly"><div className="path-picker media-path readonly" title={visibleSourcePath}><span><strong>{taskBasename(visibleSourcePath)}</strong><small>{visibleSourcePath}</small></span></div><MediaSourceStatus historical inputType={inputType} projection={inputProjection ?? videoProjection} /></div>
     </div>
     <div className="form-section"><label className="field-label">{t('project.root')}</label>
       <div className="path-picker compact readonly" title={visibleProjectsRoot}><FolderOpen size={18} /><span><strong>{taskBasename(visibleProjectsRoot)}</strong><small>{visibleProjectsRoot}</small></span></div>

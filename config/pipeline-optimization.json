@@ -4,6 +4,30 @@
     "en": "OOOSplat automatic-optimization runtime parameters. Keep schemaVersion at 1 and restart the app after changes."
   },
   "schemaVersion": 1,
+  "panoramaTraining": {
+    "recipeVersion": 1,
+    "fast": {
+      "totalSteps": 12000,
+      "maxSplats": 1000000,
+      "maxSplatsWithoutOptimization": 1000000,
+      "refineEvery": 200,
+      "densification": { "growthGradThreshold": 0.0018, "growthSelectFraction": 0.20, "growthStopIter": 10000 }
+    },
+    "balanced": {
+      "totalSteps": 30000,
+      "maxSplats": 5000000,
+      "maxSplatsWithoutOptimization": 2000000,
+      "refineEvery": 200,
+      "densification": { "growthGradThreshold": 0.0012, "growthSelectFraction": 0.25, "growthStopIter": 25000 }
+    },
+    "high": {
+      "totalSteps": 45000,
+      "maxSplats": 10000000,
+      "maxSplatsWithoutOptimization": 3000000,
+      "refineEvery": 200,
+      "densification": { "growthGradThreshold": 0.0010, "growthSelectFraction": 0.30, "growthStopIter": 38000 }
+    }
+  },
   "shared": {
     "_comment": {
       "zh-CN": "所有质量档位共用的帧数、注册率和 Brush refine 间隔。比例取值范围为 0 到 1。",

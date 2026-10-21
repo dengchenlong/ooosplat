@@ -384,8 +384,51 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .import-loading { min-height: 220px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
 .import-error { margin: 18px 20px 0; padding: 11px 12px; display: flex; gap: 8px; color: #8d302b; background: #fff2f0; border: 1px solid #e8c3bf; font-size: 11px; line-height: 1.6; }
 .import-name, .import-model-choice label { display: grid; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 700; }
-.import-name input, .import-model-choice select { min-width: 0; height: 36px; padding: 0 10px; color: var(--ink); background: #fff; border: 1px solid var(--line-dark); font-size: 12px; }
 .gaussian-export-dialog { max-height: calc(100vh - 48px); overflow-y: auto; }
+.import-name input, .import-model-choice select, .projection-select { min-width: 0; height: 36px; padding: 0 10px; color: var(--ink); background: #fff; border: 1px solid var(--line-dark); font-size: 12px; }
+.source-input-card { min-width: 0; border: 1px solid var(--line-dark); }
+.source-input-card > .path-picker, .source-input-card .input-picker > .path-picker { border: 0; }
+.source-input-card .input-picker-toggle { border: 0; border-right: 1px solid var(--line-dark); }
+.source-input-card .input-picker > .path-picker { min-width: 0; }
+.source-input-card .path-picker.empty strong { white-space: normal; line-height: 1.5; }
+.source-input-card.readonly { border-color: var(--line); background: #f2f4f7; }
+.path-picker.media-path { grid-template-columns: minmax(0, 1fr); }
+.media-source-status { min-width: 0; margin: 0; padding: 14px 16px; border-top: 1px solid var(--line-dark); font-size: 13px; line-height: 1.6; }
+.media-source-heading { display: flex; align-items: center; gap: 11px; }
+.media-source-copy { flex: 1; min-width: 0; }
+.media-source-copy > strong { display: block; font-size: 13px; }
+.media-source-type-icon { flex-shrink: 0; color: var(--blue); }
+.media-source-copy > p, .media-source-status > .media-source-warning { margin: 6px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.source-input-card.readonly .media-source-copy > strong, .source-input-card.readonly .media-source-copy > p, .source-input-card.readonly .media-source-type-icon { color: #7f8999; }
+.media-source-status.checking { display: flex; align-items: center; gap: 9px; color: var(--muted); }
+.video-type-select { display: block; width: 100%; min-height: 36px; margin-top: 10px; padding: 7px 10px; border: 1px solid var(--line-dark); background: var(--paper); color: var(--ink); font: 12px var(--font-sans); }
+.video-type-select:focus-visible, .media-retry:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.media-source-status > .media-source-warning { color: var(--amber); }
+.source-analysis-error { display: flex; align-items: flex-start; gap: 9px; color: var(--red); }
+.source-analysis-error > svg { flex-shrink: 0; margin-top: 2px; }
+.source-analysis-error > div { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.media-retry { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 5px; min-height: 34px; padding: 0 10px; border: 1px solid var(--line-dark); background: transparent; color: var(--ink); white-space: nowrap; cursor: pointer; font: 600 11px var(--font-sans); }
+.queue-input-notice { margin: 8px 14px; color: var(--amber); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.preflight-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 24px; background: #17203366; }
+.preflight-dialog { width: min(660px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; border: 1px solid var(--line-dark); background: #f6f8fc; box-shadow: 0 12px 48px #17203333; }
+.preflight-dialog header, .preflight-dialog footer { padding: 18px 22px; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.preflight-dialog header { border-bottom: 1px solid var(--line); }
+.preflight-dialog header small { color: var(--blue); font-size: 11px; }
+.preflight-dialog h2 { margin-top: 8px; font-size: 21px; line-height: 1.3; }
+.preflight-dialog header button { padding: 8px; color: var(--muted); border: 0; background: transparent; cursor: pointer; }
+.preflight-body { padding: 20px 22px; overflow-y: auto; font-size: 13px; line-height: 1.7; }
+.preflight-source { display: block; overflow-wrap: anywhere; }
+.preflight-body > p { white-space: pre-line; }
+.preflight-choices { display: grid; gap: 8px; }
+.preflight-accept { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--line-dark); cursor: pointer; }
+.preflight-accept input { accent-color: var(--blue); flex-shrink: 0; }
+.preflight-dialog footer { border-top: 1px solid var(--line); flex-wrap: wrap; }
+.preflight-dialog footer > div { display: flex; gap: 8px; margin-left: auto; }
+.preflight-dialog footer .primary-action { width: auto; min-width: 126px; margin: 0; padding: 0 18px; }
+.preflight-dialog footer .secondary-action { height: 48px; min-width: 80px; padding: 0 18px; color: var(--ink); background: transparent; border: 1px solid var(--line-dark); font: 600 13px var(--font-sans); white-space: nowrap; cursor: pointer; }
+.preflight-dialog footer .secondary-action:hover { color: var(--blue); border-color: var(--blue); }
+.preflight-dialog:focus { outline: none; }
+.preflight-dialog :focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
 .import-model-choice { margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .import-summary-grid { margin-top: 18px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .import-summary-grid article { min-height: 114px; padding: 13px; display: grid; grid-template-columns: auto 1fr; align-content: start; gap: 6px 8px; background: #f0f2f5; border: 1px solid var(--line); }
@@ -509,8 +552,8 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .preview-mode-toggle button.active { color: #fff; }
 .preview-mode-toggle button:focus-visible { outline: 2px solid #89a9ff; outline-offset: 3px; }
 .preview-mode-toggle button:disabled { cursor: default; opacity: .58; }
-.preview-view-control { height: 34px; display: grid; grid-template-columns: repeat(3, 72px); overflow: hidden; background: #f8fafc; border: 1px solid #bdc8d8; border-radius: 5px; }
-.preview-view-control button { min-width: 0; padding: 0 12px; color: #536077; background: transparent; border: 0; border-right: 1px solid #d0d7e2; cursor: pointer; font: 650 11px/1 var(--font-sans); white-space: nowrap; }
+.preview-view-control { height: 34px; display: grid; grid-template-columns: repeat(3, 72px) auto; overflow: hidden; background: #f8fafc; border: 1px solid #bdc8d8; border-radius: 5px; }
+.preview-view-control button { min-width: 0; padding: 0 12px; display: flex; align-items: center; justify-content: center; gap: 5px; color: #536077; background: transparent; border: 0; border-right: 1px solid #d0d7e2; cursor: pointer; font: 650 11px/1 var(--font-sans); white-space: nowrap; }
 .preview-view-control button:last-child { border-right: 0; }
 .preview-view-control button:hover:not(:disabled) { color: var(--blue); background: #e2e9f7; }
 .preview-view-control button.active { color: #174acb; background: #e7eeff; box-shadow: inset 0 -2px 0 var(--blue); }
@@ -521,6 +564,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .preview-input-hints span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 10px; font-weight: 600; }
 .preview-input-hints svg { color: #48607f; stroke-width: 1.7; }
 .preview-input-hints kbd { padding: 0; color: #42516a; background: transparent; border: 0; font: 700 10px/1 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.preview-input-hints .preview-roam-hint.unavailable, .preview-input-hints .preview-roam-hint.unavailable kbd, .preview-input-hints .preview-roam-hint.unavailable svg { color: #7f8999; }
 .preview-commandbar { flex: 0 0 auto; min-height: 44px; padding: 5px 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px; background: #eef1f5; border-bottom: 1px solid var(--line-dark); }
 .preview-commandbar-left { min-width: 0; display: flex; align-items: center; justify-self: start; }
 .preview-commandbar-center { grid-column: 2; display: flex; align-items: center; justify-self: center; }
@@ -540,6 +584,9 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .preview-header-actions button:hover:not(:disabled) { color: var(--blue); border-color: #9eb6fb; background: #edf2ff; }
 .preview-header-actions button:disabled { opacity: .42; cursor: default; }
 .preview-header-actions .video-cancel { color: #9b4038; border-color: #d7a8a3; }
+@media (max-width: 1400px) {
+  .preview-commandbar { grid-template-columns: max-content auto minmax(0, 1fr); }
+}
 .preview-resource-note { flex: 0 0 auto; padding: 7px 14px; color: #765112; background: #fff6df; border-bottom: 1px solid #ead6a4; font-size: 10px; line-height: 1.4; }
 .preview-editor { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #0e1117; }
 .gaussian-viewport { position: absolute; inset: 0; min-width: 0; min-height: 0; overflow: hidden; background: #0e1117; }

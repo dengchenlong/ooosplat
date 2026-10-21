@@ -131,7 +131,10 @@ impl PipelineTelemetrySession {
             timing.active = Some((event.stage, now, record_effectiveness));
         }
 
-        if event
+        if !matches!(
+            event.substage.as_deref(),
+            Some("panoramaTrainingPreparation" | "panoramaTrainingValidation")
+        ) && event
             .stage_progress
             .is_some_and(|progress| progress >= 99.999)
         {
@@ -330,6 +333,7 @@ mod tests {
 
     fn stage_event(stage: PipelineStage, stage_progress: f32) -> PipelineEvent {
         PipelineEvent {
+            operation: None,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -339,6 +343,7 @@ mod tests {
             level: EventLevel::Info,
             stage,
             engine: Some(PipelineEngine::System),
+            substage: None,
             progress: stage_progress,
             stage_progress: Some(stage_progress),
             indeterminate: false,
@@ -368,6 +373,28 @@ mod tests {
             safe_error_code(&SplatError::Cancelled, None),
             TelemetryErrorCode::Unknown
         );
+    }
+
+    #[test]
+    fn panorama_preparation_does_not_complete_the_training_telemetry_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(directory.path().join("telemetry.json"));
+        let session =
+            PipelineTelemetrySession::new(service, Quality::Fast, TelemetryInputType::Video);
+        let mut event = stage_event(PipelineStage::TrainingSplats, 0.0);
+        event.substage = Some("panoramaTrainingPreparation".into());
+        session.observe(&event);
+        event.stage_progress = Some(100.0);
+        event.substage = Some("panoramaTrainingValidation".into());
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.substage = Some("training".into());
+        event.stage_progress = Some(0.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.stage_progress = Some(100.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_none());
     }
 
     #[test]

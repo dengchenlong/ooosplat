@@ -57,7 +57,7 @@ fn skip(reader: &mut impl Read, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
+pub(super) fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
     Some(match model_id {
         0 => ("SIMPLE_PINHOLE", 3),
         1 => ("PINHOLE", 4),
@@ -71,6 +71,7 @@ fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
         9 => ("RADIAL_FISHEYE", 5),
         10 => ("THIN_PRISM_FISHEYE", 12),
         11 => ("RAD_TAN_THIN_PRISM_FISHEYE", 16),
+        17 => ("EQUIRECTANGULAR", 2),
         _ => return None,
     })
 }
@@ -125,7 +126,7 @@ fn read_single_camera_text(path: &Path) -> Result<ColmapCamera> {
         return Err(SplatError::Process("COLMAP cameras.txt 内容不完整".into()));
     }
     let model = fields[1].to_string();
-    let model_id = (0..=11)
+    let model_id = (0..=17)
         .find(|id| camera_model(*id).is_some_and(|value| value.0 == model))
         .ok_or_else(|| SplatError::Process(format!("原项目使用了暂不支持的相机模型 {model}")))?;
     let expected_params = camera_model(model_id)

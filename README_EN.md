@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><img src="https://img.shields.io/badge/release-v0.6.1-blue?style=flat" alt="Release: v0.6.1"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-blue?style=flat" alt="Release: v0.7.0"></a>
   <a href="#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -19,13 +19,15 @@
   <a href="https://trendshift.io/repositories/177239?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-177239" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/177239/weekly?language=Rust" alt="OOOSplat — Trendshift Rust Repository of the Week" width="250" height="55" /></a>
 </p>
 
-OOOSplat is a local desktop application that turns an ordinary orbit video or image sequence into a 3D Gaussian Splatting project in one workflow. Choose source media, a project directory, and a quality preset, and OOOSplat automatically handles image preparation, camera reconstruction, training, PLY publishing, preview, adjustment, and export.
+OOOSplat is a local desktop application that turns ordinary or panorama videos and image sequences into 3D Gaussian Splatting projects. Choose source media, a project directory, and a quality preset, then generate, preview, edit, and export the result.
 
 Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal generation and preview do not require a separate HTTP server.
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
-> 0.6.1 adds update notifications, preview movement axes, rotation rings, an inverse-selection shortcut, and saved-view restoration, with improved Gaussian selection and edit saving. It enables video loop detection across all three Auto Optimize presets, fixes preview ordering and Planner effectiveness metrics, and reduces UI update overhead during generation.
+> 0.7.0 adds panorama video and image generation, external model import, multi-format export, horizontal WASD navigation, Auto locate view, and image-order confirmation, with improvements to progress reporting, camera controls, and PNG focal-length reading.
+
+The features below describe the current `main` source tree; consult each release's notes for installer contents.
 
 ## Why OOOSplat
 
@@ -51,15 +53,19 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ## Key Features
 
 - **One-click generation**: Create a Gaussian Splat from MP4/MOV video or a JPG, JPEG, and PNG image folder. OOOSplat handles image preparation, camera reconstruction, training, and PLY publishing.
+- **Panorama media**: Supports stitched, monoscopic, full 360°×180°, 2:1 ERP MP4 and image folders. Media types are detected automatically; ambiguous inputs require an inline choice.
+- **Image-order confirmation**: For ordinary or panorama folders with more than 100 images, confirm capture order before generation. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
 - **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically and can enable incremental high-resolution reshoots for eligible single-camera projects.
 - **Three quality presets**: Fast, Balanced, and Detailed are available. Auto Optimize selects suitable extraction, resolution, and training settings for the source and available VRAM.
 - **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
 - **Multi-task workspace**: Group tasks into New Tasks, Completed, and Unfinished. Keep multiple drafts, reorder them, and automatically run the next task. Only one generation task runs at a time; tasks can be cancelled or resumed.
 - **Reshoots**: Create a task from a completed project, reuse its camera and reconstruction for new media, then retrain from all registered images. The derived project does not overwrite the original.
-- **Preview and editing**: Prefer WebGPU with a WebGL2 fallback. Use model translation axes and rotation rings, crop tools, point deletion, selection inversion, undo, and redo.
+- **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Use WASD for horizontal navigation or Auto locate view to return to the first training view.
 - **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML.
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
 - **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
+
+Panorama folders need at least two same-sized images; a 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas, and private camera originals are unsupported, as are panorama reshoots. See the [video](docs/PANORAMA_VIDEO_V1.md) and [image support notes](docs/PANORAMA_IMAGES_V1.md) for formats, parameters, and verification limits.
 
 ### Gaussian Editing Shortcuts
 
@@ -68,6 +74,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - In rectangle, sphere, or box selection, choose Invert selection or press `Ctrl + I` (`⌘ + I` on macOS) to switch which points are selected or retained.
 - Sphere and box selection enter an orthographic view automatically. Switch between side, front, and top views, then adjust the volume in the viewport or through numeric fields.
 - Use “Scene gizmo” in the Transform panel to switch between Move and Rotate; click the selected button again to turn the gizmo off. Left-drag an axis or ring to edit the model; drag empty space to orbit the camera. Both rings and numeric rotation pivot around the model center. Releasing commits one edit; `Esc` cancels the current gizmo drag. The gizmo mode is saved locally.
+- After clicking the canvas or Auto locate view, use `WASD` to move on the horizontal plane and `Shift` for 3× speed. Speed follows zoom; perspective views only.
 - Use `Ctrl + Z` to undo and `Ctrl + Shift + Z` or `Ctrl + Y` to redo. Transform, crop, and deletion changes share one history; camera movement and temporary highlights are not recorded.
 
 ## Processing Pipeline
@@ -77,8 +84,9 @@ Input video or image sequence
   │
   ├─ Video: inspect with FFprobe and extract at the preset target FPS and working resolution; emit RGBA frames and masks for transparent media
   ├─ Images: scan headers and naturally sort filenames, copy source media, prefer hard links for internal reuse, and create Alpha masks when needed
-  ├─ COLMAP: auto-select CPU/CUDA for features; sequential matching for video with loop detection when Auto Optimize is on, exhaustive for images
+  ├─ COLMAP: auto-select CPU/CUDA for features; sequential matching for video, exhaustive by default for images, with an ordered option above 100 images; preset loop detection with Auto Optimize
   ├─ COLMAP: incremental reconstruction and registration validation; Auto Optimize can attempt bridge-frame recovery
+  ├─ Panoramas: retain full ERP images for spherical reconstruction, then convert registered images to six-face training data
   ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed adapts its profile to VRAM
   └─ Validate the PLY and atomically publish final.ply
 ```
@@ -130,10 +138,10 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
-After downloading the `OOOSplat-0.6.1-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
+After downloading the `OOOSplat-0.7.0-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
 
 ```bash
-sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
+sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
 ```
 
 The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
@@ -142,12 +150,12 @@ The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned
 
 Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
 
-1. On Windows, run `OOOSplat-0.6.1-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.6.1-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.6.1-x64-linux.deb`.
+1. On Windows, run `OOOSplat-0.7.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.7.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.7.0-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
-3. Select a draft under “Task List → New Tasks,” or choose Add. In the left “Create New Task” panel, choose Video or Images and select a video file or image-sequence folder.
+3. Select a draft under “Task List → New Tasks,” or choose Add, then select a video or image folder. Wait for detection; choose ordinary or panorama processing in the media box if the type is uncertain.
 4. Choose the projects root; OOOSplat remembers the last location.
 5. Select the Fast, Balanced, or Detailed quality preset.
-6. Review the automatically detected COLMAP acceleration status and its explanation, then select “Start Generation.”
+6. Review COLMAP acceleration and select “Start Generation.” For more than 100 images, confirm whether filenames follow capture order; an answer is required before starting.
 7. Follow the selected task's stages, progress, and logs on the left. Click any task on the right to switch details. Generated projects appear under Completed or Unfinished; completed projects offer Preview.
 8. Edit the model in “Preview → Adjust.” Transforms, crops, and deletions are saved automatically in the project; each project's view is stored locally on this device. “Save edits” confirms that the current edits and view have been saved. Choose standard PLY, compressed PLY, SPZ, or SOG directly from “Export,” with no second format confirmation. Both Adjust and Animation support model export.
 9. Switch to Animation, choose Portrait or Landscape, and use Export → Export video for a 30 FPS, 23-second MP4 at 1080×1920 or 1920×1080 respectively. Both Adjust and Animation can export offline HTML. Exports use the current edits, can be cancelled, and provide access to the output folder on completion.
@@ -158,7 +166,7 @@ Usage notes:
 - Drag the divider between the panels to resize them; double-click it to restore the default ratio.
 - Use the percentage button in the lower-right corner to reduce, reset, or increase the interface scale.
 - Drafts are saved locally and their media is rechecked after restart. Running-task parameters cannot be changed, but other drafts remain editable. A second task cannot run concurrently.
-- Drag new tasks to reorder them. Auto-run next task is off by default. When enabled, a successfully generated draft starts the immediate next valid draft; failure, cancellation, or an unprepared draft stops the queue without skipping ahead.
+- Drag new tasks to reorder them. Auto-run next task is off by default and never skips an unready task. Image-order questions pause startup; cancelling disables the queue.
 - Reshoots inherit the source project's quality and Auto Optimize settings. Original media cannot be submitted again. Images must match the original camera dimensions; video can be reduced to those dimensions at the same aspect ratio, but cannot be enlarged or recropped. Projects with missing reconstruction data or incompatible older image caches must be regenerated first.
 - Reshoots extract features only for new images and extend matching and reconstruction in copies of the original database and model. Brush retrains from all registered images. The derived project inherits the model transform, not deletion or crop edits.
 - Task pages keep the latest 500 log entries; complete engine logs remain in the project's `logs/` directory. The training runtime monitor is hidden by default and can be enabled under Settings → Interface.
@@ -166,9 +174,11 @@ Usage notes:
 
 ## Quality Presets
 
-With Auto Optimize enabled, video sequential matching uses offline loop detection in all three quality presets. It reuses the bundled vocabulary tree to help connect revisited viewpoints without a download. Matching may take longer, and not every capture will contain a detectable loop. Auto Optimize off leaves loop detection disabled; image sequences, reshoots, and Bridge retain their existing matching strategies. See the [parameter configuration guide](docs/pipeline-optimization-config.en.md).
+With Auto Optimize enabled, sequential matching for video and confirmed ordered images uses the preset's offline loop-detection rules; disabling it turns loop detection off. Matching may take longer, and valid loops are not guaranteed. Reshoot and Bridge matching are unchanged. See the [parameter configuration guide](docs/pipeline-optimization-config.en.md).
 
-“Auto Optimize (Experimental)” is enabled by default. Video is scaled once during extraction to the selected working resolution while preserving aspect ratio and never upscaling lower-resolution media. Actual sampling never exceeds the source FPS or total frame count. Image sequences keep every valid image at its original input resolution, while COLMAP and Brush still apply the selected preset's processing limits.
+“Auto Optimize (Experimental)” is enabled by default. Ordinary video is scaled once during extraction to the selected working resolution while preserving aspect ratio and never upscaling lower-resolution media. Actual sampling never exceeds the source FPS or total frame count. Ordinary image sequences keep every valid image at its original input resolution, while COLMAP and Brush still apply the selected preset's processing limits.
+
+The table below describes ordinary inputs. Panoramas use dedicated recipes: with Auto Optimize off, Fast / Balanced / Detailed cap splats at 1 / 2 / 3 million. With it on, quality and VRAM budgets determine the cap, up to 10 million. Caps guarantee neither final counts nor sufficient memory. See [panorama training parameters and measurements](docs/PANORAMA_IMAGES_V1.md#全景训练配方-v1).
 
 | Preset | Initial / bridge-frame target | Video working long edge | COLMAP long edge / maximum features | Brush training |
 | --- | ---: | ---: | ---: | --- |
@@ -180,7 +190,7 @@ Short videos target a minimum of 30 selected frames when the source provides eno
 
 Detailed starts from one of three VRAM profiles. Below 8 GB, or when VRAM cannot be read, the video and Brush long edges are capped at 3,200. From 8 GB inclusive to below 12 GB, they are capped at 3,840. At 12 GB or more, video stays at its native long edge and Brush uses that native long edge. All three Detailed profiles cap the COLMAP image long edge at 3,200. Bridge-frame recovery is attempted only when the initial video reconstruction has insufficient coverage and unused candidate frames remain. A failed attempt safely returns to the initial reconstruction, and the mechanism does not apply to image sequences. Detailed performs at most one automatic retry with a lower training profile after an explicit out-of-memory failure.
 
-With Auto Optimize disabled, Fast, Balanced, and Detailed return to the legacy 30%, 50%, and 100% source-frame retention strategy. Video uses the legacy maximum long edge of 1,920, Brush resolutions return to 1,200, 1,600, and 2,000, and no additional Splat-count limit is applied.
+For ordinary inputs with Auto Optimize disabled, Fast, Balanced, and Detailed return to the legacy 30%, 50%, and 100% source-frame retention strategy. Video uses the legacy maximum long edge of 1,920, Brush resolutions return to 1,200, 1,600, and 2,000, and no additional Splat-count limit is applied.
 
 ## Project and File Locations
 
@@ -234,7 +244,7 @@ What is sent:
 | Field | Description |
 | --- | --- |
 | Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
-| App version, OS, CPU architecture | For example `0.6.1` / `windows` / `x86_64` |
+| App version, OS, CPU architecture | For example `0.7.0` / `windows` / `x86_64` |
 | Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`, `planner_evaluation`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
 | Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
 | Stage and total durations | Milliseconds |
@@ -366,7 +376,7 @@ npm run package:windows
 The NSIS installer is written to:
 
 ```text
-dist-artifacts\OOOSplat-0.6.1-x64-windows.exe
+dist-artifacts\OOOSplat-0.7.0-x64-windows.exe
 ```
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.
@@ -448,11 +458,13 @@ Each project keeps source copies, input images, COLMAP data, and Brush intermedi
 
 Yes. Select “Preview” on a completed project in the task list to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, inversion, undo, and redo. Edits are saved automatically in the project; “Save edits” confirms that the current edits and view have been saved without creating a model file. Choosing a model format directly from “Export” creates or safely replaces the edited model, while the original `final.ply` remains unchanged. Reopening restores the edits and the view saved on this device; yellow selections and undo history do not persist between sessions. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, watermarked portrait/landscape MP4 export, and offline HTML export. External standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT files can be imported from “Completed → Import”; LCC/LCC2, Streamed SOG, 2DGS, and ordinary point-cloud PLY files are not supported.
 
+`WASD` moves on the horizontal plane at 15% of the current visible height per second; `Shift` gives 3× speed. Auto locate view returns from any view to the first training camera, using the earliest registered panorama's front face for panorama projects. It is disabled without a reliable training camera. Opening a preview still restores the saved view first. See the [navigation notes](docs/PREVIEW_NAVIGATION.md).
+
 ### Can I preview very large PLY files?
 
 PLY files larger than 256 MiB load through Range requests of about 1 MB each to reduce full-file buffering during transfer. This does not compress, downsample, or discard SH data. Parsing, sorting, and GPU textures still need RAM and VRAM; whether a model opens depends on its size and the device, so not every large model is guaranteed to load.
 
-## Technology
+### Which model formats can I export?
 
 The preview Export menu supports models, portrait/landscape video, and single-file offline HTML. Model options:
 
@@ -463,15 +475,11 @@ The preview Export menu supports models, portrait/landscape video, and single-fi
 | SPZ v4 | Very small, lossy; sharing |
 | Bundled SOG | Typically higher compression, lossy; web presentation |
 
-SOG and SPZ are typically smaller, but size depends on the model and compression can affect detail. No fixed ratio or universally smallest format is guaranteed. Exports keep all undeleted Gaussians and the original SH degree without downsampling; codecs may quantize and reorder data, and custom extra attributes may not survive. See the [SOG](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/) and [SPZ](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/spz/) specifications.
+SOG and SPZ are typically smaller; actual size varies and compression can affect detail. Processing starts only after selecting a format, without an intermediate PLY. The original `final.ply` stays unchanged, and failure or cancellation preserves existing exports. Choose standard PLY if compression exceeds the memory budget; SPZ also has a coordinate limit of approximately ±2048 scene units. See the [export notes and verification record](docs/model-export-verification.md).
 
-The current SPZ encoder supports coordinates within approximately ±2048 scene units. Models outside this range are rejected for SPZ export with a prompt to choose another format, preventing coordinate overflow. They are not automatically scaled, centered, or stripped of distant points.
+Offline HTML preserves edits and supports viewing and animation playback, but not editing. Large models remain limited by device RAM and VRAM.
 
-Opening “Export” does not scan the model or create files. Selecting a format saves edits and starts the export. Rust writes standard PLY directly to the final format's atomic-publication temporary file. For compressed formats, a dedicated CPU Worker reads the edited virtual data view on demand; no intermediate PLY is written or buffered in full. Without deletions, cropping, or transforms, chunks come directly from the source file; filtering and transforms run only when needed.
-
-SOG uses 10 SH compression iterations and may take a long time; it can be cancelled. All three compressed formats still require whole-model encoding memory, rather than fully streaming encoding. Estimated extra memory is `6 × equivalent edited PLY bytes + 128 × point count + 64 MiB`, plus retained-point indices. The budget is 25% of available system memory, capped at 512 MiB, or 256 MiB when detection fails. After selection, an over-budget check stops the export; choose standard PLY instead. Preflight cannot guarantee that runtime allocation will succeed. The final output still needs disk space. Only validated results replace the corresponding export; failure or cancellation preserves existing exports and the source model.
-
-HTML preserves all undeleted Gaussians and SH data, initially displays the complete edited result, and supports offline orbit, pan, zoom, and manual animation playback. Mouse interaction pauses animation. It prefers WebGPU and falls back to WebGL2, offers no model editing, and contains no project paths, source media, logs, or telemetry. The file is about 4/3 of the corresponding PLY size plus viewer resources; large models still depend on device capacity. Development and build commands generate the offline runtime first; before running Rust alone, run `npm run build:html-viewer` if needed.
+## Technology
 
 - Desktop framework: Tauri 2
 - Backend: Rust and Tokio

@@ -21,6 +21,8 @@ pub struct PipelineOptimizationConfig {
     pub high_vram: HighVramConfig,
     pub qualities: QualityConfigs,
     pub brush_profiles: BrushProfileConfigs,
+    #[serde(default)]
+    pub panorama_training: super::PanoramaTrainingConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -263,6 +265,7 @@ fn parse_and_validate(json: &str) -> Result<PipelineOptimizationConfig, String> 
 
 impl PipelineOptimizationConfig {
     fn validate(&self) -> Result<(), String> {
+        self.panorama_training.validate()?;
         if self.schema_version != 1 {
             return Err(format!(
                 "unsupported schemaVersion {}; expected 1",
@@ -444,7 +447,7 @@ impl BrushProfileConfig {
 }
 
 impl BrushDensificationPreset {
-    fn validate(&self, field: &str) -> Result<(), String> {
+    pub(super) fn validate(&self, field: &str) -> Result<(), String> {
         if !self.growth_grad_threshold.is_finite()
             || self.growth_grad_threshold <= 0.0
             || !self.growth_select_fraction.is_finite()

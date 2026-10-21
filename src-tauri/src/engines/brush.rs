@@ -20,6 +20,8 @@ pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--growth-grad-threshold",
     "--growth-select-fraction",
     "--growth-stop-iter",
+    "--growth-start-iter",
+    "--sh-degree",
     "--export-every",
     "--export-path",
     "--export-name",
@@ -35,6 +37,7 @@ pub struct BrushGpuLaunchPolicy {
 
 pub struct BrushTrainingOptions<'a> {
     pub preset: BrushTrainingPreset,
+    pub panorama: bool,
     pub log_path: PathBuf,
     pub gpu_launch_policy: &'a BrushGpuLaunchPolicy,
 }
@@ -42,6 +45,19 @@ pub struct BrushTrainingOptions<'a> {
 impl BrushGpuLaunchPolicy {
     pub fn from_acceleration(acceleration: &ColmapAccelerationStatus) -> Self {
         Self::resolve(cfg!(windows), acceleration)
+    }
+
+    /// COLMAP's selected GPU is not necessarily Brush's default adapter in a
+    /// multi-GPU topology. Do not give panoramas a large VRAM budget when the
+    /// launch policy cannot identify the training device.
+    pub fn known_training_memory_mb(&self, acceleration: &ColmapAccelerationStatus) -> Option<u64> {
+        self.expected_device_name.as_ref().and_then(|expected| {
+            acceleration
+                .device
+                .as_ref()
+                .filter(|device| &device.name == expected)
+                .and_then(|_| acceleration.usable_gpu_total_memory_mb())
+        })
     }
 
     fn resolve(is_windows: bool, acceleration: &ColmapAccelerationStatus) -> Self {
@@ -153,6 +169,9 @@ fn train_args(
             densification.growth_stop_iter.to_string().into(),
         ]);
     }
+    if dataset.join("manifest.json").is_file() && dataset.join("signature.json").is_file() {
+        args.extend(["--max-scene-batch-cache-size".into(), "2GiB".into()]);
+    }
     args.extend([
         OsString::from("--export-every"),
         preset.total_steps.to_string().into(),
@@ -162,6 +181,23 @@ fn train_args(
         OsString::from("final.ply.tmp"),
         dataset.into(),
     ]);
+    args
+}
+
+fn train_args_for_mode(
+    dataset: &Path,
+    output_directory: &Path,
+    preset: BrushTrainingPreset,
+    panorama: bool,
+) -> Vec<OsString> {
+    let mut args = train_args(dataset, output_directory, preset);
+    if panorama {
+        // Pin these defaults for the versioned panorama recipe only.
+        args.splice(
+            0..0,
+            ["--growth-start-iter", "0", "--sh-degree", "3"].map(OsString::from),
+        );
+    }
     args
 }
 
@@ -190,11 +226,12 @@ pub async fn train(
         }
     }
     let environment = options.gpu_launch_policy.environment();
+    let args = train_args_for_mode(dataset, output_directory, options.preset, options.panorama);
     let output = manager
         .run_with_environment(
             ProcessSpec {
                 executable: executable.to_path_buf(),
-                args: train_args(dataset, output_directory, options.preset),
+                args,
                 working_directory: Some(output_directory.to_path_buf()),
                 log_path: Some(options.log_path),
                 observer,
@@ -338,6 +375,10 @@ mod tests {
     fn windows_single_nvidia_policy_forces_first_discrete_gpu_for_brush_only() {
         let policy =
             BrushGpuLaunchPolicy::resolve(true, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+        assert_eq!(
+            policy.known_training_memory_mb(&acceleration(ColmapBackend::Gpu, 1, Some(0))),
+            Some(6144)
+        );
         let environment = policy.environment_with_rust_log(Some("app=debug".into()));
 
         assert_eq!(
@@ -367,6 +408,7 @@ mod tests {
             acceleration(ColmapBackend::Cpu, 0, None),
         ] {
             let policy = BrushGpuLaunchPolicy::resolve(true, &status);
+            assert_eq!(policy.known_training_memory_mb(&status), None);
             let environment = policy.environment_with_rust_log(None);
             assert_eq!(
                 environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
@@ -416,6 +458,32 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--total-steps" || arg == "--lod-levels"));
+    }
+
+    #[test]
+    fn panorama_cli_pins_growth_start_and_sh_without_changing_ordinary_jobs() {
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            let r =
+                crate::presets::resolve_panorama_training_preset(quality, false, None, 512, 10_192)
+                    .unwrap();
+            let dataset = Path::new("existing panorama");
+            let output = Path::new("isolated output");
+            let args = args_as_strings(train_args_for_mode(dataset, output, r.preset, true));
+            assert_eq!(args.last().unwrap(), "existing panorama");
+            for (flag, value) in [
+                ("--growth-start-iter", "0".into()),
+                ("--sh-degree", "3".into()),
+                ("--total-train-iters", r.preset.total_steps.to_string()),
+                ("--max-splats", r.preset.max_splats.unwrap().to_string()),
+            ] {
+                assert_eq!(args.iter().filter(|v| *v == flag).count(), 1);
+                assert!(args.windows(2).any(|w| w[0] == flag && w[1] == value));
+            }
+            assert_eq!(
+                train_args_for_mode(dataset, output, r.preset, false),
+                train_args(dataset, output, r.preset)
+            );
+        }
     }
 
     #[test]
@@ -558,5 +626,23 @@ mod tests {
             "process exited with code -1073740791"
         ));
         assert!(!is_out_of_memory_detail("process exited with code 1"));
+    }
+
+    #[test]
+    fn real_panorama_wgpu_oom_remains_oom_despite_secondary_kernel_failures() {
+        let output = ProcessOutput {
+            success: false,
+            exit_code: Some(101),
+            stdout: "Refine iter 41001, 3476124 splats.".into(),
+            stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
+        };
+        assert!(matches!(
+            resolve_train_output(
+                &output,
+                PathBuf::from("absent.ply"),
+                PathBuf::from("absent.tmp.ply")
+            ),
+            Err(SplatError::BrushOutOfMemory(_))
+        ));
     }
 }

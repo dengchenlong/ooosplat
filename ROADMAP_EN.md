@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Main development version: **0.6.1**. Latest published release: **0.5.0**. The current 0.6.1 work adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, corrected transparent-input handling, and further Auto Optimize, training densification, and preview stability improvements.
+Current `main` version identifier: **0.7.0**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
 
 ## Product Principles
 
@@ -30,16 +30,19 @@ Main development version: **0.6.1**. Latest published release: **0.5.0**. The cu
 | P0 | UI simplification | Reduce unnecessary information and interaction layers while unifying generation, history, preview, and editing workflows. | To be created |
 | P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. | To be created |
 | P1 | Telemetry data collection and learning | Active-user, Pipeline performance, and Failure distribution metrics already exist. Improve data quality, long-term samples, dashboards, and release comparisons. | To be created |
-| P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
-| P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |
+| P1 | Capture guidance improvements | Extend existing capture advice and image-order confirmation with examples of orbit paths, speed, overlap, and lighting. | To be created |
+| P1 | Panorama platform and large-scene acceptance | Main supports standard ERP video and images. Continue checking source diversity, long inputs, seams, directional coverage, and large-scale densification. The 10-million cap is permitted, not a verified achieved count. | [Verification record](docs/PANORAMA_IMAGES_V1.md) |
+| P2 | AI masking and fine image matting Beta | Validate native person-exclusion and subject-Alpha inference, corrections, model distribution, and COLMAP/Brush semantics before enabling verified platforms. Not available on current main. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
-| P3 | Panoramic video support | Explore a workflow for using panoramic video as input and producing usable Gaussian Splatting results. | To be created |
+| P3 | Panorama input expansion and reshoots | Explore additional projections and panorama reshoots beyond standard full monoscopic ERP. Dual-fisheye, stereo, VR180, cropped panoramas, and private camera originals remain unsupported. | To be created |
 
 ## Completed
 
+“Implemented · main” means integrated into the main source tree, not necessarily released or accepted on all platforms. See linked records for real-media, hardware, and platform limitations.
+
 | Status | Item | Delivery | GitHub Issue / PR |
 | --- | --- | --- | --- |
-| Completed | Ubuntu 24.04 Alpha | Provides an x86_64 `.deb` desktop package and CLI using system FFmpeg/FFprobe/CPU COLMAP and a pinned Brush runtime bundled with the package. | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
+| Completed | Ubuntu 24.04 Alpha | Provides an x86_64 `.deb` desktop package and CLI using system FFmpeg/FFprobe and bundled pinned COLMAP/Brush runtimes. COLMAP uses CUDA or CPU as supported. | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
 | Completed | Apple Silicon macOS Alpha | Provides an application-bundled FFmpeg, FFprobe, CPU COLMAP, and Brush workflow for macOS 15+ arm64. | [#4](https://github.com/ooolabdev/ooosplat/issues/4) / [PR #8](https://github.com/ooolabdev/ooosplat/pull/8) |
 | Completed | Embedded Gaussian preview and animation export | Supports `.ply` loading, camera navigation, whole-model transforms, animation preview, and Gaussian and portrait-video export. | [#3](https://github.com/ooolabdev/ooosplat/issues/3) |
 | Completed | Automatic COLMAP CUDA acceleration | Detects NVIDIA drivers and Compute Capability, enables GPU feature extraction and matching when supported, and otherwise falls back to CPU. | [#6](https://github.com/ooolabdev/ooosplat/issues/6) |
@@ -56,7 +59,15 @@ Main development version: **0.6.1**. Latest published release: **0.5.0**. The cu
 | Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
 | Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
 | Completed · 0.6.0 | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented in the 0.6.0 main development version |
-| Completed · main | External Gaussian and COLMAP project import | Imports standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group, detects COLMAP automatically, keeps external data read-only, and enables eligible incremental reshoots. | Implemented on main |
+| Completed · 0.6.1 | Update notifications | Checks platform-compatible releases, shows dates and notes, supports copying download links and revisiting updates in Settings; installation remains manual. | [Feature notes](docs/update-notifications.md) |
+| Completed · 0.6.1 | Scene gizmos and edit saving | Adds translation axes, center-pivot rotation rings, inversion shortcuts, and saved views; separates edit saving from model export and improves preview sorting. | Implemented in 0.6.1 |
+| Implemented · main | External Gaussian and COLMAP project import | Imports standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from Completed; detects COLMAP, keeps external data read-only, and enables eligible reshoots. | Implemented on main |
+| Implemented · main | Multi-format model, landscape-video, and HTML export | Select PLY, compressed PLY, SPZ v4, or bundled SOG directly without an intermediate PLY; supports portrait/landscape video, offline HTML, cancellation, and safe publication. | [Export verification](docs/model-export-verification.md) |
+| Implemented · main | Panorama video and image input | Reconstructs standard full ERP spherically, then generates six-face training caches for registered images. Dedicated VRAM budgets and recipes retain source media, time/source mappings, and stage reuse. | [Video notes](docs/PANORAMA_VIDEO_V1.md) / [Image notes](docs/PANORAMA_IMAGES_V1.md) |
+| Implemented · main | Fast input detection and image-order confirmation | Lightweight ordinary/panorama detection is reused across quality changes. More than 100 images require order confirmation; sequential/exhaustive choices persist for resume, and the queue waits for answers. | Implemented on main |
+| Implemented · main | Preview navigation and camera fixes | Fixes post-zoom panning scale, orthographic grid clipping, and fixed-view orbit jumps. Adds horizontal WASD at 15% of the original speed and first-training-view locating. | [Navigation and verification](docs/PREVIEW_NAVIGATION.md) |
+| Implemented · main | Multi-pass progress and runtime monitoring | Isolates operations and late events, retains monitor state, separates registration counts, face preparation, and actual training iterations, and reports matching activity and silent periods. | Implemented on main |
+| Implemented · main | Temporary PNG/XMP focal workaround | Correctly parses rational XMP values and overrides initialization only for eligible ordinary PNGs with the confirmed affected runtime. Image bytes stay unchanged; incompatible caches are invalidated. | [#73](https://github.com/ooolabdev/ooosplat/issues/73) / [Scope and removal](docs/temporary-png-focal-workaround.md) |
 
 ## Tracking and Contributions
 

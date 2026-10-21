@@ -431,6 +431,9 @@ pub(crate) fn revalidate_imported_colmap(
         return Err(SplatError::Process("外部 COLMAP 项目缺少稀疏模型".into()));
     }
     let camera = colmap_model::read_single_camera(&colmap.sparse_model_path)?;
+    if camera.model_id == 17 {
+        return Err(SplatError::Process("全景项目暂不支持高清补拍。".into()));
+    }
     let images = colmap_model::read_registered_images(&colmap.sparse_model_path)?;
     if images.is_empty() {
         return Err(SplatError::Process("稀疏模型没有已注册图像".into()));
@@ -492,7 +495,12 @@ fn inspect_colmap(model: &Path, all_files: &[PathBuf]) -> ImportedColmapProvenan
         (count, count == 1)
     };
     let parsed_camera = colmap_model::read_single_camera(model).ok();
-    let reason = if database.is_none() {
+    let reason = if parsed_camera
+        .as_ref()
+        .is_some_and(|camera| camera.model_id == 17)
+    {
+        Some("全景项目暂不支持高清补拍。".into())
+    } else if database.is_none() {
         Some("缺少 database.db".into())
     } else if images.is_none() {
         Some("缺少原始 images 目录".into())

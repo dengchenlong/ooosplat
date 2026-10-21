@@ -9,6 +9,8 @@ npm run dev:local
 
 ## Auto Optimize off
 
+Panorama videos and images use the separate optional `panoramaTraining` configuration, not the ordinary Brush presets below. `maxSplatsWithoutOptimization` defaults to 1M / 2M / 3M and applies only with Auto Optimize off. `maxSplats` retains the 1M / 5M / 10M tier ceilings with optimization on, further limited by quality-specific VRAM budgets. Iterations remain 12k / 30k / 45k. See [panorama recipes and validation](PANORAMA_IMAGES_V1.md#全景训练配方-v1) for the full budget table, initial-point overrides and one-shot OOM retries. Older external configurations missing the panorama section or the new off-mode fields use the corresponding embedded defaults; saved task recipes are not rewritten.
+
 Videos use the original fixed-ratio sampling. Initial reconstruction and reshoots share the preset's SFM limits. Candidate pools, Bridge, staged resolutions, loop detection, Caspar BA, and automatic High OOM retries are disabled. Image sequences retain all valid images and use exhaustive matching.
 
 | Preset | Video retention | SFM long edge / features per image | Brush steps | Brush resolution | Growth threshold / fraction / stop |

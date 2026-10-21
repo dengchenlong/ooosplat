@@ -5,6 +5,9 @@ export const TASK_WORKSPACE_STORAGE_KEY = "ooo-splat-task-workspace-v1";
 export type TaskSelection = { kind: "draft" | "project" | "task"; id: string };
 
 export interface TaskDraft {
+  videoProjection: import("../types/pipeline").VideoProjection;
+  projectionDetection: import("../types/pipeline").ProjectionDetection | null;
+  projectionAnswer?: { identity: string; projection: "perspective" | "equirectangular" } | null;
   id: string;
   ordinal: number;
   kind: "generation" | "reshoot";
@@ -18,6 +21,8 @@ export interface TaskDraft {
   linkedProjectId: string | null;
   running: boolean;
   inputChecking: boolean;
+  inputPlanning?: boolean;
+  inputError?: string | null;
   needsValidation: boolean;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
@@ -33,7 +38,7 @@ interface PersistedWorkspace {
   schemaVersion: 1;
   nextOrdinal: number;
   selected: TaskSelection;
-  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running"> & { plannerEnabled?: boolean }>;
+  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running" | "projectionAnswer"> & { plannerEnabled?: boolean; videoProjection?: import("../types/pipeline").VideoProjection }>;
 }
 
 const newId = () => {
@@ -49,6 +54,7 @@ const newId = () => {
 
 export function createGenerationDraft(ordinal: number, plannerEnabled = true, plannerDefaultPending = false): TaskDraft {
   return {
+    videoProjection: "auto", projectionDetection: null,
     id: newId(), ordinal, kind: "generation", inputType: "video", inputPath: null,
     quality: "balanced", plannerEnabled, plannerDefaultPending, sourceProjectId: null, sourceProjectName: null,
     linkedProjectId: null, running: false, inputChecking: false, needsValidation: false,
@@ -85,6 +91,8 @@ export function loadTaskWorkspace(): { drafts: TaskDraft[]; selected: TaskSelect
       return ({
       ...createGenerationDraft(Number(draft.ordinal) || 1),
       ...draft,
+      videoProjection: ["auto", "perspective", "equirectangular"].includes(draft.videoProjection ?? "") ? draft.videoProjection! : "auto",
+      projectionAnswer: draft.projectionAnswer && typeof draft.projectionAnswer.identity === "string" && ["perspective", "equirectangular"].includes(draft.projectionAnswer.projection) ? draft.projectionAnswer : null,
       plannerEnabled: typeof draft.plannerEnabled === "boolean" ? draft.plannerEnabled : true,
       plannerDefaultPending: typeof draft.plannerEnabled !== "boolean",
       running,
@@ -118,7 +126,8 @@ export function saveTaskWorkspace(drafts: TaskDraft[], selected: TaskSelection, 
     schemaVersion: 1,
     nextOrdinal,
     selected,
-    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, plannerEnabled, plannerDefaultPending, sourceProjectId, sourceProjectName, linkedProjectId, running }) => ({
+    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, plannerEnabled, plannerDefaultPending, sourceProjectId, sourceProjectName, linkedProjectId, running, videoProjection, projectionAnswer }) => ({
+      videoProjection, projectionAnswer,
       id, ordinal, kind, inputType, inputPath, quality, sourceProjectId, sourceProjectName,
       linkedProjectId, running,
       ...(plannerDefaultPending ? {} : { plannerEnabled }),
@@ -129,6 +138,6 @@ export function saveTaskWorkspace(drafts: TaskDraft[], selected: TaskSelection, 
 
 export function draftDisplayName(draft: TaskDraft, newTaskLabel: string, reshootLabel: string) {
   if (draft.kind === "reshoot") return `${draft.sourceProjectName ?? newTaskLabel} · ${reshootLabel}`;
-  if (draft.inputPath) return draft.inputPath.split(/[\\/]/).at(-1) ?? `${newTaskLabel} ${draft.ordinal}`;
-  return `${newTaskLabel} ${draft.ordinal}`;
+  if (draft.inputPath) return draft.inputPath.split(/[\\/]/).at(-1) || newTaskLabel;
+  return newTaskLabel;
 }

@@ -322,6 +322,8 @@ pub struct ProjectTaskLogLine {
 pub struct ProjectTaskDetail {
     project: ProjectSummary,
     input_type: Option<ProjectInputType>,
+    video_projection: Option<crate::video::panorama::VideoProjection>,
+    input_projection: Option<crate::video::panorama::VideoProjection>,
     source_path: PathBuf,
     projects_root: PathBuf,
     planner_enabled: Option<bool>,
@@ -422,6 +424,8 @@ pub struct GaussianPreviewDescriptor {
     editing: GaussianEditing,
     edit_mask_asset_path: Option<PathBuf>,
     read_token: Option<Uuid>,
+    reference_view: Option<crate::reconstruction::reference_view::TrainingReferenceView>,
+    reference_view_unavailable: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -476,11 +480,147 @@ pub struct GaussianVideoExportResult {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeAndPlan {
+    projection_detection: Option<crate::video::panorama::ProjectionDetection>,
     input_type: ProjectInputType,
     video: Option<VideoInfo>,
     image_sequence: Option<ImageSequenceInfo>,
     plan: FramePlan,
     estimate: RuntimeEstimate,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAnalysis {
+    video: VideoInfo,
+    projection_detection: crate::video::panorama::ProjectionDetection,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputAnalysis {
+    input_type: ProjectInputType,
+    video: Option<VideoInfo>,
+    image_sequence: Option<ImageSequenceInfo>,
+    projection_detection: crate::video::panorama::ProjectionDetection,
+}
+
+async fn analyze_media(engine_paths: &EnginePaths, input: &Path) -> Result<InputAnalysis> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::Mutex<std::collections::VecDeque<(String, InputAnalysis)>>,
+    > = std::sync::OnceLock::new();
+    let identity = crate::video::panorama::source_identity(input)?;
+    // Single flight, bounded cache; quality/planner changes never re-open image headers.
+    let mut cache = CACHE.get_or_init(Default::default).lock().await;
+    if let Some((_, value)) = cache.iter().find(|(key, _)| key == &identity) {
+        return Ok(value.clone());
+    }
+    let value = if input.is_dir() {
+        let path = input.to_path_buf();
+        let analysis =
+            tokio::task::spawn_blocking(move || crate::video::image_projection::analyze(&path))
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??;
+        InputAnalysis {
+            input_type: ProjectInputType::Images,
+            video: None,
+            image_sequence: Some(analysis.info),
+            projection_detection: analysis.detection,
+        }
+    } else {
+        let (video, json) = crate::engines::ffprobe::probe_video_metadata(
+            &engine_paths.ffprobe,
+            input,
+            None,
+            &ProcessManager::new(),
+        )
+        .await?;
+        let mut detection = crate::video::panorama::detect_metadata(
+            &json,
+            &video,
+            input
+                .extension()
+                .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
+        );
+        detection.source_identity = identity.clone();
+        InputAnalysis {
+            input_type: ProjectInputType::Video,
+            video: Some(video),
+            image_sequence: None,
+            projection_detection: detection,
+        }
+    };
+    if crate::video::panorama::source_identity(input)? != identity {
+        return Err(SplatError::Process(
+            "素材文件已发生变化，请重新分析后再生成".into(),
+        ));
+    }
+    if cache.len() >= 8 {
+        cache.pop_front();
+    }
+    cache.push_back((identity, value.clone()));
+    Ok(value)
+}
+
+#[tauri::command]
+pub async fn analyze_input(app: tauri::AppHandle, path: String) -> Result<InputAnalysis> {
+    analyze_media(&paths_for_app(&app), Path::new(&path)).await
+}
+
+async fn input_analysis_for_plan(
+    engines: &EnginePaths,
+    input: &Path,
+    previous: Option<InputAnalysis>,
+) -> Result<InputAnalysis> {
+    // Same identity contract as the legacy VideoAnalysis interface. Drafts can
+    // replan without a second read even after the bounded process cache evicts them.
+    if let Some(previous) = previous {
+        let shape_matches = match previous.input_type {
+            ProjectInputType::Images => {
+                input.is_dir() && previous.image_sequence.is_some() && previous.video.is_none()
+            }
+            ProjectInputType::Video => {
+                input.is_file() && previous.video.is_some() && previous.image_sequence.is_none()
+            }
+        };
+        if shape_matches
+            && previous.projection_detection.source_identity
+                == crate::video::panorama::source_identity(input)?
+        {
+            return Ok(previous);
+        }
+    }
+    analyze_media(engines, input).await
+}
+
+async fn video_analysis_for_plan(
+    ffprobe: &Path,
+    ffmpeg: &Path,
+    input: &Path,
+    previous: Option<VideoAnalysis>,
+) -> Result<VideoAnalysis> {
+    if let Some(previous) = previous {
+        if previous.projection_detection.source_identity
+            == crate::video::panorama::source_identity(input)?
+        {
+            return Ok(previous);
+        }
+    }
+    let manager = ProcessManager::new();
+    let (video, json) =
+        crate::engines::ffprobe::probe_video_metadata(ffprobe, input, None, &manager).await?;
+    let mut projection_detection = crate::video::panorama::detect_metadata(
+        &json,
+        &video,
+        input
+            .extension()
+            .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
+    );
+    projection_detection.source_identity = crate::video::panorama::source_identity(input)?;
+    let _ = ffmpeg;
+    Ok(VideoAnalysis {
+        video,
+        projection_detection,
+    })
 }
 
 pub(crate) fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
@@ -503,18 +643,18 @@ pub async fn probe_and_plan(
     path: String,
     quality: Quality,
     planner_enabled: Option<bool>,
+    video_analysis: Option<VideoAnalysis>,
+    input_analysis: Option<InputAnalysis>,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
     let engine_paths = paths_for_app(&app);
     let samples = catalog::runtime_samples().await;
     let input = PathBuf::from(path);
     let planner_enabled = planner_enabled.unwrap_or(true);
     if input.is_dir() {
-        let image_sequence = tokio::task::spawn_blocking({
-            let input = input.clone();
-            move || analyze_image_sequence(&input)
-        })
-        .await
-        .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
+        let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+        let image_sequence = analysis
+            .image_sequence
+            .ok_or_else(|| SplatError::InvalidPath(input.clone()))?;
         let plan = create_image_plan(&image_sequence, &quality.preset());
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
         let resolution = planner_enabled.then(|| {
@@ -560,14 +700,34 @@ pub async fn probe_and_plan(
         );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Images,
+            projection_detection: Some(analysis.projection_detection),
             video: None,
             image_sequence: Some(image_sequence),
             plan,
             estimate,
         })
     } else {
-        let video =
-            probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
+        let video_analysis = if input_analysis.is_some() {
+            let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+            Some(VideoAnalysis {
+                video: analysis
+                    .video
+                    .ok_or_else(|| SplatError::InvalidPath(input.clone()))?,
+                projection_detection: analysis.projection_detection,
+            })
+        } else {
+            video_analysis
+        };
+        let VideoAnalysis {
+            video,
+            projection_detection,
+        } = video_analysis_for_plan(
+            &engine_paths.ffprobe,
+            &engine_paths.ffmpeg,
+            &input,
+            video_analysis,
+        )
+        .await?;
         let plan = if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {
@@ -621,6 +781,7 @@ pub async fn probe_and_plan(
         );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
+            projection_detection: Some(projection_detection),
             video: Some(video),
             image_sequence: None,
             plan,
@@ -656,8 +817,20 @@ fn resolve_checkpoint_brush(
     detected_total_memory_mb: Option<u64>,
     source_long_edge: u32,
     initial_sfm_points: u64,
-) -> crate::presets::ResolvedBrushTrainingPreset {
-    state.resolution_plan.map_or_else(
+) -> Result<crate::presets::ResolvedBrushTrainingPreset> {
+    if let Some(saved) = state.brush_training.resolved {
+        return Ok(saved);
+    }
+    if let Some(panorama) = &state.panorama {
+        return crate::presets::resolve_panorama_training_preset(
+            quality,
+            state.planner_enabled,
+            detected_total_memory_mb,
+            panorama.face_size,
+            initial_sfm_points,
+        );
+    }
+    Ok(state.resolution_plan.map_or_else(
         || {
             resolve_brush_training_preset(
                 quality,
@@ -676,7 +849,7 @@ fn resolve_checkpoint_brush(
                 &resolution,
             )
         },
-    )
+    ))
 }
 
 #[tauri::command]
@@ -719,7 +892,7 @@ pub async fn estimate_project_runtime(
             let plan = saved_plan.unwrap_or_else(|| {
                 UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
             });
-            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+            let brush = state.brush_training.resolved.map(Ok).unwrap_or_else(|| {
                 resolve_checkpoint_brush(
                     &state,
                     metadata.quality,
@@ -731,7 +904,7 @@ pub async fn estimate_project_runtime(
                         .map(|output| output.points_3d)
                         .unwrap_or(0),
                 )
-            });
+            })?;
             estimate_runtime_with_brush_and_resolution(
                 &video,
                 &plan,
@@ -757,7 +930,7 @@ pub async fn estimate_project_runtime(
             };
             let plan = saved_plan
                 .unwrap_or_else(|| create_image_plan(&image_sequence, &metadata.quality.preset()));
-            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+            let brush = state.brush_training.resolved.map(Ok).unwrap_or_else(|| {
                 resolve_checkpoint_brush(
                     &state,
                     metadata.quality,
@@ -769,7 +942,7 @@ pub async fn estimate_project_runtime(
                         .map(|output| output.points_3d)
                         .unwrap_or(0),
                 )
-            });
+            })?;
             estimate_runtime_for_images_with_brush_and_resolution(
                 image_sequence.image_count,
                 image_sequence.width.max(image_sequence.height),
@@ -986,6 +1159,18 @@ pub async fn get_project_task_detail(
     Ok(ProjectTaskDetail {
         project,
         input_type: (!is_imported).then_some(metadata.input_type),
+        video_projection: project_video_projection(state.as_ref(), metadata.input_type),
+        input_projection: if is_imported {
+            None
+        } else if metadata.input_type == ProjectInputType::Images {
+            Some(if state.as_ref().is_some_and(|s| s.panorama.is_some()) {
+                crate::video::panorama::VideoProjection::Equirectangular
+            } else {
+                crate::video::panorama::VideoProjection::Perspective
+            })
+        } else {
+            project_video_projection(state.as_ref(), metadata.input_type)
+        },
         source_path: metadata.source_path,
         projects_root: project_root
             .parent()
@@ -1011,6 +1196,26 @@ pub async fn get_project_task_detail(
         logs,
         imported: imported_detail,
     })
+}
+
+fn project_video_projection(
+    state: Option<&PipelineStateFile>,
+    input_type: ProjectInputType,
+) -> Option<crate::video::panorama::VideoProjection> {
+    use crate::video::panorama::VideoProjection;
+    if input_type != ProjectInputType::Video {
+        return None;
+    }
+    let state = state?;
+    if state.panorama.is_some() {
+        return Some(VideoProjection::Equirectangular);
+    }
+    match state.video_projection {
+        VideoProjection::Equirectangular => Some(VideoProjection::Equirectangular),
+        VideoProjection::Perspective => Some(VideoProjection::Perspective),
+        VideoProjection::Auto if state.video.is_some() => Some(VideoProjection::Perspective),
+        VideoProjection::Auto => None,
+    }
 }
 
 #[tauri::command]
@@ -1097,7 +1302,24 @@ pub async fn create_gui_task(
     projects_root: String,
     planner_enabled: Option<bool>,
     workspace_task_id: Option<String>,
+    video_projection: Option<crate::video::panorama::VideoProjection>,
+    video_source_identity: Option<String>,
+    input_projection: Option<crate::video::panorama::VideoProjection>,
+    input_source_identity: Option<String>,
+    image_matching_strategy: Option<crate::project::ImageMatchingStrategy>,
 ) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
+    let video_projection = input_projection.or(video_projection);
+    let video_source_identity = input_source_identity.or(video_source_identity);
+    if let Some(expected) = &video_source_identity {
+        let identity = crate::video::panorama::source_identity(std::path::Path::new(&path))
+            .map_err(|e| crate::tasks::ServiceError::new("INPUT_CHANGED", e.to_string()))?;
+        if &identity != expected {
+            return Err(crate::tasks::ServiceError::new(
+                "INPUT_CHANGED",
+                "素材文件已发生变化，请重新分析后再生成",
+            ));
+        }
+    }
     let id = workspace_task_id
         .map(|v| Uuid::parse_str(&v))
         .transpose()
@@ -1111,7 +1333,7 @@ pub async fn create_gui_task(
             planner_enabled.unwrap_or(true),
             "gui",
             None,
-            None,
+            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default()})),
         )
         .await
 }
@@ -1472,6 +1694,13 @@ pub async fn prepare_gaussian_preview(
     }
     let id = parse_project_id(&project_id)?;
     let (project_root, path, metadata) = catalog::registered_final_ply_for_project(id).await?;
+    let reference_root = project_root.clone();
+    let imported = metadata.imported.is_some();
+    let (reference_view, reference_view_unavailable) = tokio::task::spawn_blocking(move || {
+        crate::reconstruction::reference_view::training_reference_view(&reference_root, imported)
+    })
+    .await
+    .unwrap_or((None, Some("unavailable")));
     let info = inspect_gaussian_ply(&path)?;
     let transform = metadata.transform.validate()?;
     let editing = metadata.editing.validate(info.splat_count)?;
@@ -1547,6 +1776,8 @@ pub async fn prepare_gaussian_preview(
         editing,
         edit_mask_asset_path,
         read_token,
+        reference_view,
+        reference_view_unavailable,
     })
 }
 
@@ -2160,6 +2391,272 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panorama_estimates_use_recipe_but_saved_runs_keep_their_parameters() {
+        use super::*;
+        for images in [false, true] {
+            let mut state = PipelineStateFile::created(Quality::High);
+            state.planner_enabled = true;
+            state.panorama = Some(serde_json::from_value(serde_json::json!({
+                "version": 1, "sourceSha256": "fixture", "sfmWidth": 4096,
+                "sfmHeight": 2048, "faceSize": 1024, "fieldOfViewDegrees": 92.0,
+                "imageSources": if images { serde_json::json!([]) } else { serde_json::Value::Null },
+            })).unwrap());
+            let resolved =
+                resolve_checkpoint_brush(&state, Quality::High, Some(8192), 4096, 10_192).unwrap();
+            assert_eq!(resolved.preset.total_steps, 45_000);
+            assert_eq!(resolved.preset.max_splats, Some(3_000_000));
+            let old = crate::presets::resolve_brush_training_preset(
+                Quality::Fast,
+                true,
+                Some(8192),
+                512,
+                10_192,
+            );
+            state.brush_training.resolved = Some(old);
+            assert_eq!(
+                resolve_checkpoint_brush(&state, Quality::High, Some(24_576), 4096, 10_192)
+                    .unwrap(),
+                old
+            );
+            // A panorama task saved before the manual-cap change must also
+            // retain its former 10M cap rather than adopting the new 3M cap.
+            let mut old_panorama = crate::presets::resolve_panorama_training_preset(
+                Quality::High,
+                false,
+                Some(8192),
+                1024,
+                10_192,
+            )
+            .unwrap();
+            old_panorama.configured_max_splats = Some(10_000_000);
+            old_panorama.preset.max_splats = Some(10_000_000);
+            let saved = serde_json::to_vec(&old_panorama).unwrap();
+            state.brush_training.resolved = Some(serde_json::from_slice(&saved).unwrap());
+            assert_eq!(
+                resolve_checkpoint_brush(&state, Quality::High, Some(24_576), 4096, 10_192)
+                    .unwrap(),
+                old_panorama
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_preflight_cache_revalidates_membership_and_never_needs_engines() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["2.png", "10.png"] {
+            image::RgbImage::new(64, 32)
+                .save(root.path().join(name))
+                .unwrap();
+        }
+        let engines = crate::engines::EnginePaths::from_root(root.path().join("missing-engines"));
+        let first = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert!(first.projection_detection.requires_choice);
+        let second = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert_eq!(
+            crate::video::image_projection::header_reads_for_test(root.path()),
+            2
+        );
+        // More drafts than the cache capacity must still replan without header reads.
+        for _ in 0..9 {
+            let other = tempfile::tempdir().unwrap();
+            for name in ["1.png", "2.png"] {
+                image::RgbImage::new(64, 32)
+                    .save(other.path().join(name))
+                    .unwrap();
+            }
+            super::analyze_media(&engines, other.path()).await.unwrap();
+        }
+        super::input_analysis_for_plan(&engines, root.path(), Some(first.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::video::image_projection::header_reads_for_test(root.path()),
+            2
+        );
+        assert_eq!(
+            first.projection_detection.source_identity,
+            second.projection_detection.source_identity
+        );
+        image::RgbImage::new(64, 32)
+            .save(root.path().join("3.png"))
+            .unwrap();
+        let changed = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert_ne!(
+            first.projection_detection.source_identity,
+            changed.projection_detection.source_identity
+        );
+        assert_eq!(changed.image_sequence.unwrap().image_count, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires bundled FFprobe and a real ordinary/panorama video path"]
+    async fn fast_video_detection_benchmark_and_single_probe_cache() {
+        let source = std::path::PathBuf::from(
+            std::env::var_os("OOOSPLAT_DETECTION_VIDEO").expect("Set real video"),
+        );
+        let engines = crate::engines::EnginePaths::from_root(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("engines"),
+        );
+        let start = std::time::Instant::now();
+        let first = super::analyze_media(&engines, &source).await.unwrap();
+        eprintln!(
+            "video cold: {} us; confirmed={}, choice={}",
+            start.elapsed().as_micros(),
+            first.projection_detection.confirmed_erp,
+            first.projection_detection.requires_choice
+        );
+        let mut absent = engines.clone();
+        absent.ffprobe = std::path::PathBuf::from("must-not-execute-on-cache-hit");
+        let start = std::time::Instant::now();
+        let second = super::analyze_media(&absent, &source).await.unwrap();
+        eprintln!(
+            "video hot: {} us, zero FFprobe on cache hit",
+            start.elapsed().as_micros()
+        );
+        assert_eq!(first.video, second.video);
+    }
+
+    #[tokio::test]
+    #[ignore = "Header-only preflight cold/cache-hit timing, isolated PNG fixtures"]
+    async fn fast_folder_detection_cache_benchmark() {
+        for count in [100, 1000] {
+            let root = tempfile::tempdir().unwrap();
+            for i in 0..count {
+                image::RgbImage::new(64, 32)
+                    .save(root.path().join(format!("{i}.png")))
+                    .unwrap();
+            }
+            let engines = crate::engines::EnginePaths::from_root(root.path().join("must-not-run"));
+            let before = crate::video::image_projection::header_reads_for_test(root.path());
+            let start = std::time::Instant::now();
+            super::analyze_media(&engines, root.path()).await.unwrap();
+            let cold = start.elapsed().as_micros();
+            let middle = crate::video::image_projection::header_reads_for_test(root.path());
+            let start = std::time::Instant::now();
+            super::analyze_media(&engines, root.path()).await.unwrap();
+            let hot = start.elapsed().as_micros();
+            let after = crate::video::image_projection::header_reads_for_test(root.path());
+            assert_eq!(middle - before, count);
+            assert_eq!(after - middle, 0);
+            eprintln!("{count} PNG preflight: cold {cold} us / {} header reads; cached {hot} us / {} header reads; FFprobe=0",middle-before,after-middle);
+        }
+    }
+
+    #[tokio::test]
+    async fn quality_replanning_reuses_video_analysis_without_starting_ffprobe() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("视频.mp4");
+        std::fs::write(&input, b"identity-only fixture, not a decodable video").unwrap();
+        let previous: super::VideoAnalysis = serde_json::from_value(serde_json::json!({
+            "video": { "duration": 10.0, "width": 3840, "height": 1920, "fps": 30.0,
+                "totalFrames": 300, "codec": "h264", "rotation": 0 },
+            "projectionDetection": { "sourceIdentity": crate::video::panorama::source_identity(&input).unwrap(),
+                "confirmedErp": true, "requiresChoice": false, "supportedErp": true,
+                "reason": "metadata", "previewJpeg": [] }
+        })).unwrap();
+        let missing_engine = root.path().join("must-not-run.exe");
+        let result = super::video_analysis_for_plan(
+            &missing_engine,
+            &missing_engine,
+            &input,
+            Some(previous.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.video, previous.video);
+        assert!(result.projection_detection.confirmed_erp);
+        // Changed content, size, mtime or path must not reuse a stale detection.
+        std::fs::write(&input, b"changed").unwrap();
+        assert!(super::video_analysis_for_plan(
+            &missing_engine,
+            &missing_engine,
+            &input,
+            Some(previous)
+        )
+        .await
+        .is_err());
+        assert!(
+            super::video_analysis_for_plan(&missing_engine, &missing_engine, &input, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires OOOSPLAT_PANORAMA_DETAIL_TEST_PROJECT and the bundled engines; read-only real input verification"]
+    async fn real_panorama_metadata_and_saved_detail_without_preview_extraction() {
+        let project = std::path::PathBuf::from(
+            std::env::var_os("OOOSPLAT_PANORAMA_DETAIL_TEST_PROJECT")
+                .expect("Set a real panorama project path"),
+        );
+        let state: crate::project::PipelineStateFile =
+            serde_json::from_slice(&std::fs::read(project.join("state.json")).unwrap()).unwrap();
+        let engines = crate::pipeline::runner::default_engine_paths(Some(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("engines"),
+        ));
+        let input = project.join("source/input.mp4");
+        let manager = crate::process::ProcessManager::new();
+        let video = crate::engines::ffprobe::probe_video(&engines.ffprobe, &input, None, &manager)
+            .await
+            .unwrap();
+        let detection = crate::video::panorama::detect(
+            &engines.ffprobe,
+            &engines.ffmpeg,
+            &input,
+            &video,
+            &manager,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(detection.confirmed_erp && !detection.requires_choice);
+        assert!(!detection.source_identity.is_empty() && detection.preview_jpeg.is_empty());
+        assert_eq!(
+            super::project_video_projection(Some(&state), crate::project::ProjectInputType::Video),
+            Some(crate::video::panorama::VideoProjection::Equirectangular)
+        );
+        eprintln!(
+            "Real metadata/detail verified: {}x{}, confirmed ERP, no JPEG extraction",
+            video.width, video.height
+        );
+    }
+    #[test]
+    fn historical_video_projection_comes_from_saved_configuration_not_dimensions() {
+        use super::project_video_projection;
+        use crate::presets::Quality;
+        use crate::project::{PipelineStateFile, ProjectInputType};
+        use crate::video::panorama::VideoProjection;
+        let mut state = PipelineStateFile::created(Quality::Fast);
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            Some(VideoProjection::Perspective)
+        );
+        state.video_projection = VideoProjection::Equirectangular;
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            Some(VideoProjection::Equirectangular)
+        );
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Images),
+            None
+        );
+        state.video_projection = VideoProjection::Auto;
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            None
+        );
+        assert_eq!(
+            project_video_projection(None, ProjectInputType::Video),
+            None
+        );
+    }
     use super::{
         classify_dropped_input_path, classify_pipeline_failure, contains_mp4_ftyp,
         create_preview_asset, next_gaussian_video_path, persisted_task_stage, preview_client_path,

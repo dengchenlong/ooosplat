@@ -50,6 +50,8 @@ enum Commands {
         projects_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
+        #[arg(long, value_enum, default_value_t = ooo_splat::video::panorama::VideoProjection::Auto)]
+        video_projection: ooo_splat::video::panorama::VideoProjection,
     },
 }
 
@@ -158,13 +160,15 @@ async fn execute(cli: Cli) -> Result<()> {
             input,
             projects_root,
             quality,
+            video_projection,
         } => {
             let runner = PipelineRunner::new(engines, |event| {
                 eprintln!(
                     "{:>6.2}% {:?}: {}",
                     event.progress, event.stage, event.message
                 );
-            });
+            })
+            .with_video_projection(video_projection);
             let result = match projects_root {
                 Some(root) => {
                     runner

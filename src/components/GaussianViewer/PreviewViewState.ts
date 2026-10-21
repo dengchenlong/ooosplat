@@ -10,6 +10,10 @@ function validState(value: unknown): value is ViewerCameraState {
     && [state.yaw, state.pitch, state.distance, state.horizontalFrameOffset, state.orthoHeight].every(Number.isFinite)
     && state.distance > 0 && state.orthoHeight > 0
     && Math.abs(state.pitch) <= 90
+    && (state.roll === undefined || Number.isFinite(state.roll))
+    && (state.fov === undefined || (Number.isFinite(state.fov) && state.fov > 0 && state.fov < 180))
+    && (state.projectionScaleX === undefined || (Number.isFinite(state.projectionScaleX) && state.projectionScaleX > 0))
+    && (state.projectionOffset === undefined || (Array.isArray(state.projectionOffset) && state.projectionOffset.length === 2 && state.projectionOffset.every(Number.isFinite)))
     && (state.projection === PROJECTION_PERSPECTIVE || state.projection === PROJECTION_ORTHOGRAPHIC)
     && (state.orthographicView === null || ["side", "front", "top"].includes(state.orthographicView))
     && (state.orthographicView === null || state.projection === PROJECTION_ORTHOGRAPHIC);

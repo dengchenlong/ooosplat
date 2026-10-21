@@ -84,7 +84,11 @@ export async function selectProjectsRoot(current: string): Promise<string | null
 
 export async function checkEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("check_engines") : []; }
 export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus | null> { return inTauri() ? invoke("check_colmap_acceleration") : null; }
-export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true): Promise<ProbeAndPlan> { return invoke("probe_and_plan", { path, quality, plannerEnabled }); }
+export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true, cached?: import("../types/pipeline").InputAnalysis | import("../types/pipeline").VideoAnalysis, onAnalyzed?: (value: import("../types/pipeline").InputAnalysis) => void): Promise<ProbeAndPlan> {
+  const analysis = cached ?? await invoke<import("../types/pipeline").InputAnalysis>("analyze_input", { path });
+  if ('inputType' in analysis) onAnalyzed?.(analysis);
+  return invoke("probe_and_plan", { path, quality, plannerEnabled, ...('inputType' in analysis ? { inputAnalysis: analysis } : { videoAnalysis: analysis }) });
+}
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
 export async function getProjectTaskDetail(projectId: string): Promise<ProjectTaskDetail> { return invoke("get_project_task_detail", { projectId }); }
@@ -115,8 +119,8 @@ export async function onInputDragDrop(handler: (event: NativeInputDragEvent) => 
     });
   });
 }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string): Promise<PipelineResult> {
-  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId });
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy): Promise<PipelineResult> {
+  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy });
   await startGuiTask(task.task_id);
   return waitForSharedTask(task.task_id);
 }

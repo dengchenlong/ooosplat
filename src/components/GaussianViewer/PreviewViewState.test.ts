@@ -32,4 +32,22 @@ describe("preview view persistence", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Storage unavailable"); });
     expect(savePreviewView("first", view)).toBe(false);
   });
+
+  it("round-trips reference orientation and projection while preserving old records", () => {
+    const located = { ...view, roll: 32, fov: 83, projectionOffset: [0.02, -0.01] as [number, number], projectionScaleX: 1.1 };
+    expect(savePreviewView("located", located)).toBe(true);
+    expect(readPreviewView("located")).toEqual(located);
+    expect(savePreviewView("old", view)).toBe(true);
+    expect(readPreviewView("old")).toEqual(view);
+    for (const invalid of [{ roll: NaN }, { fov: 180 }, { projectionOffset: [0, Infinity] }, { projectionScaleX: 0 }]) {
+      expect(savePreviewView("invalid", { ...view, ...invalid } as ViewerCameraState)).toBe(false);
+    }
+  });
+
+  it("preserves legacy saved orthographic scale and focal ratio on reopen", () => {
+    const located = { ...view, target: [0, 0, 0] as [number, number, number], projection: PROJECTION_ORTHOGRAPHIC,
+      orthographicView: "top" as const, orthoHeight: 4.25, projectionOffset: [0, 0] as [number, number], projectionScaleX: 1.3 };
+    expect(savePreviewView("located-top", located)).toBe(true);
+    expect(readPreviewView("located-top")).toEqual(located);
+  });
 });

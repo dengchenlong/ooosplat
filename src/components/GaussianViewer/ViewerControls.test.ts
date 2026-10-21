@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { BoundingBox, GraphNode, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Vec3, type Entity } from "playcanvas";
+import { BoundingBox, GraphNode, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Quat, Vec3, type Entity } from "playcanvas";
 import { describe, expect, it, vi } from "vitest";
 import { ViewerControls } from "./ViewerControls";
 import { buildGroundGrid } from "./GroundGrid";
+import { robustEffectBounds } from "./PreviewAnimation";
 
 function pointerEvent(type: string, x: number, y: number, button = 0) {
   const event = new MouseEvent(type, { bubbles: true, cancelable: true, button, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y });
@@ -11,12 +12,12 @@ function pointerEvent(type: string, x: number, y: number, button = 0) {
   return event;
 }
 
-function setup() {
+function setup(width = 1200, height = 800) {
   const canvas = document.createElement("canvas");
   const captures = new Set<number>();
   Object.defineProperties(canvas, {
-    clientWidth: { value: 1200 },
-    clientHeight: { value: 800 },
+    clientWidth: { value: width },
+    clientHeight: { value: height },
     setPointerCapture: { value: (id: number) => captures.add(id) },
     releasePointerCapture: { value: (id: number) => captures.delete(id) },
     hasPointerCapture: { value: (id: number) => captures.has(id) },
@@ -28,11 +29,138 @@ function setup() {
   const setPosition = vi.spyOn(entity, "setPosition");
   const lookAt = vi.spyOn(entity, "lookAt");
   const onOrthographicViewChange = vi.fn();
-  const controls = new ViewerControls(canvas, entity as Entity, onOrthographicViewChange);
-  return { canvas, camera, controls, entity, setPosition, lookAt, onOrthographicViewChange };
+  const onViewChange = vi.fn();
+  const onMotion = vi.fn();
+  const controls = new ViewerControls(canvas, entity as Entity, onOrthographicViewChange, undefined, onViewChange, onMotion);
+  return { canvas, camera, controls, entity, setPosition, lookAt, onOrthographicViewChange, onViewChange, onMotion };
 }
 
 describe("ViewerControls", () => {
+  it.each(["perspective", "orthographic"])("pans at the current %s pixel scale immediately after repeated zoom, without orbiting", projection => {
+    const { controls, canvas, camera } = setup();
+    if (projection === "orthographic") {
+      controls.alignOrthographic("front", new BoundingBox(new Vec3(), new Vec3(1, 1, 1)), 0.85, false);
+      controls.setSceneBounds(new BoundingBox(new Vec3(), new Vec3(100, 1, 100)));
+    }
+    for (let i = 0; i < 15; i++) canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -200, cancelable: true }));
+    const before = controls.snapshot();
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40, 2));
+    canvas.dispatchEvent(pointerEvent("pointermove", 60, 40, 2));
+    canvas.dispatchEvent(pointerEvent("pointerup", 60, 40, 2));
+    const after = controls.snapshot();
+    const height = projection === "orthographic" ? 2 * camera.orthoHeight : 2 * before.distance * Math.tan(camera.fov * Math.PI / 360);
+    expect(new Vec3(...after.target).sub(new Vec3(...before.target)).length()).toBeCloseTo(20 * height / 800, 8);
+    expect(after.distance).toBe(before.distance);
+    controls.restore(before);
+    canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0));
+    canvas.dispatchEvent(pointerEvent("pointermove", 10, 0));
+    canvas.dispatchEvent(pointerEvent("pointerup", 10, 0));
+    const rotated = controls.snapshot();
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40, 2));
+    canvas.dispatchEvent(pointerEvent("pointermove", 60, 40, 2));
+    canvas.dispatchEvent(pointerEvent("pointerup", 60, 40, 2));
+    expect(new Vec3(...controls.snapshot().target).sub(new Vec3(...rotated.target)).length()).toBeCloseTo(20 * height / 800, 8);
+    controls.destroy();
+  });
+
+  it("restores a full reference pose including roll, FOV and off-center projection", () => {
+    const { controls, entity, camera } = setup();
+    const reference = { position: new Vec3(3, 4, 5), forward: new Vec3(1, -1, -1).normalize(), up: new Vec3(1, 1, 0).normalize(),
+      fov: 80, projectionOffset: [0.1, -0.08] as [number, number], projectionScaleX: 1.2 };
+    controls.locate(reference, new BoundingBox(new Vec3(8, -1, 0), new Vec3(2, 2, 2)), false);
+    expect(entity.getPosition().distance(reference.position)).toBeLessThan(1e-5);
+    expect(entity.forward.dot(reference.forward)).toBeCloseTo(1, 6);
+    expect(entity.up.dot(reference.up)).toBeCloseTo(1, 6);
+    expect(camera.fov).toBe(80);
+    const saved = controls.snapshot();
+    const projection = new Mat4();
+    (camera as unknown as { calculateProjection: (m: Mat4) => void }).calculateProjection(projection);
+    expect(projection.data[8]).toBeCloseTo(-0.2 / camera.aspectRatio);
+    expect(projection.data[9]).toBeCloseTo(-0.16);
+    controls.orbitBy(45);
+    controls.restore(saved);
+    expect(entity.getPosition().distance(reference.position)).toBeLessThan(1e-5);
+    expect(entity.up.dot(reference.up)).toBeCloseTo(1, 6);
+    controls.destroy();
+  });
+
+  it.each(["front", "side", "top"] as const)("returns from %s to the first training perspective camera", view => {
+    const { controls, camera, entity, onOrthographicViewChange } = setup();
+    const bounds = new BoundingBox(new Vec3(50, 50, 50), new Vec3(5, 5, 5));
+    controls.alignOrthographic(view, bounds, 0.85, false);
+    controls.locate({ position: new Vec3(50, 50, 30), forward: new Vec3(0, 0, 1), up: Vec3.UP,
+      fov: 90, projectionOffset: [0, 0], projectionScaleX: 1 }, bounds, false);
+    expect(controls.snapshot().target).toEqual([50, 50, 50]);
+    expect(controls.snapshot().orthographicView).toBeNull();
+    expect(camera.projection).toBe(PROJECTION_PERSPECTIVE);
+    expect(entity.getPosition().distance(new Vec3(50, 50, 30))).toBeLessThan(1e-5);
+    expect(entity.forward.dot(new Vec3(0, 0, 1))).toBeCloseTo(1);
+    expect(camera.fov).toBe(90);
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null, false);
+    controls.destroy();
+  });
+
+  it("keeps pole reference cameras finite and upright without requiring a first orbit", () => {
+    const { controls, entity } = setup();
+    controls.locate({ position: new Vec3(0, 3, 0), forward: new Vec3(0, -1, 0), up: new Vec3(0, 0, -1),
+      fov: 70, projectionOffset: [0, 0], projectionScaleX: 1 }, new BoundingBox(new Vec3(), new Vec3(1, 1, 1)), false);
+    expect(entity.forward.y).toBeCloseTo(-1);
+    expect(entity.up.z).toBeCloseTo(-1);
+    expect(entity.getPosition().y).toBeCloseTo(3);
+    expect(controls.snapshot().pitch).toBeCloseTo(90);
+    controls.destroy();
+  });
+
+  it.each(["front", "side", "top"] as const)("restores the transformed training pose from %s without orthographic safety retreat", view => {
+    const { controls, camera, entity } = setup();
+    try {
+      const centers = Array.from({ length: 300 }, (_, i) => [i % 2 ? -1 : 1, i % 3 ? -2 : 2, i % 5 ? -3 : 3]).flat();
+      centers.push(10_000, 10_000, 10_000);
+      const robust = robustEffectBounds(centers, { center: [5000, 5000, 5000], halfExtents: [5001, 5002, 5003] });
+      const rotation = new Quat().setFromEulerAngles(180, 27, -12);
+      const transform = new Mat4().setTRS(new Vec3(2, 3, 4), rotation, new Vec3(2, 2, 2));
+      const bounds = new BoundingBox();
+      bounds.setFromTransformedAabb(new BoundingBox(new Vec3(...robust.center), new Vec3(...robust.halfExtents)), transform);
+      const forward = rotation.transformVector(new Vec3(0, 0, -1));
+      const reference = { position: bounds.center.clone().sub(forward.clone().mulScalar(12)), forward,
+        up: rotation.transformVector(Vec3.UP), fov: 64, projectionOffset: [0.1, -0.1] as [number, number], projectionScaleX: 1.3 };
+      controls.setSceneBounds(new BoundingBox(new Vec3(), new Vec3(1000, 1000, 1000)));
+      controls.alignOrthographic(view, bounds, 0.85, false);
+      controls.locate(reference, bounds, false);
+      const state = controls.snapshot();
+      expect(new Vec3(...state.target).distance(bounds.center)).toBeLessThan(1e-5);
+      expect(state.orthographicView).toBeNull();
+      expect(state.projection).toBe(PROJECTION_PERSPECTIVE);
+      expect(state.distance).toBeCloseTo(12);
+      expect(state.projectionOffset).toEqual(reference.projectionOffset);
+      expect(state.projectionScaleX).toBe(1.3);
+      expect(entity.getPosition().distance(reference.position)).toBeLessThan(1e-5);
+      expect(entity.forward.dot(reference.forward)).toBeCloseTo(1);
+      expect(entity.up.dot(reference.up)).toBeCloseTo(1);
+      const projection = new Mat4();
+      (camera as unknown as { calculateProjection: (m: Mat4) => void }).calculateProjection(projection);
+      const verticalPixelsPerUnit = projection.data[5] * 800 / (2 * 12);
+      const horizontalPixelsPerUnit = projection.data[0] * 1200 / (2 * 12);
+      const referencePixelsPerUnit = 800 / (2 * 12 * Math.tan(64 * Math.PI / 360));
+      expect(verticalPixelsPerUnit).toBeCloseTo(referencePixelsPerUnit, 5);
+      expect(horizontalPixelsPerUnit).toBeCloseTo(referencePixelsPerUnit * 1.3, 5);
+      controls.restore(state);
+      expect(controls.snapshot()).toEqual(state);
+    } finally { controls.destroy(); }
+  });
+
+  it("uses robust extent only when the reference depth is invalid", () => {
+    const { controls, camera, entity } = setup();
+    try {
+      const bounds = new BoundingBox(Vec3.ZERO, new Vec3(1, 2, 3));
+      controls.alignOrthographic("front", bounds, 0.85, false);
+      controls.locate({ position: new Vec3(0, 0, -5), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 60, projectionOffset: [0, 0], projectionScaleX: 1 }, bounds, false);
+      expect(controls.snapshot().distance).toBeCloseTo(Math.sqrt(14));
+      expect(camera.projection).toBe(PROJECTION_PERSPECTIVE);
+      expect(entity.getPosition().distance(new Vec3(0, 0, -5))).toBeLessThan(1e-5);
+    } finally { controls.destroy(); }
+  });
   it("does not move the camera for a click or sub-threshold pointer motion", () => {
     const { canvas, controls, setPosition } = setup();
     const initialUpdates = setPosition.mock.calls.length;
@@ -222,7 +350,7 @@ describe("ViewerControls", () => {
     controls.usePerspective();
     controls.restore(saved);
     expect(controls.snapshot()).toEqual(saved);
-    expect(onOrthographicViewChange).toHaveBeenLastCalledWith("top");
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith("top", true);
     controls.destroy();
   });
 
@@ -301,7 +429,7 @@ describe("ViewerControls", () => {
     controls.alignOrthographic(view, new BoundingBox(new Vec3(), new Vec3(2, 1, 3)), 0.85, false);
     const aligned = controls.snapshot();
     expect(camera.projection).toBe(PROJECTION_ORTHOGRAPHIC);
-    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(view);
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(view, true);
 
     canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
     canvas.dispatchEvent(pointerEvent("pointermove", 60, 48));
@@ -313,7 +441,7 @@ describe("ViewerControls", () => {
     expect(orbited.orthoHeight).toBe(aligned.orthoHeight);
     expect(orbited.distance).toBe(aligned.distance);
     expect(orbited.orthographicView).toBeNull();
-    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null);
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null, true);
     controls.destroy();
   });
 
@@ -334,8 +462,312 @@ describe("ViewerControls", () => {
     expect(orbited.distance).toBe(aligned.distance);
     expect(orbited.pitch).toBeCloseTo(89.9);
     expect(up.z).toBeLessThan(-0.99);
-    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null);
+    expect(onOrthographicViewChange).toHaveBeenLastCalledWith(null, true);
     controls.destroy();
   });
 
+});
+
+describe("focused perspective WASD flight", () => {
+  function flight(height = 800) {
+    const frames = new Map<number, FrameRequestCallback>();
+    let id = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation(callback => { frames.set(++id, callback); return id; });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(id => { frames.delete(id); });
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const state = setup(1200, height);
+    document.body.append(state.canvas);
+    state.canvas.focus();
+    state.controls.setRoamingEnabled(true);
+    const key = (type: string, code: string, options: KeyboardEventInit = {}) => state.canvas.dispatchEvent(new KeyboardEvent(type, { code, key: code.replace("Key", "").toLowerCase(), bubbles: true, cancelable: true, ...options }));
+    const advance = (now: number) => { clock.mockReturnValue(now); const pending = [...frames.values()]; frames.clear(); pending.forEach(f => f(now)); };
+    const done = () => { state.controls.destroy(); state.canvas.remove(); request.mockRestore(); cancel.mockRestore(); clock.mockRestore(); };
+    return { ...state, key, advance, frames, done };
+  }
+
+  it("moves horizontally at 15% speed, preserves orientation/distance and saves only when released", () => {
+    const s = flight();
+    try {
+      const before = s.controls.snapshot();
+      const forward = s.entity.forward.clone(); forward.y = 0; forward.normalize();
+      const position = s.entity.getPosition().clone();
+      s.key("keydown", "KeyW");
+      s.advance(16); s.advance(32);
+      const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...before.target));
+      expect(moved.clone().normalize().dot(forward)).toBeCloseTo(1);
+      expect(moved.y).toBe(0);
+      expect(s.entity.getPosition().y).toBeCloseTo(position.y, 7);
+      expect(s.entity.forward.dot(forward)).toBeCloseTo(Math.cos(before.pitch * Math.PI / 180));
+      expect(moved.length()).toBeCloseTo(0.15 * 2 * before.distance * Math.tan(52 * Math.PI / 360) * 0.032);
+      expect(s.controls.snapshot().distance).toBe(before.distance);
+      expect(s.onViewChange).not.toHaveBeenCalled();
+      s.key("keyup", "KeyW");
+      expect(s.onViewChange).toHaveBeenCalledOnce();
+      expect(s.frames.size).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it("normalizes diagonal movement, supports Shift, and bounds time after a stalled frame", () => {
+    const s = flight();
+    try {
+      const before = s.controls.snapshot();
+      s.key("keydown", "KeyW", { shiftKey: true });
+      s.key("keydown", "KeyD", { shiftKey: true });
+      s.advance(5000);
+      const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...before.target));
+      expect(moved.length()).toBeCloseTo(0.15 * 2 * before.distance * Math.tan(52 * Math.PI / 360) * 0.05 * 3);
+      expect(moved.y).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it.each([
+    [0, 0, 0], [47, 70, 90], [-135, -70, -90],
+    [90, 89.999, 180], [47, 90, 90], [-135, -90, -90],
+  ])("keeps all keys horizontal at full ground speed with yaw %s, pitch %s, roll %s", (yaw, pitch, roll) => {
+    const s = flight();
+    try {
+      const initial = { ...s.controls.snapshot(), yaw, pitch, roll };
+      const angle = yaw * Math.PI / 180;
+      const front = new Vec3(-Math.sin(angle), 0, -Math.cos(angle));
+      const right = new Vec3(Math.cos(angle), 0, -Math.sin(angle));
+      let time = 0;
+      for (const [code, direction] of [
+        ['KeyW', front], ['KeyS', front.clone().mulScalar(-1)],
+        ['KeyD', right], ['KeyA', right.clone().mulScalar(-1)],
+      ] as const) {
+        s.controls.restore(initial);
+        const before = s.entity.getPosition().clone();
+        const orientation = s.entity.getRotation().clone();
+        s.key('keydown', code); s.advance(time += 16); s.key('keyup', code);
+        const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...initial.target));
+        expect(moved.y).toBe(0);
+        expect(moved.clone().normalize().dot(direction)).toBeCloseTo(1, 7);
+        expect(moved.length()).toBeCloseTo(0.15 * 2 * initial.distance * Math.tan(initial.fov! * Math.PI / 360) * 0.016, 7);
+        expect(s.entity.getPosition().y).toBeCloseTo(before.y, 6);
+        expect(s.entity.getRotation().equalsApprox(orientation)).toBe(true);
+      }
+    } finally { s.done(); }
+  });
+
+  it('cancels opposing keys without moving or committing a view change', () => {
+    const s = flight();
+    try {
+      const before = s.controls.snapshot();
+      for (const code of ['KeyW', 'KeyS', 'KeyA', 'KeyD']) s.key('keydown', code);
+      s.advance(16);
+      for (const code of ['KeyW', 'KeyS', 'KeyA', 'KeyD']) s.key('keyup', code);
+      expect(s.controls.snapshot()).toEqual(before);
+      expect(s.onViewChange).not.toHaveBeenCalled();
+      expect(s.frames.size).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it.each([800, 1600])("automatically slows with zoom and respects FOV at viewport height %s", height => {
+    const s = flight(height);
+    try {
+      const move = (now: number) => {
+        const before = new Vec3(...s.controls.snapshot().target);
+        s.key('keydown', 'KeyW'); s.advance(now); s.key('keyup', 'KeyW');
+        return new Vec3(...s.controls.snapshot().target).sub(before).length();
+      };
+      const original = move(16);
+      s.canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, cancelable: true }));
+      const zoomed = move(32);
+      expect(zoomed / original).toBeCloseTo(Math.exp(-0.2));
+      s.controls.restore({ ...s.controls.snapshot(), fov: 90 });
+      const wider = move(48);
+      expect(wider / zoomed).toBeCloseTo(Math.tan(Math.PI / 4) / Math.tan(52 * Math.PI / 360));
+    } finally { s.done(); }
+  });
+
+  it.each([30, 60, 144])("uses the same flight speed at %s frames per second", fps => {
+    const s = flight();
+    try {
+      const start = s.controls.snapshot();
+      s.key('keydown', 'KeyW');
+      for (let frame = 1; frame <= fps; frame++) s.advance(1000 * frame / fps);
+      const distance = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...start.target)).length();
+      expect(distance).toBeCloseTo(0.15 * 2 * start.distance * Math.tan(52 * Math.PI / 360), 5);
+    } finally { s.done(); }
+  });
+
+  it("does not double-count queued frame timestamps older than keydown", () => {
+    const s = flight();
+    try {
+      s.advance(100);
+      const before = s.controls.snapshot();
+      s.key("keydown", "KeyW");
+      s.advance(80); s.advance(90); s.advance(116);
+      const distance = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...before.target)).length();
+      expect(distance).toBeCloseTo(0.15 * 2 * before.distance * Math.tan(52 * Math.PI / 360) * 0.016, 7);
+    } finally { s.done(); }
+  });
+
+  it.each(["blur", "disabled", "mode", "visibility", "pointercancel", "input"])("stops and commits flight on %s", reason => {
+    const s = flight();
+    const input = document.createElement("input");
+    try {
+      s.key("keydown", "KeyW"); s.advance(16);
+      if (reason === "blur") window.dispatchEvent(new Event("blur"));
+      if (reason === "disabled") s.controls.enabled = false;
+      if (reason === "mode") s.controls.setRoamingEnabled(false);
+      if (reason === "visibility") document.dispatchEvent(new Event("visibilitychange"));
+      if (reason === "pointercancel") s.canvas.dispatchEvent(pointerEvent("pointercancel", 0, 0));
+      if (reason === "input") { document.body.append(input); input.focus(); }
+      const stopped = s.controls.snapshot();
+      s.advance(32);
+      expect(s.controls.snapshot()).toEqual(stopped);
+      expect(s.frames.size).toBe(0);
+      expect(s.onViewChange).toHaveBeenCalledOnce();
+    } finally { input.remove(); s.done(); }
+  });
+
+  it("ignores input targets, modifier shortcuts and every orthographic view", () => {
+    const s = flight();
+    try {
+      const before = s.controls.snapshot();
+      s.key("keydown", "KeyA", { ctrlKey: true });
+      expect(s.frames.size).toBe(0);
+      const input = document.createElement("input"); document.body.append(input); input.focus();
+      input.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyW", bubbles: true }));
+      expect(s.frames.size).toBe(0);
+      input.remove(); s.canvas.focus();
+      for (const view of ["front", "side", "top"] as const) {
+        s.controls.alignOrthographic(view, new BoundingBox(new Vec3(), new Vec3(1, 1, 1)), 0.85, false);
+        const aligned = s.controls.snapshot();
+        s.key("keydown", "KeyW"); s.advance(16);
+        expect(s.frames.size).toBe(0);
+        expect(s.controls.snapshot()).toEqual(aligned);
+      }
+      s.controls.restore(before);
+      s.controls.setRoamingEnabled(false);
+      s.key("keydown", "KeyW");
+      expect(s.frames.size).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it("can interrupt locating with pointer or wheel and releases all listeners on destroy", () => {
+    const s = flight();
+    try {
+      const reference = { position: new Vec3(0, 0, 5), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 60, projectionOffset: [0, 0] as [number, number], projectionScaleX: 1 };
+      const bounds = new BoundingBox(new Vec3(), new Vec3(1, 1, 1));
+      s.controls.locate(reference, bounds);
+      s.advance(100);
+      s.canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 20, cancelable: true }));
+      expect(s.frames.size).toBe(0);
+      s.controls.locate(reference, bounds);
+      s.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0));
+      expect(s.frames.size).toBe(0);
+      s.controls.destroy();
+      s.key("keydown", "KeyW");
+      expect(s.frames.size).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it("flies at the same scale after zoom, orbit, saved restore and reference locating", () => {
+    const s = flight();
+    try {
+      s.canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -200, cancelable: true }));
+      const zoom = s.controls.snapshot();
+      const move = (time: number) => {
+        const start = new Vec3(...s.controls.snapshot().target);
+        s.key("keydown", "KeyW"); s.advance(time); s.key("keyup", "KeyW");
+        return new Vec3(...s.controls.snapshot().target).sub(start).length();
+      };
+      const original = move(16);
+      s.controls.orbitBy(48);
+      expect(move(32)).toBeCloseTo(original, 7);
+      s.controls.restore(zoom);
+      expect(move(48)).toBeCloseTo(original, 7);
+      s.controls.locate({ position: new Vec3(0, 0, zoom.distance), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: zoom.fov!, projectionOffset: [0, 0], projectionScaleX: 1 }, new BoundingBox(Vec3.ZERO, Vec3.ONE), false);
+      expect(move(64)).toBeCloseTo(original, 7);
+    } finally { s.done(); }
+  });
+
+  it.each([true, false])("returns button focus immediately and accepts WASD after locate (animate=%s)", animate => {
+    const s = flight();
+    const button = document.createElement("button");
+    document.body.append(button);
+    try {
+      button.onclick = () => s.controls.locate({ position: new Vec3(3, 4, 8), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 70, projectionOffset: [0, 0], projectionScaleX: 1 }, new BoundingBox(Vec3.ZERO, Vec3.ONE), animate);
+      button.focus(); button.click();
+      expect(document.activeElement).toBe(s.canvas);
+      if (animate) s.advance(100);
+      const before = s.entity.getPosition().clone();
+      const zoom = s.controls.snapshot();
+      const forward = s.entity.forward.clone(); forward.y = 0; forward.normalize();
+      s.key("keydown", "KeyW");
+      s.advance(animate ? 116 : 16);
+      const movement = s.entity.getPosition().clone().sub(before);
+      expect(movement.clone().normalize().dot(forward)).toBeCloseTo(1, 5);
+      expect(movement.y).toBeCloseTo(0, 7);
+      expect(movement.length()).toBeCloseTo(0.15 * 2 * zoom.distance * Math.tan(zoom.fov! * Math.PI / 360) * 0.016, 5);
+      s.key("keyup", "KeyW");
+      expect(s.frames.size).toBe(0);
+    } finally { button.remove(); s.done(); }
+  });
+
+  it.each(["front", "side", "top"] as const)("finishes locating from %s in perspective and immediately enables flight", view => {
+    const s = flight();
+    try {
+      const bounds = new BoundingBox(Vec3.ZERO, Vec3.ONE);
+      const reference = { position: new Vec3(3, 4, 8), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 70, projectionOffset: [0.02, -0.01] as [number, number], projectionScaleX: 1.1 };
+      s.controls.alignOrthographic(view, bounds, 0.85, false);
+      s.controls.locate(reference, bounds);
+      s.advance(400);
+      expect(s.entity.getPosition().distance(reference.position)).toBeLessThan(1e-5);
+      expect(s.entity.forward.dot(reference.forward)).toBeCloseTo(1);
+      const located = s.controls.snapshot();
+      expect(located.projection).toBe(PROJECTION_PERSPECTIVE);
+      expect(located.orthographicView).toBeNull();
+      expect(located.fov).toBe(70);
+      expect(document.activeElement).toBe(s.canvas);
+      s.key("keydown", "KeyW"); s.advance(416); s.key("keyup", "KeyW");
+      expect(s.entity.getPosition().distance(reference.position)).toBeCloseTo(0.15 * 2 * located.distance * Math.tan(located.fov! * Math.PI / 360) * 0.016, 5);
+      s.controls.alignOrthographic(view, bounds, 0.85, false);
+      s.controls.restore(located);
+      expect(s.entity.getPosition().distance(reference.position)).toBeLessThan(1e-5);
+      expect(s.controls.snapshot()).toEqual(located);
+    } finally { s.done(); }
+  });
+
+  it("does not steal later input focus when locating finishes, or focus on a blocked locate", () => {
+    const s = flight();
+    const input = document.createElement("input"); document.body.append(input);
+    try {
+      const reference = { position: new Vec3(0, 0, 8), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 70, projectionOffset: [0, 0] as [number, number], projectionScaleX: 1 };
+      const bounds = new BoundingBox(Vec3.ZERO, Vec3.ONE);
+      s.controls.locate(reference, bounds);
+      input.focus(); s.advance(400);
+      expect(document.activeElement).toBe(input);
+      input.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyW", bubbles: true }));
+      expect(s.frames.size).toBe(0);
+      s.controls.enabled = false;
+      const before = s.controls.snapshot();
+      s.controls.locate(reference, bounds);
+      expect(document.activeElement).toBe(input);
+      expect(s.controls.snapshot()).toEqual(before);
+    } finally { input.remove(); s.done(); }
+  });
+
+  it("keeps the rendered pose when a gizmo or modal interrupts locating", () => {
+    const s = flight();
+    try {
+      s.controls.locate({ position: new Vec3(3, 4, 8), forward: new Vec3(0, 0, -1), up: Vec3.UP,
+        fov: 70, projectionOffset: [0, 0], projectionScaleX: 1 }, new BoundingBox(new Vec3(), new Vec3(1, 1, 1)));
+      s.advance(100);
+      const position = s.entity.getPosition().clone();
+      const forward = s.entity.forward.clone();
+      s.controls.enabled = false;
+      expect(s.entity.getPosition().distance(position)).toBeLessThan(1e-5);
+      expect(s.entity.forward.dot(forward)).toBeCloseTo(1);
+      expect(s.frames.size).toBe(0);
+      expect(s.onViewChange).toHaveBeenCalledOnce();
+    } finally { s.done(); }
+  });
 });

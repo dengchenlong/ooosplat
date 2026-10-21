@@ -46,6 +46,95 @@ fn notification_event(sequence: u64, kind: crate::pipeline::EventKind) -> Pipeli
 }
 
 #[tokio::test]
+async fn panorama_substage_change_clears_face_counts_runtime_and_eta() {
+    let (_root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut face = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.95, "faces");
+    face.sequence = 1;
+    face.substage = Some("panoramaTrainingPreparation".into());
+    face.current = Some(228);
+    face.total = Some(228);
+    face.unit = Some("panoramaFaces".into());
+    service.on_event(task.task_id, run, face);
+    let prepared = service.get(task.task_id).await.unwrap();
+    assert_eq!(prepared.progress, Some(95.0));
+    assert_eq!(prepared.current, Some(228));
+    let mut validation = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.95, "validate");
+    validation.sequence = 2;
+    validation.substage = Some("panoramaTrainingValidation".into());
+    validation.indeterminate = true;
+    service.on_event(task.task_id, run, validation);
+    let validating = service.get(task.task_id).await.unwrap();
+    assert!(validating.current.is_none() && validating.progress.is_none());
+    let mut train = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.0, "training");
+    train.sequence = 3;
+    train.substage = Some("training".into());
+    train.current = Some(0);
+    train.total = Some(8000);
+    train.unit = Some("iterations".into());
+    service.on_event(task.task_id, run, train);
+    let training = service.get(task.task_id).await.unwrap();
+    assert_eq!(training.total, Some(8000));
+    assert_eq!(training.current, Some(0));
+    assert!(training.runtime.is_none() && training.eta_seconds.is_none());
+}
+
+#[tokio::test]
+async fn panorama_monitor_survives_non_lifecycle_events_and_rejects_old_operations() {
+    use crate::pipeline::{event::PipelineOperation, EventKind};
+    let (_root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut stage = notification_event(1, EventKind::Stage);
+    stage.substage = Some("panoramaReconstruction".into());
+    stage.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    service.on_event(task.task_id, run, stage.clone());
+    let snapshot: crate::pipeline::runtime::RuntimeSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "processId": 42, "phase": "running", "updatedAt": Utc::now(), "lastOutputAgeMs": 0,
+            "training": null, "device": null, "backend": null, "config": {}, "resources": null
+        }))
+        .unwrap();
+    for sequence in 2..12 {
+        let mut event = stage.clone();
+        event.sequence = sequence;
+        event.kind = if sequence % 2 == 0 {
+            EventKind::Runtime
+        } else {
+            EventKind::Log
+        };
+        event.substage = None; // Legacy producer omitted this; it is not a lifecycle change.
+        if event.kind == EventKind::Runtime {
+            event.runtime = Some(snapshot.clone());
+        }
+        service.on_event(task.task_id, run, event);
+        let current = service.get(task.task_id).await.unwrap();
+        assert_eq!(current.substage.as_deref(), Some("panoramaReconstruction"));
+        assert_eq!(current.runtime.unwrap().process_id, 42);
+    }
+    let mut retry = stage.clone();
+    retry.sequence = 12;
+    retry.operation = Some(PipelineOperation { id: 2, attempt: 2 });
+    retry.stage_progress = None;
+    retry.indeterminate = true;
+    service.on_event(task.task_id, run, retry.clone());
+    let mut stale = stage;
+    stale.sequence = 13;
+    stale.kind = EventKind::Runtime;
+    stale.runtime = Some(snapshot);
+    service.on_event(task.task_id, run, stale);
+    let current = service.get(task.task_id).await.unwrap();
+    assert!(current.runtime.is_none());
+    assert_eq!(current.operation.unwrap().attempt, 2);
+    let mut local_count = retry;
+    local_count.sequence = 14;
+    local_count.kind = EventKind::Progress;
+    local_count.current = Some(80);
+    local_count.total = Some(100);
+    service.on_event(task.task_id, run, local_count);
+    assert!(service.get(task.task_id).await.unwrap().progress.is_none());
+}
+
+#[tokio::test]
 async fn notification_bursts_are_bounded_and_do_not_clone_full_records() {
     use notifications::{MAX_PENDING_LOGS, MAX_PENDING_LOG_BYTES};
     for lines in [1000, 5000] {
@@ -391,10 +480,11 @@ async fn delayed_positive_sequence_cannot_regress_stage_runtime_or_progress() {
     let (_root, service, task) = fixture().await;
     let updates = record_notifications(&service);
     let run = notification_run(&service, task.task_id);
-    let mut newer = notification_event(10, crate::pipeline::EventKind::Progress);
+    let mut newer = notification_event(10, crate::pipeline::EventKind::Stage);
     newer.stage = PipelineStage::TrainingSplats;
     newer.current = Some(10);
     newer.total = Some(100);
+    newer.stage_progress = Some(10.0);
     service.on_event(task.task_id, run, newer);
     let before = service.get(task.task_id).await.unwrap();
     for sequence in [9, 10] {
@@ -556,6 +646,86 @@ async fn fixture() -> (tempfile::TempDir, TaskService, TaskRecord) {
         .await
         .unwrap();
     (root, service, task)
+}
+
+#[tokio::test]
+async fn image_matching_request_survives_restart_and_cannot_change_on_retry() {
+    use crate::project::ImageMatchingStrategy;
+    let (root, service, _) = fixture().await;
+    let images = root.path().join("photos");
+    std::fs::create_dir(&images).unwrap();
+    for strategy in [
+        ImageMatchingStrategy::Sequential,
+        ImageMatchingStrategy::Exhaustive,
+    ] {
+        let parameters = serde_json::json!({"imageMatchingStrategy": strategy});
+        let task = service
+            .create(
+                None,
+                images.clone(),
+                Quality::Balanced,
+                root.path().join("projects"),
+                true,
+                "gui",
+                None,
+                Some(parameters.clone()),
+            )
+            .await
+            .unwrap();
+        let reopened = TaskService::at(root.path().join("registry"));
+        let restored = reopened.get(task.task_id).await.unwrap();
+        assert_eq!(restored.request_parameters, Some(parameters));
+        assert_eq!(
+            restored.input_type,
+            crate::project::ProjectInputType::Images
+        );
+        // The original request wins if transport retries reuse the same workspace ID.
+        let retried = reopened
+            .create(
+                Some(task.task_id),
+                images.clone(),
+                Quality::High,
+                root.path().join("projects"),
+                false,
+                "gui",
+                None,
+                Some(serde_json::json!({"imageMatchingStrategy":"other"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.request_parameters, restored.request_parameters);
+    }
+}
+
+#[tokio::test]
+async fn changed_video_identity_is_rejected_before_starting_a_run() {
+    let (root, service, _) = fixture().await;
+    let input = root.path().join("changed.mp4");
+    std::fs::write(&input, b"original").unwrap();
+    let identity = crate::video::panorama::source_identity(&input).unwrap();
+    let task = service
+        .create(
+            None,
+            input.clone(),
+            Quality::Fast,
+            root.path().join("projects"),
+            false,
+            "gui",
+            None,
+            Some(serde_json::json!({"videoSourceIdentity": identity})),
+        )
+        .await
+        .unwrap();
+    std::fs::write(&input, b"changed input size").unwrap();
+    let error = service
+        .start_inner(task.task_id, default_engine_paths(None), None, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "INPUT_CHANGED");
+    let unchanged = service.get(task.task_id).await.unwrap();
+    assert_eq!(unchanged.status, TaskStatus::Created);
+    assert!(unchanged.run_id.is_none() && unchanged.project_id.is_none());
+    assert!(!unchanged.status.active());
 }
 #[tokio::test]
 async fn concurrent_idempotent_creation_and_conflicting_parameters() {

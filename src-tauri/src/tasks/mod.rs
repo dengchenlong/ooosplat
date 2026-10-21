@@ -105,6 +105,10 @@ pub struct TaskRecord {
     pub actual_configuration: Option<Value>,
     pub status: TaskStatus,
     pub stage: Option<PipelineStage>,
+    #[serde(default)]
+    pub substage: Option<String>,
+    #[serde(default)]
+    pub operation: Option<crate::pipeline::event::PipelineOperation>,
     pub revision: u64,
     pub sequence: u64,
     pub created_at: DateTime<Utc>,
@@ -540,6 +544,8 @@ impl TaskService {
             actual_configuration: None,
             status: TaskStatus::Created,
             stage: None,
+            substage: None,
+            operation: None,
             revision: 1,
             sequence: 0,
             created_at: now,
@@ -650,6 +656,8 @@ impl TaskService {
                 actual_configuration: Some(actual_snapshot(serde_json::to_value(&checkpoint)?)),
                 status,
                 stage: Some(checkpoint.stage),
+                substage: None,
+                operation: None,
                 revision: 1,
                 sequence: 0,
                 created_at: metadata.created_at,
@@ -779,6 +787,23 @@ impl TaskService {
         if task.status.active() || (!resume && task.status != TaskStatus::Created) {
             return Ok(StartReceipt::existing(&task));
         }
+        if !resume {
+            if let Some(expected) = task
+                .request_parameters
+                .as_ref()
+                .and_then(|value| value.get("videoSourceIdentity"))
+                .and_then(Value::as_str)
+            {
+                let actual = crate::video::panorama::source_identity(&task.input_path)
+                    .map_err(|e| ServiceError::new("INPUT_CHANGED", e.to_string()))?;
+                if actual != expected {
+                    return Err(ServiceError::new(
+                        "INPUT_CHANGED",
+                        "素材文件已发生变化，请重新分析后再生成",
+                    ));
+                }
+            }
+        }
         if resume && task.status == TaskStatus::Completed {
             return Err(ServiceError::new(
                 "TASK_NOT_STARTABLE",
@@ -824,7 +849,21 @@ impl TaskService {
                 service.on_event(id, run_id, event);
             })
             .with_effectiveness_tracker(effectiveness)
+            .with_video_projection(
+                task.request_parameters
+                    .as_ref()
+                    .and_then(|v| v.get("videoProjection"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
+            )
             .with_workspace_task_id(Some(id))
+            .with_image_matching_strategy(
+                task.request_parameters
+                    .as_ref()
+                    .and_then(|v| v.get("imageMatchingStrategy"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
+            )
             .with_input_boundary(
                 (task.source.as_deref() == Some("mcp")).then(|| task.input_path.clone()),
             )
@@ -850,6 +889,8 @@ impl TaskService {
             }
             t.error = None;
             t.stage = None;
+            t.substage = None;
+            t.operation = None;
             t.estimated_progress = None;
             t.sequence = 0;
             t.recent_events.clear();
@@ -973,7 +1014,26 @@ impl TaskService {
                 return;
             }
             let starting = t.status == TaskStatus::Starting;
-            let stage_changed = t.stage != Some(event.stage);
+            let lifecycle = event.kind == crate::pipeline::EventKind::Stage;
+            if event
+                .operation
+                .as_ref()
+                .zip(t.operation.as_ref())
+                .is_some_and(|(incoming, current)| incoming.id < current.id)
+                || (!lifecycle
+                    && event
+                        .operation
+                        .as_ref()
+                        .zip(t.operation.as_ref())
+                        .is_some_and(|(incoming, current)| incoming.id != current.id))
+            {
+                return;
+            }
+            let stage_changed = lifecycle
+                && (t.stage != Some(event.stage)
+                    || t.substage != event.substage
+                    || event.operation.as_ref().map(|op| op.id)
+                        != t.operation.as_ref().map(|op| op.id));
             if starting {
                 t.status = TaskStatus::Running;
             }
@@ -987,25 +1047,37 @@ impl TaskService {
             }
             t.revision += 1;
             t.sequence = t.sequence.max(event.sequence);
-            t.stage = Some(event.stage);
+            if lifecycle {
+                t.stage = Some(event.stage);
+                t.substage = event.substage.clone();
+                t.operation = event.operation.clone();
+            }
             t.updated_at = event.timestamp;
             t.elapsed_ms = t.elapsed_offset_ms.saturating_add(event.elapsed_ms);
-            t.estimated_progress = Some(t.estimated_progress.unwrap_or(0.0).max(event.progress));
-            if event.current.is_some() {
+            t.estimated_progress = Some(
+                t.estimated_progress
+                    .unwrap_or(0.0)
+                    .max(event.progress.min(99.9)),
+            );
+            let progress_event = matches!(
+                event.kind,
+                crate::pipeline::EventKind::Stage | crate::pipeline::EventKind::Progress
+            ) && t.stage == Some(event.stage);
+            if progress_event {
                 t.current = event.current;
                 t.total = event.total;
                 t.unit = event.unit.clone();
-                t.progress = if !event.indeterminate {
-                    event
-                        .current
-                        .zip(event.total)
-                        .filter(|(_, total)| *total > 0)
-                        .map(|(current, total)| (current as f32 / total as f32 * 100.0).min(100.0))
-                } else {
+                t.progress = if event.indeterminate {
                     None
+                } else {
+                    event.stage_progress
                 };
             }
-            if let Some(runtime) = &event.runtime {
+            if let Some(runtime) = event
+                .runtime
+                .as_ref()
+                .filter(|_| t.stage == Some(event.stage))
+            {
                 t.runtime = Some(runtime.clone());
                 t.eta_seconds = runtime
                     .training
@@ -1178,6 +1250,10 @@ impl TaskService {
                 .elapsed_ms()
                 .saturating_add(runner.elapsed_offset_ms().max(t.elapsed_offset_ms));
             t.eta_seconds = None;
+            if t.status == TaskStatus::Completed {
+                t.estimated_progress = Some(100.0);
+                t.progress = Some(100.0);
+            }
             t.revision += 1;
             t.clone()
         };

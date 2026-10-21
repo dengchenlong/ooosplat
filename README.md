@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><img src="https://img.shields.io/badge/release-v0.6.1-blue?style=flat" alt="Release: v0.6.1"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-blue?style=flat" alt="Release: v0.7.0"></a>
   <a href="#系统要求"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -19,13 +19,15 @@
   <a href="https://trendshift.io/repositories/177239?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-177239" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/177239/weekly?language=Rust" alt="OOOSplat — Trendshift Rust 周榜荣誉" width="250" height="55" /></a>
 </p>
 
-OOOSplat 是一款将普通环绕拍摄视频或图片序列一键转换为 3D Gaussian Splatting 的本地桌面应用。选择素材、项目目录和质量档位后，应用会自动完成画面准备、相机重建、训练与 PLY 发布，并可直接预览、调整和导出结果。
+OOOSplat 是一款将普通或全景视频、图片序列一键转换为 3D Gaussian Splatting 的本地桌面应用。选择素材、项目目录和质量档位，即可自动完成生成，并直接预览、编辑和导出结果。
 
 Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端，普通生成与预览不需要额外启动 HTTP 服务。
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.6.1 加入版本更新提醒、预览移动轴、旋转环、反选快捷键与视角恢复，改进 Gaussian 选择和编辑保存流程；自动优化三档启用视频闭环检测，并修复预览排序与 Planner 效果统计，减少生成期间的界面刷新负担。
+> 0.7.0 加入全景视频与图片生成、外部模型导入、多格式导出、水平 WASD 漫游和自动定位视角，支持图片顺序确认，并改进生成进度、相机控制与 PNG 焦距读取。
+
+以下以当前 `main` 源码功能为准，安装包内容以对应版本说明为准。
 
 ## 核心优势
 
@@ -51,15 +53,19 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ## 主要功能
 
 - **一键生成**：支持 MP4、MOV 和 JPG、JPEG、PNG 图片序列，自动完成画面准备、相机重建、训练和 PLY 发布。
+- **全景素材**：支持已拼接、单目、完整 360°×180° 的 2:1 ERP MP4 和图片文件夹；自动检测类型，无法确定时在素材框中选择。
+- **图片顺序确认**：普通及全景图片超过100张时，生成前询问拍摄顺序；已排序使用顺序匹配，未排序或100张及以下使用穷举匹配。
 - **导入外部模型**：可从“已完成”分组导入标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT；完整 COLMAP 数据会自动关联，并在满足单相机条件时支持增量高清补拍。
 - **三种质量档位**：提供快速、均衡和精细档；自动优化会根据素材与显存选择合适的抽帧、分辨率和训练配置。
 - **透明素材**：支持透明 MOV 和 PNG，保留原始颜色与 Alpha，并自动生成 COLMAP 黑白蒙版。
 - **多任务管理**：任务列表分为新任务、已完成和未完成，可保存多个草稿、调整顺序并自动执行下一个任务；同一时间只运行一个生成任务，支持取消和断点续跑。
 - **补拍**：从已完成项目创建补拍任务，复用原相机和重建数据处理新素材，再用全部已注册画面重新训练；派生项目不覆盖原结果。
-- **预览与编辑**：优先使用 WebGPU，不支持时回退 WebGL2；支持模型移动轴和旋转环、区域裁切、点删除、反选与撤销重做。
+- **预览与编辑**：支持 WebGPU／WebGL2、移动轴与旋转环、裁切、删点、反选和撤销重做；可用 WASD 水平漫游或“自动定位视角”返回首帧训练视角。
 - **多种导出**：支持标准 PLY、压缩 PLY、SPZ v4、单文件 SOG，以及竖屏或横屏 MP4、单文件离线 HTML。
 - **本地运行**：COLMAP 重建与 Brush 训练都在本机完成；满足条件时自动使用 GPU，否则使用可用的兼容路径。
 - **跨平台与双语界面**：支持 Windows、Apple Silicon macOS 和 Ubuntu，并可在简体中文与英文之间切换。
+
+全景图片需至少两张且尺寸一致；仅有 2:1 比例不会自动判为全景。不支持双鱼眼、双目、VR180、裁切全景或厂商私有原片，全景项目暂不支持补拍。格式、参数和验证范围见[全景视频](docs/PANORAMA_VIDEO_V1.md)与[全景图片说明](docs/PANORAMA_IMAGES_V1.md)。
 
 ### Gaussian 编辑快捷键
 
@@ -68,6 +74,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 在矩形、球形或盒形选择中，点击“反选”或按 `Ctrl + I`（macOS 为 `⌘ + I`）切换保留或选中的部分。
 - 球形或盒形选择会自动进入正交视图，可切换侧视图、正视图和顶视图，并通过视口控制器或数值面板调整位置与大小。
 - 变换面板中的“场景操作轴”可切换“移动／旋转”，再次点击当前选中的按钮即可关闭；左键拖轴操作模型，拖动空白处转动视角。旋转环和面板旋转都围绕模型中心；松开提交一次编辑，`Esc` 取消本次拖轴，操作轴模式保存在本机。
+- 点击画布或“自动定位视角”后，使用 `WASD` 沿水平面漫游，`Shift` 三倍加速；速度随缩放调整，仅透视视图可用。
 - `Ctrl + Z` 撤销，`Ctrl + Shift + Z` 或 `Ctrl + Y` 重做。模型变换、裁切和删除共享同一历史记录；相机移动和临时黄色选区不计入历史。
 
 ## 处理流程
@@ -77,8 +84,9 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
   │
   ├─ 视频：FFprobe 分析，FFmpeg 按档位目标 FPS 和工作分辨率抽帧；透明视频同步生成 RGBA 画面与 Mask
   ├─ 图片：快速扫描文件头并按文件名自然排序，复制源素材后优先硬链接复用；按需生成 Alpha Mask
-  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，自动优化开启时含闭环检测，图片穷举匹配
+  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，图片默认穷举匹配，超过100张可确认按序匹配；顺序匹配在自动优化开启时沿用档位闭环检测规则
   ├─ COLMAP：增量重建并验证注册率和三维点；自动优化开启时可按需尝试桥接补帧
+  ├─ 全景：先保留整幅 ERP 做球面重建，仅将已注册画面转为六面训练图片
   ├─ Brush：使用可用 GPU 训练 Gaussian Splats；精细档按显存选择训练配置
   └─ 校验 PLY 后原子发布为 final.ply
 ```
@@ -130,10 +138,10 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。内置 COLMAP 在兼容 NVIDIA 设备上使用 CUDA/Caspar，否则使用 CPU/Ceres；Brush 独立选择图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
-从 main 分支 GitHub Actions 下载 `OOOSplat-0.6.1-x64-linux` Artifact 后，可执行：
+从 main 分支 GitHub Actions 下载 `OOOSplat-0.7.0-x64-linux` Artifact 后，可执行：
 
 ```bash
-sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
+sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
 ```
 
 `.deb` 仅通过 Ubuntu 包管理器安装 FFmpeg/FFprobe；锁定的 COLMAP 和 Brush 已包含在安装包中。
@@ -142,12 +150,12 @@ sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
 
 测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
 
-1. Windows 运行 `OOOSplat-0.6.1-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.6.1-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.6.1-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.7.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.7.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.7.0-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
-3. 在右侧“任务列表 → 新任务”中选择一个草稿，或点击“新增”。在左侧“创建新任务”的输入类型下拉栏选择“视频”或“图片”，再选择视频文件或图片序列文件夹。
+3. 在右侧“任务列表 → 新任务”中选择草稿或点击“新增”，再选择视频文件或图片文件夹。等待类型检测完成；无法确定时，在素材框内选择普通或全景类型。
 4. 选择项目根目录；程序会记住上次使用的位置。
 5. 选择“快速”“均衡”或“精细”档位。
-6. 查看自动检测到的 COLMAP 加速状态及原因，然后点击“开始生成”。
+6. 查看 COLMAP 加速状态并点击“开始生成”；图片超过100张时，需确认文件名是否按拍摄顺序排列，未选择不能启动。
 7. 在左侧查看所选任务的阶段、进度和日志；点击右侧任意任务可切换详情。生成出的项目按状态进入“已完成”或“未完成”，已完成项目可点击“预览”。
 8. 在“预览”的“调整”模式中修改模型，变换、裁切和删除记录会自动保存到项目中，视角按项目保存在本机。点击“保存编辑”可确认当前编辑与视角已保存；需要模型文件时，在“导出”菜单直接选择标准 PLY、压缩 PLY、SPZ 或 SOG，无需再次确认格式。调整和动画模式均可使用。
 9. 切换到“动画”，在命令栏中间选择“竖屏 / 横屏”，通过“导出 → 导出视频”生成 30 FPS、23 秒 MP4，分辨率分别为 1080×1920 和 1920×1080；调整或动画模式均可导出离线 HTML。导出使用当前编辑结果，可取消，完成后可打开所在文件夹。
@@ -158,7 +166,7 @@ sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
 - 拖动左右面板之间的分界线可以调整宽度；双击分界线恢复默认比例。
 - 点击右下角百分比按钮可缩小、恢复或放大整个界面。
 - 新任务草稿会在本机保存，重启后重新检查素材。运行中的任务参数不能修改，但可以切换并编辑其他草稿；不能同时启动第二个任务。
-- 新任务可拖动排序。“自动执行下一个任务”默认关闭，开启后当前草稿生成成功时会启动紧邻的下一个有效草稿；失败、取消或遇到尚未准备好的草稿时停止，不会跳过它继续执行。
+- 新任务可拖动排序。“自动执行下一个任务”默认关闭，开启后按顺序执行，不跳过未就绪任务；图片顺序确认会暂停启动，取消则关闭队列。
 - 补拍继承源项目的质量档位和自动优化设置。不能重复输入原素材；图片尺寸必须匹配原相机，视频可以按相同宽高比缩小到该尺寸，但不能放大或改变宽高比。缺失重建数据或使用旧版不兼容图片缓存的项目，需要先重新生成。
 - 补拍只对新增画面提取特征，在原数据库和模型副本上补充匹配及重建；Brush 使用全部已注册画面完整重训。派生项目继承模型变换，不继承删点或裁切记录。
 - 任务页日志保留最近 500 条，完整引擎日志位于项目的 `logs/` 目录。训练资源面板默认隐藏，可在“设置 → 界面”中开启。
@@ -166,11 +174,13 @@ sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
 
 ## 质量档位
 
-“自动优化（实验性）”默认开启。视频会在抽帧时一次性缩放到对应工作分辨率，并保持原始宽高比且不会放大低分辨率素材；实际采样不会超过源视频 FPS 或总帧数。图片序列始终保留全部有效图片和原始输入分辨率，但 COLMAP 与 Brush 仍使用对应档位的处理上限。
+“自动优化（实验性）”默认开启。普通视频会在抽帧时一次性缩放到对应工作分辨率，并保持原始宽高比且不会放大低分辨率素材；实际采样不会超过源视频 FPS 或总帧数。普通图片序列保留全部有效图片和原始输入分辨率，但 COLMAP 与 Brush 仍使用对应档位的处理上限。
 
 自动优化开启/关闭时各档位的完整参数、Bridge/Caspar/OOM 处理逻辑，以及开发环境外部配置覆盖方法见[自动优化参数配置](docs/pipeline-optimization-config.zh-CN.md)。默认参数集中维护在 `config/pipeline-optimization.json`。
 
-自动优化开启时，三个档位的视频顺序匹配均启用闭环检测，复用内置词汇树、无需联网，帮助连接绕拍回到起点的画面。匹配耗时可能增加，且不保证所有素材都能找到闭环；关闭自动优化时不启用。图片序列、高清补拍及 Bridge 匹配策略保持不变。
+自动优化开启时，视频及已确认按序排列的图片使用档位对应的离线闭环检测；关闭时不启用。闭环检测可能增加匹配时间，不保证所有素材均能闭环；补拍及 Bridge 的匹配策略不变。
+
+下表为普通素材配置。全景使用独立配方：关闭自动优化时，快速／均衡／精细的 Splat 上限为100万／200万／300万；开启时按档位与显存确定，最高1,000万，上限不保证实际点数或显存安全。详见[全景训练参数与实测](docs/PANORAMA_IMAGES_V1.md#全景训练配方-v1)。
 
 | 档位 | 视频初始 / 桥接目标 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
 | --- | ---: | ---: | ---: | --- |
@@ -182,7 +192,7 @@ sudo apt install ./OOOSplat-0.6.1-x64-linux.deb
 
 精细档的初始配置按可用显存划分：显存低于 8 GB 或无法读取时，视频和 Brush 最大长边为 3,200；8 GB（含）至 12 GB 之间为 3,840；12 GB（含）以上保留视频原生长边，并让 Brush 使用原生长边。三个精细配置的 COLMAP 图像长边均限制为 3,200。桥接补帧仅在视频初始重建覆盖不足且仍有候选画面时尝试；失败会安全回退到初始重建，不适用于图片序列。精细档在明确检测到显存不足时最多自动降低一次训练配置并重试。
 
-关闭自动优化后，快速、均衡、精细档分别恢复为保留源视频 30%、50%、100% 画面的旧版策略；视频画面长边沿用旧版最大 1,920，Brush 最大训练分辨率分别为 1,200、1,600、2,000，且不额外设置 Splat 数量上限。
+普通素材关闭自动优化后，快速、均衡、精细档分别恢复为保留源视频 30%、50%、100% 画面的旧版策略；视频画面长边沿用旧版最大 1,920，Brush 最大训练分辨率分别为 1,200、1,600、2,000，且不额外设置 Splat 数量上限。
 
 ## 项目与文件位置
 
@@ -236,7 +246,7 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 字段 | 说明 |
 | --- | --- |
 | 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
-| 应用版本、操作系统、CPU 架构 | 例如 `0.6.1` / `windows` / `x86_64` |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.7.0` / `windows` / `x86_64` |
 | 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
 | 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
 | 阶段耗时与总耗时 | 毫秒 |
@@ -368,7 +378,7 @@ npm run package:windows
 NSIS 安装包输出到：
 
 ```text
-dist-artifacts\OOOSplat-0.6.1-x64-windows.exe
+dist-artifacts\OOOSplat-0.7.0-x64-windows.exe
 ```
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。
@@ -450,11 +460,13 @@ M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把�
 
 可以。在任务列表中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式支持整体 Transform，以及矩形、球形和盒形 Gaussian 选择；可以非破坏式删除、裁切、反选、撤销和重做。编辑记录会自动保存在项目中；“保存编辑”确认当前编辑与视角已保存，不生成模型文件。在“导出”菜单直接选择模型格式即可生成或安全替换编辑结果，原始 `final.ply` 始终不变。重新打开时恢复编辑与本机保存的视角，黄色选区和撤销历史不跨次恢复。“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕，以及带水印的横竖屏 MP4 和离线 HTML 导出。外部标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT 可从“已完成 → 导入”导入；不支持 LCC/LCC2、Streamed SOG、2DGS 或普通点云 PLY。
 
+`WASD` 沿水平面漫游，速度为每秒当前可见画面高度的15%，`Shift` 三倍加速。“自动定位视角”从任意视图返回首帧训练相机，全景使用最早已注册画面的 front 面；无可靠训练相机时禁用。打开预览仍优先恢复上次视角，详见[导航说明](docs/PREVIEW_NAVIGATION.md)。
+
 ### 超大 PLY 可以预览吗？
 
 大于 256 MiB 的 PLY 使用 Range 分块读取，每次约 1 MB，减少文件传输阶段的整文件缓冲；不会压缩、降采样或丢弃 SH 数据。解析、排序和 GPU 纹理仍需要内存与显存，能否打开取决于模型大小和设备能力，不保证所有大模型都能加载。
 
-## 技术栈
+### 模型可以导出哪些格式？
 
 预览的“导出”菜单支持模型、竖屏/横屏视频和单文件离线 HTML。模型导出格式如下：
 
@@ -465,15 +477,11 @@ M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把�
 | SPZ v4 | 文件很小，有损压缩，适合分享 |
 | 单文件 SOG | 通常压缩率更高，有损压缩，适合网页展示 |
 
-SOG、SPZ 通常更小，实际大小取决于模型；压缩可能影响细节，不保证固定比例或某种格式始终最小。导出保留全部未删除 Gaussian 和原有 SH 阶数，不降采样；格式自身允许量化和重排，自定义额外属性可能无法保留。参考 [SOG](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/) 和 [SPZ](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/spz/) 格式说明。
+SOG、SPZ 通常更小，实际体积取决于模型，压缩可能影响细节。点击格式后才开始处理，不生成中转 PLY；原始 `final.ply` 不变，失败或取消保留已有导出。压缩内存超限时请改用标准 PLY；SPZ 当前还受约 ±2048 场景单位的坐标范围限制。详见[导出说明与验证记录](docs/model-export-verification.md)。
 
-当前 SPZ 编码器使用约 ±2048 场景单位的坐标范围。含超范围坐标的模型会被拒绝 SPZ 导出并提示改用其他格式，避免坐标溢出；不会自动缩放、居中或删除远端点。
+离线 HTML 保留编辑结果，支持浏览和播放动画，不提供编辑功能；大模型仍受设备内存与显存限制。
 
-展开“导出”菜单不会扫描模型或生成文件，点击具体格式后才保存编辑并启动导出。标准 PLY 由 Rust 直接写入用于原子发布的临时文件；压缩格式由独立 CPU Worker 按需读取编辑后的虚拟数据视图进行离线编码，不生成、落盘或整份缓存中转 PLY。无删除、裁切和变换时直接分块读取原文件；过滤和变换仅在需要时执行。
-
-SOG 使用 10 次 SH 压缩迭代，可能耗时较长，可取消。三种压缩格式仍需要整模型编码内存，不是完整流式编码：预估额外内存为 `6 × 编辑后等效 PLY 字节数 + 128 × 点数 + 64 MiB`，另计保留点索引占用；预算为系统可用内存的 25% 且最多 512 MiB，检测失败使用 256 MiB。选择格式后若检测到超过预算则停止，请改选标准 PLY；预检不能保证运行时不会内存不足。最终文件仍需磁盘空间，只有校验完成才替换对应导出文件，失败或取消保留旧文件及原模型。
-
-HTML 初始展示完整编辑结果，保留未删除的 Gaussian 与 SH 数据，可离线旋转、平移、缩放并手动播放动画，鼠标操作会暂停播放；支持 WebGPU 优先、WebGL2 回退，不提供模型编辑，也不包含项目路径、源素材、日志或遥测。HTML 体积约为对应 PLY 的 4/3，另含查看器资源，大模型打开仍取决于设备能力。开发和构建命令会预先生成离线查看器资源，单独运行 Rust 前可先执行 `npm run build:html-viewer`。
+## 技术栈
 
 - 桌面框架：Tauri 2
 - 后端：Rust、Tokio

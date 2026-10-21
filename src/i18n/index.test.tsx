@@ -5,6 +5,13 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { detectSystemLocale, LanguageProvider, localizePipelineMessage, readInitialLocale, translate, useI18n } from ".";
 
+it("panorama initialization limit uses approved English copy", () => {
+  const message = "初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。";
+  expect(localizePipelineMessage("en", message)).toBe("Initial point count exceeds the current panorama training budget. Training stopped to avoid dropping initial points.");
+  expect(localizePipelineMessage("en", `外部进程执行失败：${message}`)).toBe(localizePipelineMessage("en", message));
+  expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+});
+
 function Harness() {
   const { locale, t, toggleLocale, formatDuration } = useI18n();
   return <div>
@@ -15,6 +22,25 @@ function Harness() {
 }
 
 describe("interface language", () => {
+  it("uses compact navigation labels without the removed speed/limitation copy", () => {
+    expect(translate('zh-CN', 'viewer.roamHint')).toContain('自动定位视角后');
+    expect(translate('en', 'viewer.roamHint')).toContain('Auto locate view');
+    expect(translate('zh-CN', 'viewer.roam')).toBe('漫游');
+    expect(translate('en', 'viewer.roam')).toBe('Fly');
+    expect(translate('zh-CN', 'viewer.rotate')).toBe('旋转');
+    expect(translate('en', 'viewer.rotate')).toBe('Rotate');
+    expect(translate('zh-CN', 'viewer.locateHint')).toContain('切换到该透视视角');
+    expect(translate('en', 'viewer.locateHint')).toContain('back to perspective');
+    for (const locale of ['zh-CN', 'en'] as const) {
+      expect(translate(locale, 'viewer.roamHint')).not.toMatch(/Shift|仅透视|perspective only/i);
+    }
+  });
+  it("localizes matching silence notices as system status, not invented engine progress", () => {
+    const message = '图像匹配进程仍在运行，最近 15 秒无新输出。此步骤可能耗时较长，请耐心等待';
+    expect(localizePipelineMessage('en', message)).toBe('The image-matching process is still running, with no new output for 15 seconds. This step may take a while. Please wait.');
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+    expect(translate('en', 'viewer.locate')).toBe('Auto locate view');
+  });
   it("localizes optional loop detection messages without relabeling exhaustive matching", () => {
     expect(localizePipelineMessage("en", "COLMAP 正在进行 GPU 顺序匹配（已开启闭环检测）")).toBe("COLMAP is running sequential matching with GPU (loop detection enabled)");
     expect(localizePipelineMessage("en", "顺序匹配（已开启闭环检测）完成")).toBe("Sequential matching (loop detection enabled) completed");

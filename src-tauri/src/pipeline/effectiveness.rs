@@ -291,6 +291,7 @@ mod tests {
             profile,
             detected_total_memory_mb: Some(8_192),
             configured_max_splats: Some(1_500_000),
+            panorama: None,
             preset: BrushTrainingPreset {
                 total_steps: 30_000,
                 max_resolution: 3_840,

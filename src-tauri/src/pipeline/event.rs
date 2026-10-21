@@ -35,7 +35,17 @@ pub enum PipelineEngine {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PipelineOperation {
+    pub id: u64,
+    /// Actual process execution number within this stage; zero for in-process preparation.
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<PipelineOperation>,
     #[serde(default)]
     pub task_id: Option<uuid::Uuid>,
     #[serde(default)]
@@ -47,6 +57,8 @@ pub struct PipelineEvent {
     pub kind: EventKind,
     pub level: EventLevel,
     pub stage: PipelineStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substage: Option<String>,
     pub engine: Option<PipelineEngine>,
     pub progress: f32,
     pub stage_progress: Option<f32>,
@@ -66,6 +78,7 @@ impl PipelineEvent {
         let bounded = stage_progress.clamp(0.0, 1.0);
         let (start, end) = stage_progress_range(stage);
         Self {
+            operation: None,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -74,6 +87,7 @@ impl PipelineEvent {
             kind: EventKind::Stage,
             level: EventLevel::Info,
             stage,
+            substage: None,
             engine: Some(PipelineEngine::System),
             progress: start + (end - start) * bounded,
             stage_progress: Some(bounded * 100.0),
