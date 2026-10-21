@@ -906,21 +906,7 @@ impl PipelineRunner {
         // A 2:1 target is set only by the persisted panorama branch. Keep real
         // decoder PTS and indices, including a separate rescue candidate pool.
         if panorama {
-            let (width, height) = target_dimensions
-                .ok_or_else(|| SplatError::Process("全景抽帧缺少目标尺寸".into()))?;
-            let count = plan
-                .estimated_frames
-                .max(plan.candidate_frames.len() as u64);
-            if count
-                .saturating_mul(width as u64)
-                .saturating_mul(height as u64)
-                .saturating_mul(8)
-                > crate::video::panorama::MAX_CACHE_BYTES
-            {
-                return Err(SplatError::Process(
-                    "全景抽帧超过首版 20 GiB 临时预算，请缩短视频或降低档位".into(),
-                ));
-            }
+            target_dimensions.ok_or_else(|| SplatError::Process("全景抽帧缺少目标尺寸".into()))?;
             self.events.panorama_phase.store(4, Ordering::Relaxed);
             self.events.send(
                 PipelineStage::ExtractingFrames,

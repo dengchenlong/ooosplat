@@ -1,7 +1,8 @@
-import { ReadStream, readFile, readFileInfo, writeSource, createChunkDataPool, WorkerQueue, WebPCodec, logger, type ReadFileSystem, type ReadSource, type FileSystem, type Writer, type InputFormat } from "@playcanvas/splat-transform";
+import { ReadStream, readFile, readFileInfo, writeSource, createChunkDataPool, WorkerQueue, WebPCodec, logger, bakeTransform, Transform, type ReadFileSystem, type ReadSource, type FileSystem, type Writer, type InputFormat } from "@playcanvas/splat-transform";
 import webpWasmUrl from "@playcanvas/splat-transform/lib/webp.wasm?url";
-import type { ModelWorkerStart } from "../lib/modelExportTypes";
-import { assertSpzPositions, validateDecodedLayer } from "../lib/modelExportValidation";
+import type { ModelWorkerStart, SpzAdjustment } from "../lib/modelExportTypes";
+import { validateDecodedLayer } from "../lib/modelExportValidation";
+import { createSpzBounds, includeSpzChunk, planSpzAdjustment, assertSpzAdjustmentSizes, adjustedSpzSource } from "../lib/spzAdjustment";
 // Already inside a dedicated worker: avoid extra WASM heaps and GPU contention.
 WorkerQueue.maxWorkers = 0;
 WebPCodec.wasmUrl = webpWasmUrl;
@@ -13,7 +14,7 @@ const pending = new Map<number, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
 }>();
-const rpc = <T>(type: "read" | "write", value: Record<string, unknown>, transfer: Transferable[] = []) => {
+const rpc = <T>(type: "read" | "write" | "confirm" | "encode", value: Record<string, unknown>, transfer: Transferable[] = []) => {
     const result = ioQueue.then(() => new Promise<T>((resolve, reject) => {
         const requestId = ++sequence;
         pending.set(requestId, { resolve: resolve as (v: unknown) => void, reject });
@@ -66,22 +67,36 @@ async function run(message: ModelWorkerStart) {
     const sources = await readFile(options);
     if (sources.length !== 1)
         throw new Error("Multiple scenes are not supported");
-    self.postMessage({ type: "progress", exportId, phase: "encoding", progress: null });
+    let encodingSource = sources[0];
+    let adjustment: SpzAdjustment | null = null;
+    let filename = "";
     const pool = createChunkDataPool({ maxPooledBytes: 0 });
     try {
         if (message.format === "spz") {
-            const source = sources[0], meta = source.meta;
+            encodingSource = bakeTransform(encodingSource, Transform.PLY);
+            const source = encodingSource, meta = source.meta, bounds = createSpzBounds();
             const positionPool = createChunkDataPool({ chunkSize: Math.min(meta.chunkSize, meta.numGaussians), maxPooledBytes: 0 });
             try {
                 for (let chunkIndex = 0; chunkIndex < meta.numChunks[0]; chunkIndex++) {
                     const count = Math.min(meta.chunkSize, meta.numGaussians - chunkIndex * meta.chunkSize);
                     const position = positionPool.acquire("position", meta.layouts.position!, count);
-                    try { await source.read({ chunkIndex, position }); assertSpzPositions(new Float32Array(position.data, 0, count * 3)); }
-                    finally { position.release(); }
+                    const geometric = positionPool.acquire("geometric", meta.layouts.geometric!, count);
+                    try { await source.read({ chunkIndex, position, geometric }); includeSpzChunk(bounds, position, geometric); }
+                    finally { position.release(); geometric.release(); }
                 }
             } finally { positionPool.destroy(); }
+            if (bounds.count !== message.splatCount) throw new Error("SPZ preflight count mismatch");
+            adjustment = planSpzAdjustment(bounds);
+            if (adjustment) {
+                const accepted = await rpc<boolean>("confirm", { adjustment });
+                if (!accepted) throw new Error("SPZ adjustment was not confirmed");
+                assertSpzAdjustmentSizes(bounds, adjustment);
+                encodingSource = adjustedSpzSource(encodingSource, adjustment);
+            }
         }
-        await writeSource({ filename: message.filename, outputFormat: message.format === "compressedPly" ? "compressed-ply" : message.format === "sog" ? "sog-bundle" : "spz", source: sources[0], pool, options: { iterations: 10, spzVersion: 4, webpEffort: 6 } }, outputFS);
+        // The host creates the output only after preflight and explicit consent.
+        filename = await rpc<string>("encode", {});
+        await writeSource({ filename, outputFormat: message.format === "compressedPly" ? "compressed-ply" : message.format === "sog" ? "sog-bundle" : "spz", source: encodingSource, pool, options: { iterations: 10, spzVersion: 4, webpEffort: 6 } }, outputFS);
     }
     finally {
         await Promise.all(sources.map(source => source.close()));
@@ -89,12 +104,12 @@ async function run(message: ModelWorkerStart) {
     }
     self.postMessage({ type: "progress", exportId, phase: "validating", progress: null });
     const inputFormat: InputFormat = message.format === "compressedPly" ? "ply" : message.format;
-    const result = await readFileInfo({ filename: message.filename, inputFormat, fileSystem: new FS("output", outputSize) });
+    const result = await readFileInfo({ filename, inputFormat, fileSystem: new FS("output", outputSize) });
     if (!result.gaussian || result.numGaussians !== message.splatCount || result.shBands !== message.shBands || result.model !== info.model)
         throw new Error("Export round-trip validation failed: Gaussian count, SH bands or render model changed");
     // SPZ/SOG metadata alone does not validate the payload. Decode every layer,
     // one bounded chunk at a time, before allowing the atomic publication.
-    const decoded = await readFile({ filename: message.filename, inputFormat, fileSystem: new FS("output", outputSize) });
+    const decoded = await readFile({ filename, inputFormat, fileSystem: new FS("output", outputSize) });
     if (decoded.length !== 1)
         throw new Error("Invalid encoded scene count");
     const source = decoded[0], meta = source.meta;
@@ -122,11 +137,12 @@ async function run(message: ModelWorkerStart) {
         await Promise.all(decoded.map(source => source.close()));
         validationPool.destroy();
     }
-    self.postMessage({ type: "done", exportId, validation: { splatCount: result.numGaussians, shBands: result.shBands } });
+    self.postMessage({ type: "done", exportId, validation: { splatCount: result.numGaussians, shBands: result.shBands }, adjustment });
 }
 self.onmessage = (event: MessageEvent) => {
     const m = event.data;
-    if (m.type === "readReply" || m.type === "writeReply") {
+    if (m.type !== "start" && m.exportId !== exportId) return;
+    if (m.type === "readReply" || m.type === "writeReply" || m.type === "confirmReply" || m.type === "encodeReply") {
         const p = pending.get(m.requestId);
         if (!p)
             return;
@@ -134,7 +150,7 @@ self.onmessage = (event: MessageEvent) => {
         if (m.error)
             p.reject(new Error(m.error));
         else
-            p.resolve(m.type === "readReply" ? m.bytes : m.written);
+            p.resolve(m.type === "readReply" ? m.bytes : m.type === "writeReply" ? m.written : m.type === "confirmReply" ? m.accepted : m.filename);
     }
     else if (m.type === "start" && !started) {
         started = true;

@@ -699,6 +699,8 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .gaussian-save-backdrop { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: rgba(8, 14, 25, .58); backdrop-filter: blur(3px); }
 .gaussian-save-dialog { width: min(460px, calc(100vw - 48px)); padding: 20px; display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 14px; color: #263249; background: #f6f8fb; border: 1px solid #b8c3d2; box-shadow: 0 26px 70px rgba(4, 11, 23, .38); }
 .gaussian-save-symbol { width: 42px; height: 42px; display: grid; place-items: center; color: #1e5cff; background: #e5edff; border: 1px solid #c2d2ff; }
+.gaussian-export-dialog { max-height: calc(100dvh - 48px); overflow-y: auto; }
+.gaussian-export-dialog.awaiting-confirmation p + p { margin-top: 8px; }
 .gaussian-save-symbol.completed { color: #24704f; background: #e4f4eb; border-color: #b9ddc9; }
 .gaussian-save-symbol.error { color: #a13d36; background: #ffe9e6; border-color: #e5b6b1; }
 .gaussian-save-dialog h2 { margin: 2px 0 8px; font: 700 17px/1.2 var(--font-sans); }

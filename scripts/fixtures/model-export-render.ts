@@ -5,7 +5,7 @@ import { robustEffectBounds } from "../../src/components/GaussianViewer/PreviewA
 
 void (async () => {
   try {
-    const { count, poses } = await (await fetch("/config")).json();
+    const { count, poses, adjustments } = await (await fetch("/config")).json();
     const canvas = document.createElement("canvas"); canvas.width = 640; canvas.height = 480; document.body.append(canvas);
     const device = await createGraphicsDevice(canvas, { deviceTypes: [DEVICETYPE_WEBGL2], antialias: false, preserveDrawingBuffer: true });
     const app = new Application(canvas, { graphicsDevice: device });
@@ -37,6 +37,15 @@ void (async () => {
           const up = inverse.transformVector(new Vec3(0, -1, 0)).mul(mapping);
           camera.setPosition(position); camera.lookAt(position.clone().add(forward), up); camera.camera!.fov = 92;
         }
+        const adjustment = adjustments?.[index];
+        if (adjustment) {
+          // The fixture applies the same PLY->engine flip to every model.
+          const [x, y, z] = adjustment.center, s = adjustment.scale;
+          const c = new Vec3(-x, -y, z);
+          camera.setPosition(camera.getPosition().clone().sub(c).mulScalar(s));
+        }
+        camera.camera!.nearClip = .01 * (adjustment?.scale ?? 1);
+        camera.camera!.farClip = 1_000_000 * (adjustment?.scale ?? 1);
         await sorting.waitForFrame(camera.camera!, signal, "Render sort timeout", 30000);
         ctx.drawImage(canvas, 0, 0); const pixels = ctx.getImageData(0, 0, 640, 480).data;
         let error = 0, nonBackground = 0;

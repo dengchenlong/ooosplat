@@ -23,7 +23,6 @@ impl EditedPlyView {
         path: &Path,
         transform: GaussianTransform,
         edits: GaussianExportEdits<'_>,
-        budget: Option<u64>,
         mut progress: impl FnMut(u64, u64),
         check: impl Fn() -> Result<()>,
     ) -> Result<Self> {
@@ -90,19 +89,6 @@ impl EditedPlyView {
                     .try_reserve(1)
                     .map_err(|_| unsupported("无法分配导出索引，请选择标准 PLY"))?;
                 indices.push(index);
-                if let Some(budget) = budget {
-                    if index % ROWS_PER_CHUNK as u64 == 0 || indices.len().is_power_of_two() {
-                        let bytes = layout.header.len() as u64
-                            + indices.len() as u64 * layout.stride as u64
-                            + metadata.len()
-                            - source_vertex_end;
-                        if estimated(bytes, indices.len() as u64, indices.capacity() as u64 * 8)
-                            > budget
-                        {
-                            return Err(unsupported("压缩预计超过安全内存预算，请选择标准 PLY"));
-                        }
-                    }
-                }
             }
             progress(layout.count, layout.count);
         }
@@ -139,9 +125,6 @@ impl EditedPlyView {
             cached_row,
         };
         result.check_source()?;
-        if budget.is_some_and(|budget| result.estimated_memory() > budget) {
-            return Err(unsupported("压缩预计超过安全内存预算，请选择标准 PLY"));
-        }
         check()?;
         Ok(result)
     }
@@ -155,13 +138,6 @@ impl EditedPlyView {
             24 => 2,
             _ => 3,
         }
-    }
-    pub fn estimated_memory(&self) -> u64 {
-        estimated(
-            self.info.file_size,
-            self.info.splat_count,
-            self.indices.as_ref().map_or(0, |v| v.capacity() as u64 * 8),
-        )
     }
     pub fn check_source(&self) -> Result<()> {
         let metadata = std::fs::metadata(&self.path)?;
@@ -271,11 +247,4 @@ impl EditedPlyView {
         writer.get_ref().sync_all()?;
         Ok(())
     }
-}
-fn estimated(bytes: u64, count: u64, index_bytes: u64) -> u64 {
-    bytes
-        .saturating_mul(6)
-        .saturating_add(count.saturating_mul(128))
-        .saturating_add(64 * 1024 * 1024)
-        .saturating_add(index_bytes)
 }

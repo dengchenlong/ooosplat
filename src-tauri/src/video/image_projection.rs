@@ -628,7 +628,7 @@ pub fn checkpoint(
         crate::presets::Quality::High => (4096, 1024),
     };
     let width = scan.info.width.min(cap) / 4 * 4;
-    validate_budget(scan.info.image_count, width, width / 2, face.min(width / 4))?;
+    validate_cache_size(scan.info.image_count, width, width / 2, face.min(width / 4))?;
     if (scan.info.width as u64)
         .checked_mul(scan.info.height as u64)
         .and_then(|n| n.checked_mul(4))
@@ -699,8 +699,12 @@ pub fn checkpoint(
     })
 }
 
-fn validate_budget(count: u64, width: u32, height: u32, face: u32) -> Result<()> {
-    // Include both prepared image copies (hard-link fallback), masks and all six faces.
+fn validate_cache_size(count: u64, width: u32, height: u32, face: u32) -> Result<()> {
+    // Guard arithmetic and COLMAP face IDs only. Disk usage has no fixed cap.
+    count
+        .checked_mul(6)
+        .filter(|n| *n <= u32::MAX as u64)
+        .ok_or_else(invalid)?;
     let bytes = (width as u64)
         .checked_mul(height as u64)
         .and_then(|n| n.checked_mul(9))
@@ -711,11 +715,8 @@ fn validate_budget(count: u64, width: u32, height: u32, face: u32) -> Result<()>
                 .and_then(|f| n.checked_add(f))
         })
         .and_then(|n| n.checked_mul(count));
-    if bytes.is_none_or(|n| n > super::panorama::MAX_CACHE_BYTES) {
-        Err(SplatError::Process(OVER_BUDGET.into()))
-    } else {
-        Ok(())
-    }
+    bytes.ok_or_else(invalid)?;
+    Ok(())
 }
 
 pub fn prepare(
@@ -741,7 +742,7 @@ pub fn prepare(
     if scan.images.len() != records.len() || !scan.detection.supported_erp {
         return Err(invalid());
     }
-    validate_budget(
+    validate_cache_size(
         records.len() as u64,
         config.sfm_width,
         config.sfm_height,
@@ -1275,10 +1276,35 @@ mod tests {
         assert_eq!(rgba.get_pixel(10, 20).0, [53, 11, 30, 200]);
     }
     #[test]
-    fn processing_budget_includes_prepared_copies_masks_and_faces_and_checks_overflow() {
-        assert!(validate_budget(94, 2048, 1024, 512).is_ok());
-        assert!(validate_budget(1000, 4096, 2048, 1024).is_err());
-        assert!(validate_budget(u64::MAX, 4096, 2048, 1024).is_err());
+    fn source_decode_limit_is_retained_without_a_total_cache_cap() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["1.jpg", "2.jpg"] {
+            jpeg_header(
+                &d.path().join(name),
+                32_768,
+                16_384,
+                &[packet(&xml(32_768, 16_384))],
+            );
+        }
+        // Header-only inputs exceed 512 MiB RGBA at native resolution.
+        // Fail before attempting pixel decoding or publishing any cache.
+        let error = checkpoint(
+            d.path(),
+            crate::presets::Quality::High,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(OVER_BUDGET));
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cache_sizes_above_twenty_gib_are_allowed_but_overflow_is_rejected() {
+        assert!(validate_cache_size(94, 2048, 1024, 512).is_ok());
+        assert!(validate_cache_size(1000, 4096, 2048, 1024).is_ok());
+        assert!(validate_cache_size(u64::MAX, 4096, 2048, 1024).is_err());
+        assert!(validate_cache_size(u32::MAX as u64 / 6 + 1, 64, 32, 16).is_err());
+        assert!(validate_cache_size(1, u32::MAX, u32::MAX, 1024).is_err());
     }
     #[test]
     #[ignore = "Timing evidence with local real source; creates only isolated test header fixtures"]

@@ -22,6 +22,8 @@ if(viewEndpoint){
   const info=await response.json();fixture.size=info.fileSize;fixture.count=info.splatCount;fixture.sh=info.shBands;
 }
 fixture.formats = (process.env.SMOKE_FORMATS ?? "compressedPly,spz,sog").split(",");
+fixture.spzAction = process.env.SMOKE_SPZ_ACTION ?? "reject";
+if (!["reject", "accept", "cancel"].includes(fixture.spzAction)) throw new Error("Invalid SPZ test confirmation action");
 if (!fixture.formats.length || fixture.formats.some(f => !["compressedPly", "spz", "sog"].includes(f))) throw new Error("Invalid smoke formats");
 if (!fixture.count || fixture.sh === undefined) throw new Error("Expected standard Gaussian PLY");
 // Optional small real-data fixture for quick codec/WASM checks, never used by the app.
@@ -37,9 +39,9 @@ if (process.env.SMOKE_POINTS && !viewEndpoint) {
   fixture.count = count; fixture.size = (await stat(input)).size;
 }
 await build({ configFile: false, root, logLevel: "warn", worker: { plugins: () => [spzCspPlugin()] }, build: { target: "es2022", outDir: path.join(out, "bundle"), emptyOutDir: true, rollupOptions: { input: path.join(root, "scripts/fixtures/model-export-browser.ts"), output: { entryFileNames: "runtime.js" } } } });
-const outputs = Object.fromEntries(["compressedPly", "spz", "sog"].map(f => [f, { path: path.join(out, `edit.${f === "compressedPly" ? "compressed.ply" : f}`), written: 0 }]));
-for (const v of Object.values(outputs)) await writeFile(v.path, Buffer.alloc(0));
+const outputs = Object.fromEntries(["compressedPly", "spz", "sog"].map(f => [f, { path: path.join(out, `edit.${f === "compressedPly" ? "compressed.ply" : f}`), written: 0, started: false }]));
 const results = [];
+const confirmations = [];
 let finish;
 const done = new Promise(resolve => { finish = resolve; });
 const resources = new Set();
@@ -58,10 +60,17 @@ const server = createServer(async (req, res) => {
       }
       const h = await open(url.searchParams.get("file") === "source" ? input : output.path, "r");
       try { const bytes = Buffer.alloc(length); const { bytesRead } = await h.read(bytes, 0, length, offset); res.end(bytes.subarray(0, bytesRead)); } finally { await h.close(); }
+    } else if (url.pathname === "/confirmation") {
+      let body = ""; for await (const b of req) { body += b; if (body.length > 4096) throw new Error("Confirmation too large"); }
+      confirmations.push(JSON.parse(body)); res.end("ok");
+    } else if (url.pathname === "/encode") {
+      if (!output || output.started) throw new Error("Duplicate or invalid encoding reservation");
+      await writeFile(output.path, Buffer.alloc(0), { flag: "wx" }); output.started = true;
+      res.end(path.basename(output.path));
     } else if (url.pathname === "/write") {
       const chunks = []; let size = 0;
       for await (const b of req) { size += b.length; if (size > 1_024_000) throw new Error("Chunk too large"); chunks.push(b); }
-      if (!output || Number(url.searchParams.get("offset")) !== output.written) throw new Error("Out of order write");
+      if (!output?.started || Number(url.searchParams.get("offset")) !== output.written) throw new Error("Out of order or unapproved write");
       await appendFile(output.path, Buffer.concat(chunks)); output.written += size; res.end(String(output.written));
     } else if (url.pathname === "/result" || url.pathname === "/done") {
       let body = ""; for await (const b of req) body += b;
@@ -76,12 +85,15 @@ const server = createServer(async (req, res) => {
   } catch (error) { res.statusCode = 500; res.end(String(error)); }
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-const browser = spawn(process.argv[3] ?? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", ["--headless=new", "--no-first-run", "--disable-background-networking", "--disable-sync", "--disable-extensions", `--user-data-dir=${path.join(out, "profile")}`, `http://127.0.0.1:${server.address().port}`], { windowsHide: true, stdio: "ignore" });
+const browser = spawn(process.argv[3] ?? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", ["--headless=new", "--no-first-run", "--disable-background-networking", "--disable-sync", "--disable-extensions", `--user-data-dir=${path.join(out, "profile")}`, `http://127.0.0.1:${server.address().port}`], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+let browserDiagnostics = "";
+browser.stderr.on("data", bytes => { browserDiagnostics = (browserDiagnostics + bytes.toString()).slice(-4096); });
 const timer = setTimeout(() => finish("Browser conversion timed out"), 10 * 60_000);
 browser.on("error", e => finish(String(e)));
+browser.on("exit", (code, signal) => finish(`Browser exited before completing conversion (code=${code}, signal=${signal}). ${browserDiagnostics}`));
 try {
   const error = await done;
-  await writeFile(path.join(out, "results.json"), JSON.stringify({ input, fixture, results, resources: [...resources], error }, null, 2));
+  await writeFile(path.join(out, "results.json"), JSON.stringify({ input, fixture, results, confirmations, outputs, resources: [...resources], error }, null, 2));
   console.log(out);
   if (error) throw new Error(error);
   if (results.length !== fixture.formats.length || (fixture.formats.includes("sog") && ![...resources].some(p => p.endsWith(".wasm")))) throw new Error("Missing codec or local WASM verification");

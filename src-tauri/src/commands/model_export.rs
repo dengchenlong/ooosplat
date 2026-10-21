@@ -85,9 +85,6 @@ pub struct PreparedModelExport {
     file_size: u64,
     splat_count: u64,
     sh_bands: u8,
-    estimated_memory_bytes: u64,
-    memory_budget_bytes: u64,
-    compression_allowed: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -136,23 +133,16 @@ fn check_revision(expected: u64, actual: u64) -> Result<()> {
         Ok(())
     }
 }
-#[cfg(test)]
-fn estimate(info: &PlyInfo) -> u64 {
-    info.file_size
-        .saturating_mul(6)
-        .saturating_add(info.splat_count.saturating_mul(128))
-        .saturating_add(64 * MIB)
-}
-fn memory_budget(available: Option<u64>) -> u64 {
-    available
-        .map(|n| (n / 4).min(512 * MIB))
-        .unwrap_or(256 * MIB)
-}
-fn available_memory() -> Option<u64> {
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
-    let bytes = system.available_memory();
-    (bytes > 0).then_some(bytes)
+fn check_current_export(
+    s: &ModelExportSession,
+    source: &std::path::Path,
+    revision: u64,
+) -> Result<()> {
+    check_revision(s.revision, revision)?;
+    if source != s.source {
+        return Err(error("模型源文件已发生变化"));
+    }
+    Ok(())
 }
 #[cfg(test)]
 fn bands(path: &std::path::Path) -> Result<u8> {
@@ -251,7 +241,6 @@ pub async fn prepare_gaussian_model_export(
         let info = inspect_gaussian_ply(&job.source)?;
         let editing = metadata.editing.validate(info.splat_count)?;
         let mask = read_mask(&job.root, editing)?;
-        let budget = memory_budget(available_memory());
         let view = EditedPlyView::open(
             &job.source,
             job.transform,
@@ -259,7 +248,6 @@ pub async fn prepare_gaussian_model_export(
                 crop: editing.crop,
                 deleted_mask: Some(&mask),
             },
-            (job.format != ModelFormat::Ply).then_some(budget),
             |done, total| {
                 if done != total && last_progress.elapsed() < std::time::Duration::from_millis(50) {
                     return;
@@ -277,14 +265,13 @@ pub async fn prepare_gaussian_model_export(
             },
             || running(&job),
         )?;
-        Ok((view, budget))
+        Ok(view)
     })
     .await
     .map_err(|e| error(e.to_string()))?;
     match result {
-        Ok((view, budget)) => {
+        Ok(view) => {
             running(&s)?;
-            let estimated = view.estimated_memory();
             let info = view.info();
             let sh = view.sh_bands();
             let prepared = PreparedModelExport {
@@ -292,9 +279,6 @@ pub async fn prepare_gaussian_model_export(
                 file_size: info.file_size,
                 splat_count: info.splat_count,
                 sh_bands: sh,
-                estimated_memory_bytes: estimated,
-                memory_budget_bytes: budget,
-                compression_allowed: estimated <= budget,
             };
             let mut e = s.encoding.lock().await;
             e.info = Some(info);
@@ -321,6 +305,10 @@ pub async fn start_gaussian_model_encoding(
     if format != s.format {
         return Err(error("导出格式与预约不一致"));
     }
+    // Consent may have taken arbitrarily long. Recheck before creating output.
+    let _metadata = state.metadata_write.lock().await;
+    let (_, source, metadata) = catalog::registered_final_ply_for_project(s.project_id).await?;
+    check_current_export(&s, &source, metadata.editing.revision)?;
     let mut e = s.encoding.lock().await;
     if e.format.is_some() {
         return Err(error("模型导出已开始"));
@@ -334,17 +322,9 @@ pub async fn start_gaussian_model_encoding(
         .as_ref()
         .ok_or_else(|| error("导出视图未就绪"))?
         .clone();
-    if format != ModelFormat::Ply
-        && view
-            .lock()
-            .map_err(|_| error("导出视图不可用"))?
-            .estimated_memory()
-            > memory_budget(available_memory())
-    {
-        return Err(error(
-            "此模型压缩预计超过安全内存预算，请选择标准 PLY；不会自动减点或降低质量",
-        ));
-    }
+    view.lock()
+        .map_err(|_| error("导出视图不可用"))?
+        .check_source()?;
     if format != ModelFormat::Ply {
         std::fs::OpenOptions::new()
             .write(true)
@@ -545,10 +525,7 @@ pub async fn complete_gaussian_model_export(
     running(&s)?;
     let _metadata = state.metadata_write.lock().await;
     let (_, source, metadata) = catalog::registered_final_ply_for_project(s.project_id).await?;
-    check_revision(s.revision, metadata.editing.revision)?;
-    if source != s.source {
-        return Err(error("模型源文件已发生变化"));
-    }
+    check_current_export(&s, &source, metadata.editing.revision)?;
     let result = publish(&s, validation).await?;
     release(&state, export_id).await;
     Ok(result)
@@ -693,7 +670,7 @@ mod tests {
                     .unwrap();
                     let reference = std::fs::read(path).unwrap();
                     let mut view =
-                        EditedPlyView::open(&source, transform, edits, None, |_, _| {}, || Ok(()))
+                        EditedPlyView::open(&source, transform, edits, |_, _| {}, || Ok(()))
                             .unwrap();
                     assert_eq!(view.info().file_size, reference.len() as u64);
                     assert_eq!(view.sh_bands(), 3);
@@ -720,7 +697,7 @@ mod tests {
         assert_eq!(std::fs::read(source).unwrap(), original);
     }
     #[test]
-    fn virtual_view_fast_path_budget_cancel_zero_and_source_changes() {
+    fn virtual_view_fast_path_cancel_zero_and_source_changes() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("final.ply");
         gaussian_fixture(&source, 8);
@@ -729,7 +706,6 @@ mod tests {
             &source,
             GaussianTransform::default(),
             GaussianExportEdits::default(),
-            None,
             |_, _| scans += 1,
             || Ok(()),
         )
@@ -740,20 +716,10 @@ mod tests {
         assert!(EditedPlyView::open(
             &source,
             GaussianTransform::default(),
-            GaussianExportEdits::default(),
-            Some(1),
-            |_, _| {},
-            || Ok(())
-        )
-        .is_err());
-        assert!(EditedPlyView::open(
-            &source,
-            GaussianTransform::default(),
             GaussianExportEdits {
                 crop: None,
                 deleted_mask: Some(&[255])
             },
-            None,
             |_, _| {},
             || Ok(())
         )
@@ -770,15 +736,35 @@ mod tests {
     #[tokio::test]
     #[ignore = "Manual browser + Rust edited-view smoke; set OOOSPLAT_EXPORT_SMOKE_INPUT to a small real PLY"]
     async fn virtual_view_browser_smoke() {
+        let input = PathBuf::from(
+            std::env::var("OOOSPLAT_EXPORT_SMOKE_INPUT").expect("Set OOOSPLAT_EXPORT_SMOKE_INPUT"),
+        );
+        run_virtual_view_browser_smoke(input).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Real browser encoding above the former 512 MiB estimate; uses an isolated 400K SH3 fixture"]
+    async fn large_virtual_view_browser_smoke() {
+        let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".cache");
+        let dir = tempfile::Builder::new()
+            .prefix("unrestricted-model-export-")
+            .tempdir_in(cache)
+            .unwrap();
+        let input = dir.path().join("source.ply");
+        gaussian_fixture(&input, 400_000);
+        run_virtual_view_browser_smoke(input).await;
+    }
+
+    async fn run_virtual_view_browser_smoke(input: PathBuf) {
         use crate::project::GaussianCrop;
         use axum::{
             extract::{Query, State as HttpState},
             routing::get,
             Router,
         };
-        let input = PathBuf::from(
-            std::env::var("OOOSPLAT_EXPORT_SMOKE_INPUT").expect("Set OOOSPLAT_EXPORT_SMOKE_INPUT"),
-        );
         let count = inspect_gaussian_ply(&input).unwrap().splat_count;
         let mut mask = vec![0; count.div_ceil(8) as usize];
         for index in (0..count).step_by(7) {
@@ -799,7 +785,6 @@ mod tests {
                 }),
                 deleted_mask: Some(&mask),
             },
-            Some(512 * MIB),
             |_, _| {},
             || Ok(()),
         )
@@ -941,7 +926,6 @@ mod tests {
             &source,
             GaussianTransform::default(),
             GaussianExportEdits::default(),
-            None,
             |_, _| {},
             || Ok(()),
         )
@@ -951,9 +935,8 @@ mod tests {
         assert_eq!(info.splat_count, 5_000_000);
         assert!(info.file_size > 1024 * MIB);
         assert_eq!(info.file_size, std::fs::metadata(&source).unwrap().len());
-        assert!(estimate(&info) > 512 * MIB);
         assert_eq!(bands(&output).unwrap(), 3);
-        eprintln!("Large PLY: {} bytes, {} points, {:.2}s; compression rejected by budget; temporary fixture removed on exit",info.file_size,info.splat_count,started.elapsed().as_secs_f64());
+        eprintln!("Large PLY: {} bytes, {} points, {:.2}s; no estimated-memory gate; temporary fixture removed on exit",info.file_size,info.splat_count,started.elapsed().as_secs_f64());
     }
     async fn fixture(root: &Path, format: ModelFormat) -> ModelExportSession {
         let id = Uuid::new_v4();
@@ -964,7 +947,6 @@ mod tests {
             &source,
             GaussianTransform::default(),
             GaussianExportEdits::default(),
-            None,
             |_, _| {},
             || Ok(()),
         )
@@ -1024,6 +1006,43 @@ mod tests {
         drop(s);
         assert!(!output.exists());
     }
+    #[tokio::test]
+    async fn prepared_view_reads_before_encoding_without_an_output_and_rechecks_source_and_revision(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fixture(dir.path(), ModelFormat::Spz).await;
+        std::fs::remove_file(&s.output).unwrap();
+        s.encoding.lock().await.format = None;
+        std::fs::write(dir.path().join("edit.spz"), b"existing export").unwrap();
+        assert_eq!(read_chunk(&s, false, 0, 3).await.unwrap(), b"ply");
+        assert!(!s.output.exists());
+        assert!(write_chunk(&s, 0, vec![1]).await.is_err());
+        assert!(publish(
+            &s,
+            Some(ModelValidation {
+                splat_count: 2,
+                sh_bands: 3
+            })
+        )
+        .await
+        .is_err());
+        assert!(check_current_export(&s, &s.source, s.revision).is_ok());
+        assert!(check_current_export(&s, &s.source, s.revision + 1).is_err());
+        assert!(check_current_export(&s, &dir.path().join("replacement.ply"), s.revision).is_err());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s.source)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(read_chunk(&s, false, 0, 3).await.is_err());
+        assert!(!s.output.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("edit.spz")).unwrap(),
+            b"existing export"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_tokens_and_old_cleanup_do_not_touch_current_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -1106,28 +1125,67 @@ mod tests {
         assert!(!s.output.exists());
     }
     #[test]
-    fn memory_estimates_are_conservative_and_overflow_safe() {
-        let info = PlyInfo {
-            file_size: 49_435_829,
-            splat_count: 209_467,
+    fn preparation_metadata_has_no_compression_budget_or_permission_fields() {
+        let prepared = PreparedModelExport {
+            export_id: Uuid::nil(),
+            file_size: 3 * 1024 * MIB,
+            splat_count: 5_000_000,
+            sh_bands: 3,
         };
-        assert_eq!(estimate(&info), 390_535_614);
-        assert!(
-            estimate(&PlyInfo {
-                file_size: 1_180_000_000,
-                splat_count: 5_000_000
-            }) > 512 * MIB
-        );
-        assert_eq!(memory_budget(None), 256 * MIB);
-        assert_eq!(memory_budget(Some(8 * 1024 * MIB)), 512 * MIB);
-        assert_eq!(memory_budget(Some(512 * MIB)), 128 * MIB);
-        assert_eq!(
-            estimate(&PlyInfo {
-                file_size: u64::MAX,
-                splat_count: u64::MAX
+        let json = serde_json::to_value(prepared).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 4);
+        assert_eq!(json["fileSize"], 3 * 1024 * MIB);
+        for removed in [
+            "estimatedMemoryBytes",
+            "memoryBudgetBytes",
+            "compressionAllowed",
+        ] {
+            assert!(json.get(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn virtual_view_accepts_filtered_models_above_former_memory_thresholds() {
+        use crate::project::GaussianCrop;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.ply");
+        gaussian_fixture(&input, 400_000);
+        let mut mask = vec![0; 400_000_usize.div_ceil(8)];
+        mask[0] = 1;
+        for crop in [
+            None,
+            Some(GaussianCrop::Sphere {
+                center: [0.0; 3],
+                radius: 1000.0,
+                inverted: false,
             }),
-            u64::MAX
-        );
+        ] {
+            let mut view = EditedPlyView::open(
+                &input,
+                GaussianTransform::default(),
+                GaussianExportEdits {
+                    crop,
+                    deleted_mask: Some(&mask),
+                },
+                |_, _| {},
+                || Ok(()),
+            )
+            .unwrap();
+            let info = view.info();
+            // Demonstrate this really exceeds the old cap, without retaining
+            // the removed estimate as a production resource policy.
+            let former_estimate = 6 * info.file_size + 128 * info.splat_count + 64 * MIB;
+            assert!(former_estimate > 512 * MIB);
+            assert_eq!(info.splat_count, 399_999);
+            assert_eq!(view.sh_bands(), 3);
+            assert!(!view
+                .read(info.file_size - 16, 16, || Ok(()))
+                .unwrap()
+                .is_empty());
+            assert!(view.read(0, 1, || Err(SplatError::Cancelled)).is_err());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(inspect_gaussian_ply(&input).unwrap().splat_count, 400_000);
     }
     #[test]
     fn formats_are_a_closed_set_and_paths_are_fixed() {

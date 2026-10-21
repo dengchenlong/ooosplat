@@ -1,34 +1,38 @@
 export type ModelFormat = "ply" | "compressedPly" | "spz" | "sog";
+export interface SpzAdjustment {
+    center: [number, number, number];
+    scale: number;
+}
 export interface PreparedModelExport {
     exportId: string;
     fileSize: number;
     splatCount: number;
     shBands: number;
-    estimatedMemoryBytes: number;
-    memoryBudgetBytes: number;
-    compressionAllowed: boolean;
 }
 export interface ModelExportResult {
     path: string;
     fileSize: number;
     splatCount: number;
     format: ModelFormat;
+    coordinateAdjustment?: SpzAdjustment;
 }
 export interface ModelValidation {
     splatCount: number;
     shBands: number;
 }
-export interface ModelProgress {
+interface ModelProgressBase {
     exportId: string;
-    phase: "preparing" | "encoding" | "validating" | "publishing";
     progress: number | null;
     detail?: string;
 }
+export type ModelProgress = ModelProgressBase & (
+    | { phase: "preparing" | "encoding" | "validating" | "publishing" }
+    | { phase: "awaitingConfirmation"; confirmationId: number; adjustment: SpzAdjustment }
+);
 export interface ModelWorkerStart {
     type: "start";
     exportId: string;
     format: Exclude<ModelFormat, "ply">;
-    filename: string;
     sourceSize: number;
     splatCount: number;
     shBands: number;

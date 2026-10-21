@@ -18,7 +18,6 @@ use std::{
 pub const CONVERSION_VERSION: u32 = 1;
 pub const FOV_DEGREES: f64 = 92.0;
 pub const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_CACHE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
@@ -654,6 +653,26 @@ pub enum TrainingCacheUpdate {
     Validating,
 }
 
+// Validate representable sizes and the per-image decoder limit, not total disk usage.
+fn validate_training_cache_size(count: u64, width: u64, height: u64, face: u32) -> Result<()> {
+    let faces = count
+        .checked_mul(6)
+        .filter(|n| *n <= u32::MAX as u64)
+        .ok_or_else(|| process_error("Panorama image count overflow"))?;
+    faces
+        .checked_mul(face as u64)
+        .and_then(|n| n.checked_mul(face as u64))
+        .and_then(|n| n.checked_mul(6))
+        .ok_or_else(|| process_error("Panorama cache size overflow"))?;
+    let decoded = width.checked_mul(height).and_then(|n| n.checked_mul(4));
+    if width == 0 || height == 0 || decoded.is_none_or(|n| n > MAX_DECODE_BYTES) {
+        return Err(process_error(
+            "Panorama image exceeds the 512 MiB decode limit",
+        ));
+    }
+    Ok(())
+}
+
 pub fn prepare_training_cache(
     frames: &Path,
     masks: &Path,
@@ -697,24 +716,12 @@ pub fn prepare_training_cache(
     if poses.is_empty() {
         return Err(process_error("No registered panorama frames"));
     }
-    let predicted = (poses.len() as u64)
-        .checked_mul(6 * config.face_size as u64 * config.face_size as u64 * 6)
-        .ok_or_else(|| process_error("Cache budget overflow"))?;
-    let decoded = camera
-        .width
-        .checked_mul(camera.height)
-        .and_then(|n| n.checked_mul(4));
-    if predicted > MAX_CACHE_BYTES
-        || decoded.is_none_or(|n| n > MAX_DECODE_BYTES)
-        || camera.width == 0
-        || camera.height == 0
-    {
-        return Err(process_error(if config.image_sources.is_some() {
-            super::image_projection::OVER_BUDGET
-        } else {
-            "全景缓存超过首版资源预算（解码 512 MiB / 缓存 20 GiB），请降低档位或缩短视频"
-        }));
-    }
+    validate_training_cache_size(
+        poses.len() as u64,
+        camera.width,
+        camera.height,
+        config.face_size,
+    )?;
     let hashes = ["cameras.bin", "images.bin", "points3D.bin"]
         .into_iter()
         .map(|f| fingerprint_cancellable(&model.join(f), cancel))
@@ -926,6 +933,19 @@ pub fn prepare_training_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_cache_above_twenty_gib_keeps_decode_and_count_guards() {
+        // Former face-cache estimate: 1000 * 6 * 1024^2 * 6 > 20 GiB.
+        assert!(1000_u64 * 36 * 1024 * 1024 > 20 * 1024_u64.pow(3));
+        assert!(validate_training_cache_size(1000, 4096, 2048, 1024).is_ok());
+        assert!(validate_training_cache_size(1, 16_384, 8192, 1024).is_ok());
+        assert!(validate_training_cache_size(1, 16_386, 8193, 1024).is_err());
+        assert!(validate_training_cache_size(1, 0, 2048, 1024).is_err());
+        assert!(validate_training_cache_size(u64::MAX, 4096, 2048, 1024).is_err());
+        assert!(validate_training_cache_size(u32::MAX as u64 / 6 + 1, 64, 32, 16).is_err());
+        assert!(validate_training_cache_size(1, u64::MAX, 2, 1024).is_err());
+    }
 
     /// Density diagnostics only: retain registered poses/points, project the
     /// original source pixels at native resolution into an isolated cache.
@@ -1352,6 +1372,60 @@ mod tests {
         run(&changed);
         assert_eq!(image::image_dimensions(front).unwrap(), (12, 12));
     }
+    #[test]
+    fn incomplete_face_batches_are_cleaned_after_write_failure_or_mid_batch_cancel() {
+        for cancel_instead_of_write_failure in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (frames, masks, sparse, config) = fixture(temp.path());
+            let source_hash = fingerprint(&frames.join("frame_0000000000.png")).unwrap();
+            let model_hash = fingerprint(&sparse.join("points3D.bin")).unwrap();
+            let published_model = temp.path().join("final.ply");
+            fs::write(&published_model, b"existing result").unwrap();
+            let out = temp.path().join("training");
+            let token = tokio_util::sync::CancellationToken::new();
+            let result =
+                prepare_training_cache(&frames, &masks, &sparse, &out, &config, &token, |update| {
+                    if matches!(update, TrainingCacheUpdate::Faces { completed: 1, .. }) {
+                        if cancel_instead_of_write_failure {
+                            token.cancel();
+                        } else {
+                            // The next PNG write fails deterministically, without
+                            // filling the disk or relying on permission fixtures.
+                            fs::create_dir(out.join("images/erp_0000000099.partial/back.png"))
+                                .unwrap();
+                        }
+                    }
+                });
+            assert!(result.is_err());
+            if cancel_instead_of_write_failure {
+                assert!(matches!(result, Err(SplatError::Cancelled)));
+            }
+            assert!(!out.join("manifest.json").exists());
+            assert!(!out.join("images/erp_0000000099").exists());
+            assert!(!out.join("images/erp_0000000099.partial").exists());
+            assert_eq!(
+                fingerprint(&frames.join("frame_0000000000.png")).unwrap(),
+                source_hash
+            );
+            assert_eq!(
+                fingerprint(&sparse.join("points3D.bin")).unwrap(),
+                model_hash
+            );
+            assert_eq!(fs::read(published_model).unwrap(), b"existing result");
+            prepare_training_cache(
+                &frames,
+                &masks,
+                &sparse,
+                &out,
+                &config,
+                &tokio_util::sync::CancellationToken::new(),
+                |_| {},
+            )
+            .unwrap();
+            assert!(out.join("manifest.json").is_file());
+        }
+    }
+
     #[test]
     fn source_fingerprint_and_three_quality_budgets_are_stable() {
         let temp = tempfile::tempdir().unwrap();

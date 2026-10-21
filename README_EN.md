@@ -65,7 +65,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
 - **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
 
-Panorama folders need at least two same-sized images; a 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas, and private camera originals are unsupported, as are panorama reshoots. See the [video](docs/PANORAMA_VIDEO_V1.md) and [image support notes](docs/PANORAMA_IMAGES_V1.md) for formats, parameters, and verification limits.
+Panorama folders need at least two same-sized images; a 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas, and private camera originals are unsupported, as are panorama reshoots. Panorama caches no longer have a fixed 20 GiB cap; reserve enough disk space. The per-image decode limit remains 512 MiB. See the [video](docs/PANORAMA_VIDEO_V1.md) and [image support notes](docs/PANORAMA_IMAGES_V1.md) for formats, parameters, and verification limits.
 
 ### Gaussian Editing Shortcuts
 
@@ -475,7 +475,7 @@ The preview Export menu supports models, portrait/landscape video, and single-fi
 | SPZ v4 | Very small, lossy; sharing |
 | Bundled SOG | Typically higher compression, lossy; web presentation |
 
-SOG and SPZ are typically smaller; actual size varies and compression can affect detail. Processing starts only after selecting a format, without an intermediate PLY. The original `final.ply` stays unchanged, and failure or cancellation preserves existing exports. Choose standard PLY if compression exceeds the memory budget; SPZ also has a coordinate limit of approximately ±2048 scene units. See the [export notes and verification record](docs/model-export-verification.md).
+SOG and SPZ are typically smaller; actual size varies and compression can affect detail. Processing starts only after selecting a format, without an intermediate PLY. The original `final.ply` stays unchanged, and failure or cancellation preserves existing exports. Compression is no longer blocked by an estimated-memory threshold, but large models can still fail if memory runs out. If SPZ coordinates exceed its range, explicit confirmation is required to center and, if needed, uniformly shrink only the export copy. Position, dimensions, and units may change; export still stops if safe encoding is impossible. See the [export notes and verification record](docs/model-export-verification.md).
 
 Offline HTML preserves edits and supports viewing and animation playback, but not editing. Large models remain limited by device RAM and VRAM.
 

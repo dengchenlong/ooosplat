@@ -1229,13 +1229,15 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       const operation = createModelExport(store.descriptor.projectId, current.transform, current.editing.revision, format, (event) => {
         if (attempt !== modelAttemptRef.current) return;
         setGaussianExportProgress(event.progress);
-        setGaussianExportDialog({ phase: event.phase });
+        setGaussianExportDialog(event.phase === "awaitingConfirmation"
+          ? { phase: event.phase, exportId: event.exportId, confirmationId: event.confirmationId, adjustment: event.adjustment }
+          : { phase: event.phase });
       });
       modelOperationRef.current = operation;
       const result = await operation.export();
       if (attempt !== modelAttemptRef.current) return;
       setGaussianExportResult(result.path);
-      setGaussianExportDialog({ phase: "completed", path: result.path, fileSize: result.fileSize });
+      setGaussianExportDialog({ phase: "completed", path: result.path, fileSize: result.fileSize, coordinateAdjustment: result.coordinateAdjustment });
     } catch (error) {
       if (attempt === modelAttemptRef.current) {
         modelOperationRef.current = null; exportBusyRef.current = false;
@@ -1738,6 +1740,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       onRetry={() => void exportGaussian(modelFormat, true)}
       onReveal={(path) => void revealGaussianExport(path)}
       onCancel={() => void cancelModelExport()}
+      onConfirmAdjustment={(exportId, confirmationId) => modelOperationRef.current?.confirmAdjustment(exportId, confirmationId)}
       format={modelFormat}
     />
     {htmlConfirm && <div className="gaussian-save-backdrop" role="dialog" aria-modal="true" aria-labelledby="html-export-title" aria-describedby="html-export-description" onKeyDown={event => { if(event.key === "Escape")setHtmlConfirm(false); }}>
