@@ -49,7 +49,11 @@ def init_video_state(predictor, session: dict) -> dict:
         if not dst.is_file():
             _png_to_jpeg(Path(frame["path"]), dst)
 
-    state = predictor.init_state(video_path=str(frames_dir), offload_video_to_cpu=True)
+    state = predictor.init_state(
+        video_path=str(frames_dir),
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+    )
     return {
         "inference_state": state,
         "staged_dir": str(frames_dir),
@@ -176,9 +180,15 @@ def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
                 raw = raw.cpu()
             if hasattr(raw, "numpy"):
                 raw = raw.numpy()
-            cache[int(idx)] = np.asarray(raw) > 0.0
+            # Store packed bits (not float masks): the full-video cache at
+            # 1 bit/pixel is a few MB per clip, while float32 logits OOM long
+            # clips. Packed masks also stay available after propagation ends,
+            # so the per-frame drain loop can re-read any frame.
+            boolean = np.asarray(raw) > 0.0
+            cache[int(idx)] = (boolean.shape, np.packbits(boolean))
         sam2_state["propagated_upto"][object_id] = frame_index
 
     if frame_index not in cache:
         raise KeyError(f"SAM2 produced no mask for frame index {frame_index}")
-    return cache[frame_index]
+    shape, packed = cache[frame_index]
+    return np.unpackbits(packed)[: int(np.prod(shape))].reshape(shape) > 0
