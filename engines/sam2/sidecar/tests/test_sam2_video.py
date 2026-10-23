@@ -140,8 +140,9 @@ class TestAnchorRegistration:
         cache = state["propagated"]["obj"]
         assert 2 in cache and 3 in cache
         # The recomputed masks reflect the post-anchor geometry (columns 3:6).
-        assert cache[2][4, 5], "re-propagated frame must use the new guidance"
-        assert not cache[2][4, 2]
+        mask2 = sam2_video.decode_cached_mask(cache[2]) if hasattr(sam2_video, "decode_cached_mask") else cache[2]
+        assert mask2[4, 5], "re-propagated frame must use the new guidance"
+        assert not mask2[4, 2]
         assert mask0[3, 3], "frames before the anchor keep their original masks"
 
     def test_prompt_guidance_change_restarts_propagation(self):

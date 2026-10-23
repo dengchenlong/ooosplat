@@ -141,6 +141,12 @@ def _canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
+def decode_cached_mask(cached):
+    """Decode a packed cache entry back to a boolean mask."""
+    shape, packed = cached
+    return np.unpackbits(packed)[: int(np.prod(shape))].reshape(shape) > 0
+
+
 def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
     """Return the boolean mask for ``prompt``'s object at ``frame_index``.
 
@@ -190,5 +196,4 @@ def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
 
     if frame_index not in cache:
         raise KeyError(f"SAM2 produced no mask for frame index {frame_index}")
-    shape, packed = cache[frame_index]
-    return np.unpackbits(packed)[: int(np.prod(shape))].reshape(shape) > 0
+    return decode_cached_mask(cache[frame_index])
