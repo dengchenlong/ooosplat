@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::error::{Result, SplatError};
 use crate::reconstruction::colmap_model::{CameraIntrinsics, ImagePose};
-use crate::reconstruction::ply::stream_splat_cores;
+use crate::reconstruction::ply::{stream_splat_cores, SplatCore};
 
 /// Pinhole (+ optional distortion) projection for one COLMAP camera.
 ///
@@ -258,6 +258,22 @@ pub struct VoteConfig {
     pub vote_threshold: f64,
     pub footprint_dilation_px: f64,
     pub frame_fill_ratio: f64,
+    /// Relative depth slack for the per-frame z-buffer visibility test: a
+    /// splat counts as visible in a frame while its camera-space depth stays
+    /// within `front_depth * (1 + depth_tolerance)`.
+    ///
+    /// 3% is calibrated against the synthetic occlusion scene
+    /// (`occluded_background_plane_behind_object_does_not_vote`): the hidden
+    /// plane sits 0.5 units behind the cube's front face, i.e. 5.1% of the
+    /// 9.8-unit viewing depth, while surface jitter between neighbouring
+    /// splats of the *same* object stays well under 1% of that depth. 3%
+    /// therefore separates "same surface, slightly off" from "one object
+    /// behind another" with margin on both sides: it absorbs depth noise and
+    /// the half-resolution cell quantisation, yet rejects a 0.5-unit
+    /// occlusion even at close range. Larger values (>= 5%) start letting the
+    /// hidden plane back in, smaller values start dropping visible object
+    /// splats on noisy clouds.
+    pub depth_tolerance: f64,
 }
 
 impl Default for VoteConfig {
@@ -266,6 +282,7 @@ impl Default for VoteConfig {
             vote_threshold: 0.6,
             footprint_dilation_px: 2.0,
             frame_fill_ratio: 0.5,
+            depth_tolerance: 0.03,
         }
     }
 }
@@ -275,6 +292,14 @@ impl Default for VoteConfig {
 pub struct VoteOutcome {
     pub splat_count: u64,
     /// yes-votes / visible-frame ratio per splat, in PLY vertex order.
+    ///
+    /// A frame is *visible* when the splat projects inside the image **and**
+    /// survives the per-frame z-buffer test, i.e. it is not hidden behind a
+    /// nearer splat. Occluded frames therefore leave the denominator alone
+    /// instead of counting as no-votes: the ratio answers "of the views that
+    /// can actually see this splat, in how many is it part of the masked
+    /// object", which keeps the far side of a real object above threshold
+    /// while splats hidden behind the object never accumulate evidence.
     pub ratios: Vec<f32>,
     /// `ratios[i] >= vote_threshold` — object candidates before clustering.
     pub candidates: Vec<bool>,
@@ -304,10 +329,145 @@ impl VoteOutcome {
     }
 }
 
+/// Resolution divisor for the per-frame depth buffer. Half resolution costs
+/// `ceil(w/2) * ceil(h/2) * 4` bytes per frame — 518 KB for a 540x960 capture,
+/// ~79 MB for the 153-frame P1 set — and is plenty: the test only has to tell
+/// "front surface of the object" from "one object behind another", a gap of
+/// tens of pixels in projection, not sub-pixel depth.
+const DEPTH_DOWNSAMPLE: u32 = 2;
+
+/// Per-frame coarse z-buffer holding the front-most splat depth per cell.
+///
+/// Rasterising the cloud once per frame is O(splats x frames) writes and makes
+/// each visibility test O(1); rescanning the cloud per vote would be
+/// O(splats^2 x frames). Cells no splat ever projected into stay
+/// `f32::INFINITY` and never veto a vote — absence of evidence is not
+/// occlusion.
+#[derive(Debug, Clone)]
+struct DepthBuffer {
+    downsample: u32,
+    width: u32,
+    height: u32,
+    /// Row-major minimum depth per cell; `f32::INFINITY` marks an empty cell.
+    depths: Vec<f32>,
+}
+
+impl DepthBuffer {
+    fn new(image_width: u32, image_height: u32) -> Self {
+        let downsample = if image_width >= DEPTH_DOWNSAMPLE && image_height >= DEPTH_DOWNSAMPLE {
+            DEPTH_DOWNSAMPLE
+        } else {
+            1
+        };
+        let width = image_width.div_ceil(downsample).max(1);
+        let height = image_height.div_ceil(downsample).max(1);
+        Self {
+            downsample,
+            width,
+            height,
+            depths: vec![f32::INFINITY; width as usize * height as usize],
+        }
+    }
+
+    /// Records the splat's depth across its footprint disk, keeping the
+    /// minimum. The radius is clamped to `[1, 3]` cells: the one-cell floor is
+    /// the depth equivalent of `footprint_dilation_px` (neighbouring cells
+    /// inherit the front depth of a splat that landed just next door, which
+    /// keeps the test usable on sparsely sampled surfaces), and the three-cell
+    /// ceiling stops a single close-up splat from smearing over the frame.
+    fn rasterize(&mut self, frame: &FrameView, splat: &SplatCore) {
+        let Some(pixel) = frame.projection.world_to_pixel(&frame.pose, splat.position) else {
+            return;
+        };
+        let depth = frame.projection.depth(&frame.pose, splat.position);
+        if !pixel[0].is_finite() || !pixel[1].is_finite() || !depth.is_finite() {
+            return;
+        }
+        let downsample = f64::from(self.downsample);
+        let centre_x = pixel[0] / downsample;
+        let centre_y = pixel[1] / downsample;
+        let radius = (frame
+            .projection
+            .footprint_radius_px(splat.scale, depth)
+            / downsample)
+            .clamp(1.0, 3.0);
+        let depth = depth as f32;
+        let r2 = radius * radius;
+        for y in (centre_y - radius).floor() as i64..=(centre_y + radius).ceil() as i64 {
+            if y < 0 || y >= i64::from(self.height) {
+                continue;
+            }
+            for x in (centre_x - radius).floor() as i64..=(centre_x + radius).ceil() as i64 {
+                if x < 0 || x >= i64::from(self.width) {
+                    continue;
+                }
+                let dx = x as f64 - centre_x;
+                let dy = y as f64 - centre_y;
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                let cell = &mut self.depths[y as usize * self.width as usize + x as usize];
+                if depth < *cell {
+                    *cell = depth;
+                }
+            }
+        }
+    }
+
+    /// Front-most depth recorded for the cell covering image pixel `(x, y)`,
+    /// or `None` when nothing projected there.
+    fn front_depth(&self, x: f64, y: f64) -> Option<f64> {
+        let downsample = f64::from(self.downsample);
+        let cx = (x / downsample).floor();
+        let cy = (y / downsample).floor();
+        if cx < 0.0 || cy < 0.0 {
+            return None;
+        }
+        let (cx, cy) = (cx as u32, cy as u32);
+        if cx >= self.width || cy >= self.height {
+            return None;
+        }
+        let depth = self.depths[cy as usize * self.width as usize + cx as usize];
+        depth.is_finite().then(|| f64::from(depth))
+    }
+}
+
+/// Rasterises the whole cloud into one coarse depth buffer per frame.
+///
+/// This is a first streaming pass over the PLY; `vote_splats` then runs a
+/// second pass to cast the votes. Both are O(splats x frames) — the cloud is
+/// never materialised, only read, and the buffers are the only extra state.
+fn build_depth_buffers(
+    ply_path: &Path,
+    frames: &[FrameView],
+    batch_size: usize,
+) -> Result<Vec<DepthBuffer>> {
+    let mut buffers: Vec<DepthBuffer> = frames
+        .iter()
+        .map(|frame| DepthBuffer::new(frame.mask.width(), frame.mask.height()))
+        .collect();
+    stream_splat_cores(ply_path, batch_size, &mut |batch| {
+        for splat in batch {
+            for (buffer, frame) in buffers.iter_mut().zip(frames) {
+                buffer.rasterize(frame, splat);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(buffers)
+}
+
 /// Votes every splat of a binary Gaussian PLY against the per-frame masks.
 ///
+/// Visibility is decided per frame against a coarse z-buffer: a splat votes
+/// only when it projects inside the mask **and** is not hidden behind a nearer
+/// splat in that pixel (see [`DepthBuffer`]). Without that test, background
+/// points behind the object project inside the mask in almost every frame and
+/// reach a vote ratio near 1.0 — the defect behind issue #13.
+///
 /// The PLY is streamed in `batch_size`-splat batches (see
-/// `stream_splat_cores`); only the compact masks and the per-splat vote
+/// `stream_splat_cores`), twice: once to build the depth buffers, once to
+/// vote. Only the compact masks, the depth buffers and the per-splat vote
 /// vectors stay in memory, so multi-GB `final.ply` files never get
 /// materialised. `final.ply` is opened read-only.
 pub fn vote_splats(
@@ -321,6 +481,7 @@ pub fn vote_splats(
             "反投影投票需要至少一帧带 mask 的画面".into(),
         ));
     }
+    let depth_buffers = build_depth_buffers(ply_path, frames, batch_size)?;
     let mut outcome = VoteOutcome {
         splat_count: 0,
         ratios: Vec::new(),
@@ -330,7 +491,7 @@ pub fn vote_splats(
         for splat in batch {
             let mut yes = 0_u32;
             let mut visible = 0_u32;
-            for frame in frames {
+            for (frame, depth_buffer) in frames.iter().zip(&depth_buffers) {
                 let Some(pixel) = frame.projection.world_to_pixel(&frame.pose, splat.position)
                 else {
                     continue;
@@ -342,8 +503,15 @@ pub fn vote_splats(
                 if pixel[0] < 0.0 || pixel[1] < 0.0 || pixel[0] >= width || pixel[1] >= height {
                     continue;
                 }
-                visible += 1;
                 let depth = frame.projection.depth(&frame.pose, splat.position);
+                if let Some(front_depth) = depth_buffer.front_depth(pixel[0], pixel[1]) {
+                    // Hidden behind a nearer splat: this frame cannot see the
+                    // splat, so it contributes neither a vote nor visibility.
+                    if depth > front_depth * (1.0 + config.depth_tolerance) {
+                        continue;
+                    }
+                }
+                visible += 1;
                 let radius = frame.projection.footprint_radius_px(splat.scale, depth)
                     + config.footprint_dilation_px;
                 if frame.mask.coverage_in_disk(pixel[0], pixel[1], radius)
@@ -983,6 +1151,28 @@ mod tests {
         assert!(plane_ratios.iter().all(|ratio| *ratio < 0.6));
     }
 
+    #[test]
+    fn depth_buffer_keeps_the_front_most_splat_per_cell() {
+        let mask = rect_mask(64, 48, 0, 0, 0, 0);
+        let view = frame([0.0, 0.0, 0.0], &mask);
+        let mut buffer = DepthBuffer::new(64, 48);
+        // All three splats project onto the principal point (32, 24); only
+        // the nearest one may own that cell.
+        let splat_at = |depth: f64| SplatCore {
+            position: [0.0, 0.0, depth],
+            scale: [0.005_f64.ln(); 3],
+        };
+        for depth in [10.0, 8.0, 12.0] {
+            buffer.rasterize(&view, &splat_at(depth));
+        }
+        assert_eq!(buffer.front_depth(32.0, 24.0), Some(8.0));
+        // Half resolution: one cell spans 2x2 pixels.
+        assert_eq!(buffer.front_depth(33.0, 25.0), Some(8.0));
+        // A cell nothing projected into carries no occlusion information.
+        assert_eq!(buffer.front_depth(0.0, 0.0), None);
+        assert_eq!(buffer.front_depth(200.0, 200.0), None);
+    }
+
     // ---- connected components / DBSCAN cleanup --------------------------
 
     #[test]
@@ -1420,12 +1610,26 @@ mod tests {
         );
 
         // Voting: object points must vote far above background points. The
-        // worst background splats sit on a view axis (2/6 views covered by
-        // the object silhouette) and still stay below the 0.6 threshold.
+        // worst background splats sit near a view axis: the object silhouette
+        // covers them in 2 of the 6 views, and those 2 frames are also the
+        // ones the z-buffer hides them in, so with occlusion-aware voting the
+        // ratio becomes 2 yes / 4 visible instead of 2 yes / 6 in-image
+        // frames. The denominator is now conditional on visibility, so the
+        // invariant to assert is the decision boundary itself: no background
+        // splat may reach the candidate threshold.
         assert!(mean(object_ratios) > 0.9, "object mean ratio too low");
+        let worst_background = background_ratios
+            .iter()
+            .cloned()
+            .fold(f32::MIN, f32::max);
         assert!(
-            background_ratios.iter().cloned().fold(f32::MIN, f32::max) < 0.5,
-            "a background splat voted too high"
+            worst_background < VoteConfig::default().vote_threshold as f32,
+            "a background splat reached the candidate threshold: {worst_background}"
+        );
+        assert!(
+            mean(background_ratios) < 0.1,
+            "background splats still accumulate object votes: mean={}",
+            mean(background_ratios)
         );
         assert_eq!(
             outcome.candidates.iter().filter(|c| **c).count(),
