@@ -877,6 +877,112 @@ mod tests {
         assert!(vote_splats(&ply, &[], &VoteConfig::default(), 8).is_err());
     }
 
+    // ---- occlusion / visibility (issue #13) ------------------------------
+
+    /// Samples a `steps x steps` grid on the plane `z = depth`, spanning
+    /// `±half` in x and y. `steps >= 2`.
+    fn face_points(depth: f64, half: f64, steps: usize, state: &mut u64) -> Vec<[f64; 3]> {
+        let mut points = Vec::with_capacity(steps * steps);
+        for i in 0..steps {
+            for j in 0..steps {
+                let u = i as f64 / (steps - 1) as f64;
+                let v = j as f64 / (steps - 1) as f64;
+                points.push([
+                    half * (2.0 * u - 1.0) + 0.001 * lcg(state),
+                    half * (2.0 * v - 1.0) + 0.001 * lcg(state),
+                    depth,
+                ]);
+            }
+        }
+        points
+    }
+
+    /// Synthetic occlusion scene: a cube seen face-on with a background plane
+    /// 0.5 units behind its back face.
+    ///
+    /// Camera: PINHOLE f = 800, principal point (32, 24), identity pose, so a
+    /// point at depth `z` projects to `px = 32 + 800 * x / z`.
+    ///
+    /// | group      | depth | half extent | projected span (px) |
+    /// |------------|-------|-------------|---------------------|
+    /// | front face | 9.8   | 0.18        | 17.3 .. 46.7        |
+    /// | back face  | 10.2  | 0.18        | 17.1 .. 45.9        |
+    /// | plane      | 10.7  | 0.15        | 20.8 .. 43.2        |
+    ///
+    /// The mask rectangle x 14..50, y 6..42 covers the whole cube silhouette,
+    /// so every plane splat projects *inside* the mask in every frame while
+    /// sitting 0.5 units behind the cube's front face. With mask-only voting
+    /// those background splats vote yes in every frame (ratio 1.0) and sail
+    /// through the 0.6 threshold — exactly the P1 failure in issue #13.
+    ///
+    /// Returns `(splats, front_len, back_len)`; the plane is the remainder.
+    fn cube_and_occluded_plane() -> (Vec<[f64; 3]>, usize, usize) {
+        let mut state = 0x0b1e_c7ed_u64;
+        let front = face_points(9.8, 0.18, 25, &mut state);
+        let back = face_points(10.2, 0.18, 15, &mut state);
+        let plane = face_points(10.7, 0.15, 15, &mut state);
+        let (front_len, back_len) = (front.len(), back.len());
+        let mut splats = front;
+        splats.extend(back);
+        splats.extend(plane);
+        (splats, front_len, back_len)
+    }
+
+    #[test]
+    fn occluded_background_plane_behind_object_does_not_vote() {
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("occlusion.ply");
+        let (splats, front_len, back_len) = cube_and_occluded_plane();
+        write_scene_cloud(&ply, &splats);
+
+        // Four near-identical viewpoints (a small arc, like the P1 capture):
+        // the object silhouette stays inside the mask and the plane stays
+        // hidden behind it.
+        let mask = rect_mask(64, 48, 14, 6, 50, 42);
+        let frames = vec![
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.01, 0.0, 0.0], &mask),
+            frame([-0.01, 0.0, 0.0], &mask),
+            frame([0.0, 0.01, 0.0], &mask),
+        ];
+        let outcome = vote_splats(&ply, &frames, &VoteConfig::default(), 128).unwrap();
+
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let object_ratios = &outcome.ratios[..front_len];
+        let back_ratios = &outcome.ratios[front_len..front_len + back_len];
+        let plane_ratios = &outcome.ratios[front_len + back_len..];
+        println!(
+            "[acceptance] occlusion scene: visible front face mean={:.3} min={:.3}; hidden back face mean={:.3} max={:.3}; hidden plane mean={:.3} max={:.3}",
+            mean(object_ratios),
+            object_ratios.iter().cloned().fold(f32::MAX, f32::min),
+            mean(back_ratios),
+            back_ratios.iter().cloned().fold(f32::MIN, f32::max),
+            mean(plane_ratios),
+            plane_ratios.iter().cloned().fold(f32::MIN, f32::max),
+        );
+
+        // The visible front face must keep voting ~1.0: the fix may only
+        // remove hidden splats, never weaken genuinely visible object votes.
+        assert!(
+            mean(object_ratios) > 0.95,
+            "visible object splats lost votes: mean={}",
+            mean(object_ratios)
+        );
+        assert!(object_ratios.iter().all(|ratio| *ratio > 0.6));
+        // Both hidden groups must stay below the candidate threshold.
+        assert!(
+            mean(back_ratios) < 0.6,
+            "occluded cube back face voted {:.3} (must be < 0.6)",
+            mean(back_ratios)
+        );
+        assert!(
+            mean(plane_ratios) < 0.6,
+            "occluded background plane voted {:.3} (must be < 0.6)",
+            mean(plane_ratios)
+        );
+        assert!(plane_ratios.iter().all(|ratio| *ratio < 0.6));
+    }
+
     // ---- connected components / DBSCAN cleanup --------------------------
 
     #[test]
