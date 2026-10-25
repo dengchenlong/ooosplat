@@ -248,21 +248,12 @@ fn resolve_train_output(
     alternate: PathBuf,
 ) -> Result<PathBuf> {
     if !output.success {
-        let detail = output.failure_detail();
-        if is_out_of_memory_detail(&detail) {
-            return Err(SplatError::BrushOutOfMemory(detail));
-        }
-        if is_device_lost_detail(&detail) {
-            return Err(SplatError::BrushDeviceLost(detail));
-        }
-        return Err(SplatError::Process(format!(
-            "Brush 退出码 {:?}{}",
-            output.exit_code,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!("\n{detail}")
-            }
+        return Err(SplatError::EngineProcess(Box::new(
+            crate::failure::EngineProcessFailure::from_output(
+                crate::pipeline::PipelineEngine::Brush,
+                "train",
+                output,
+            ),
         )));
     }
     let candidate = if candidate.is_file() {
@@ -281,34 +272,6 @@ fn resolve_train_output(
         )));
     }
     Ok(candidate)
-}
-
-fn is_out_of_memory_detail(detail: &str) -> bool {
-    let normalized = detail.to_ascii_lowercase();
-    [
-        "out of memory",
-        "outofmemory",
-        "buffertoobig",
-        "buffer too big",
-        "failed to allocate",
-        "allocation failed",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
-}
-
-fn is_device_lost_detail(detail: &str) -> bool {
-    let normalized = detail.to_ascii_lowercase();
-    [
-        "devicelost",
-        "device lost",
-        "device_lost",
-        "parent device is lost",
-        "vk_error_device_lost",
-        "dxgi_error_device_removed",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
 }
 
 #[cfg(test)]
@@ -494,6 +457,7 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
+            termination: crate::process::ProcessTermination::default(),
             stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
             stderr: "Export at iteration 4 failed".into(),
         };
@@ -511,7 +475,7 @@ mod tests {
         };
         assert!(matches!(
             resolve_train_output(&failed, candidate, alternate),
-            Err(SplatError::BrushDeviceLost(_))
+            Err(SplatError::EngineProcess(ref failure)) if failure.classification.kind == Some("brush_device_lost")
         ));
     }
 
@@ -614,9 +578,12 @@ mod tests {
 
     #[test]
     fn gpu_failure_classifiers_keep_oom_and_device_loss_separate() {
-        assert!(is_out_of_memory_detail("OutOfMemory while allocating"));
-        assert!(is_out_of_memory_detail("BufferTooBig(2290420416)"));
-        assert!(is_out_of_memory_detail("GPU allocation failed"));
+        use crate::failure::{
+            device_lost as is_device_lost_detail, gpu_oom as is_out_of_memory_detail,
+        };
+        assert!(is_out_of_memory_detail("wgpu OutOfMemory while allocating"));
+        assert!(!is_out_of_memory_detail("BufferTooBig(2290420416)"));
+        assert!(!is_out_of_memory_detail("GPU allocation failed"));
         assert!(!is_out_of_memory_detail("DeviceLost: driver reset"));
         assert!(is_device_lost_detail("DeviceLost: driver reset"));
         assert!(is_device_lost_detail("Parent device is lost"));
@@ -633,6 +600,7 @@ mod tests {
         let output = ProcessOutput {
             success: false,
             exit_code: Some(101),
+            termination: crate::process::ProcessTermination::default(),
             stdout: "Refine iter 41001, 3476124 splats.".into(),
             stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
         };
@@ -642,7 +610,7 @@ mod tests {
                 PathBuf::from("absent.ply"),
                 PathBuf::from("absent.tmp.ply")
             ),
-            Err(SplatError::BrushOutOfMemory(_))
+            Err(ref error) if error.is_brush_oom()
         ));
     }
 }

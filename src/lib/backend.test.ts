@@ -16,6 +16,13 @@ import { probeAndPlan, prepareErrorReport,sendErrorReport,beginGaussianVideoExpo
 import { startPipeline } from './backend';
 
 describe("backend browser guards", () => {
+  it("preserves new failure classification and native termination when waiting for a task", async () => {
+    const termination = { exitCode: -1073740940, windowsStatus: "0xC0000374" };
+    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'failed', project_id: 'project',
+      error: { message: 'Could not register image', failed_stage: 'reconstructing', engine: 'colmap', classification: 'colmap_crash', classification_version: 1, classification_is_heuristic: false, termination } });
+    await expect(startPipeline('E:/input.mp4', 'balanced', 'E:/projects', false)).rejects.toMatchObject({ code: 'pipeline_failed', failureKind: 'colmap_crash', classificationVersion: 1, classificationIsHeuristic: false, termination });
+    expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
   it.each(['sequential', 'exhaustive', undefined] as const)('forwards image matching %s before starting exactly one task', async imageMatchingStrategy => {
     const result = { projectId: 'project' };
     mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'completed', result });

@@ -110,6 +110,9 @@ fn blank_environment() -> Environment {
 }
 fn reason(kind: Option<&str>) -> &'static str {
     match kind {
+        Some("brush_out_of_memory") => "GPU memory was exhausted during training.",
+        Some("brush_resource_limit") => "A required GPU resource exceeded the device or graphics backend limit; this does not necessarily mean GPU memory was exhausted.",
+        Some("colmap_crash") => "The COLMAP process terminated abnormally. The underlying cause is not yet known.",
         Some("mapper_source") => "The images could not be connected into a reconstruction.",
         Some("mapper_storage") => "The reconstruction files could not be read.",
         Some("brush_dataset") => {
@@ -430,6 +433,31 @@ pub async fn send_error_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn new_reports_use_the_same_root_classification_without_a_wire_schema_change() {
+        let service = DiagnosticService::default();
+        for (kind, phrase) in [
+            ("brush_out_of_memory", "GPU memory was exhausted"),
+            (
+                "brush_resource_limit",
+                "does not necessarily mean GPU memory was exhausted",
+            ),
+            ("colmap_crash", "underlying cause is not yet known"),
+        ] {
+            let id = service.capture(None, None, Some(kind), "exit_code: Some(-1073740940) (0xC0000374)\nFailed to read counts\nAn IO error happened", None, &[]).await;
+            let reports = service.reports.lock().unwrap();
+            let report = &reports.failures[&id].report;
+            assert_eq!(report.error_code, kind);
+            assert!(report.reason.contains(phrase));
+            assert!(report.detail.contains("-1073740940"));
+            assert!(report.detail.contains("0xC0000374"));
+            let json = serde_json::to_value(report).unwrap();
+            assert_eq!(json["schemaVersion"], 1);
+            assert_eq!(json.as_object().unwrap().len(), 12);
+            assert!(!json.as_object().unwrap().contains_key("termination"));
+        }
+    }
 
     #[test]
     fn diagnostic_default_uses_the_existing_telemetry_address() {

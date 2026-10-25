@@ -1367,6 +1367,27 @@ describe("App preview workspace", () => {
     expect(mocks.resumePipeline).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    ["brush_out_of_memory", "trainingSplats", "brush", "训练显存不足", "Not enough GPU memory for training"],
+    ["brush_resource_limit", "trainingSplats", "brush", "GPU 资源超出限制", "GPU resource limit exceeded"],
+    ["colmap_crash", "reconstructing", "colmap", "COLMAP 进程异常终止", "COLMAP terminated abnormally"],
+    ["mapper_storage", "reconstructing", "colmap", "重建文件访问失败", "Reconstruction file access failed"],
+    ["brush_dataset", "trainingSplats", "brush", "训练数据读取失败", "Training data could not be read"],
+    [undefined, "reconstructing", "colmap", "任务未能完成", "The task could not finish"],
+  ])("shows versioned %s guidance without inferring a different cause from raw logs", async (failureKind, failedStage, engine, zh, en) => {
+    const message = "wgpu error: Out of Memory\nAn IO error happened\nFailed to create any sparse model";
+    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message, failedStage, engine, failureKind, classificationVersion: 1, projectId: project.id });
+    await act(async () => useAppStore.setState({ projects: [{ ...project, status: "failed", finalPly: null, completedAt: null }] }));
+    await act(async () => [...container.querySelectorAll("button")].find(button => button.textContent === "继续任务")?.click());
+    await flush();
+    expect(container.querySelector(".failure-guidance-dialog h2")?.textContent).toBe(zh);
+    expect(container.querySelector(".inline-error .compact-error")?.textContent).toBe(zh);
+    expect(container.querySelector(".failure-guidance-dialog pre")?.textContent).toBe(message);
+    expect(container.querySelector(".failure-guidance-dialog")?.textContent).not.toContain("重新拍摄时缓慢");
+    await act(async () => container.querySelector<HTMLButtonElement>(".language-action")?.click());
+    expect(container.querySelector(".failure-guidance-dialog h2")?.textContent).toBe(en);
+  });
+
   it("classifies Brush dataset read errors separately and translates the open dialog", async () => {
     const unfinished = { ...project, status: "failed" as const, finalPly: null, completedAt: null };
     mocks.resumePipeline.mockRejectedValueOnce({

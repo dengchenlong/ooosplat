@@ -137,6 +137,10 @@ async fn run_colmap(
             serde_json::from_slice(&tokio::fs::read(camera_config).await?)?;
         apply_panorama_camera(&mut args, &config);
     }
+    let operation = args
+        .first()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let output = manager
         .run(ProcessSpec {
             executable: executable.to_path_buf(),
@@ -149,15 +153,12 @@ async fn run_colmap(
     if output.success {
         Ok(())
     } else {
-        let detail = output.failure_detail();
-        Err(SplatError::Process(format!(
-            "COLMAP 退出码 {:?}{}",
-            output.exit_code,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!("\n{detail}")
-            }
+        Err(SplatError::EngineProcess(Box::new(
+            crate::failure::EngineProcessFailure::from_output(
+                crate::pipeline::PipelineEngine::Colmap,
+                &operation,
+                &output,
+            ),
         )))
     }
 }
@@ -230,9 +231,9 @@ async fn run_mapper_with_ceres_fallback(
             .await?;
             Ok(())
         }
-        Err(ceres_error) => Err(SplatError::Process(format!(
-            "Caspar mapper failed and the automatic Ceres retry also failed.\nCaspar: {caspar_error}\nCeres: {ceres_error}"
-        ))),
+        // Cancellation/start/IO failures retain their own type; an earlier
+        // Caspar failure must not override the final attempt's outcome.
+        Err(error) => Err(error.with_previous_attempt(caspar_error)),
     }
 }
 
@@ -248,7 +249,8 @@ fn should_retry_mapper_with_ceres(
     selection: &super::colmap_ba::BaSelection,
     error: &SplatError,
 ) -> bool {
-    selection.gpu_index.is_some() && matches!(error, SplatError::Process(_))
+    selection.gpu_index.is_some()
+        && matches!(error, SplatError::Process(_) | SplatError::EngineProcess(_))
 }
 
 async fn append_log(path: &Path, message: &str) -> Result<()> {
@@ -1478,6 +1480,25 @@ mod tests {
             &caspar,
             &SplatError::Cancelled
         ));
+        let output = crate::process::ProcessOutput {
+            success: false,
+            exit_code: Some(-1073740940),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(-1073740940),
+                windows_status: Some("0xC0000374".into()),
+                ..Default::default()
+            },
+            stdout: String::new(),
+            stderr: "Could not register image".into(),
+        };
+        let error =
+            SplatError::EngineProcess(Box::new(crate::failure::EngineProcessFailure::from_output(
+                crate::pipeline::PipelineEngine::Colmap,
+                "mapper",
+                &output,
+            )));
+        assert!(should_retry_mapper_with_ceres(&caspar, &error));
+        assert!(!should_retry_mapper_with_ceres(&ceres, &error));
     }
 
     #[tokio::test]

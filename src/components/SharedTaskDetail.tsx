@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { CircleAlert, LoaderCircle, Play } from 'lucide-react';
 import { cancelSharedTask, startGuiTask, readSharedTaskLogs } from '../lib/backend';
-import { pipelineErrorMessage } from '../lib/pipelineError';
+import { pipelineErrorMessage, taskFailureContext } from '../lib/pipelineError';
 import { liveTrainingRemainingSeconds } from '../lib/runtimeEstimate';
 import { taskIsActive, type SharedTask } from '../types/tasks';
 import type { ColmapAccelerationStatus, ProjectSummary } from '../types/pipeline';
@@ -92,7 +92,7 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     {task.status === 'completed' && project && <ProjectResultStats project={project} detail={detail} inputImages={task.result?.inputImages} registeredImages={task.result?.registeredImages} />}
     <TaskConfiguration sourcePath={task.input_path} projectsRoot={task.projects_root} inputType={task.input_type ?? detail?.inputType ?? (/\.(mp4|mov)$/i.test(task.input_path) ? 'video' : 'images')} quality={task.quality} plannerEnabled={task.planner_enabled} completed={task.status === 'completed'} inheritedFrom={task.task_kind === 'reshoot' ? 'reshoot' : task.runs?.find(run => run.run_id === task.run_id)?.kind === 'resume' ? 'resume' : null} acceleration={[...events].reverse().find(event => event.acceleration)?.acceleration ?? acceleration} videoProjection={detail?.videoProjection} inputProjection={detail?.inputProjection} video={detail?.video} imageSequence={detail?.imageSequence} estimatedFrames={detail?.estimatedFrames} />
     {project?.taskKind !== "import" && project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
-    {error && <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={error} /></div>}
+    {error && <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={error} context={!actionError && !externalError ? taskFailureContext(task.error) : undefined} /></div>}
     {task.error?.classification_is_heuristic && <p className="project-failure">{locale === 'zh-CN' ? '错误分类为启发式判断，请结合日志确认。' : 'Error classification is heuristic; inspect logs for evidence.'}</p>}
     {task.status === 'created' && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => startGuiTask(task.task_id))}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('generate.start')}</button>}
     {resumable && onResume && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => onResume(project))}><Play size={16} fill="currentColor" />{t('project.continue')}</button>}

@@ -19,7 +19,7 @@ class WorkerFixture extends EventTarget {
   terminate() { this.terminated = true; }
 }
 
-function fixture(existingJob = false) {
+function fixture(existingJob = false, forceFrames?: () => () => void) {
   const app = new EventHandler() as EventHandler & { renderNextFrame: boolean; renderer: object; scene: EventHandler & { gsplat: { radialSorting: boolean } } };
   app.scene = Object.assign(new EventHandler(), { gsplat: { radialSorting: false } });
   const node = new GraphNode("camera");
@@ -35,7 +35,7 @@ function fixture(existingJob = false) {
   app.renderer = { gsplatDirector: { camerasMap: new Map([[camera, data]]), getCameraData: () => data } };
   sorter.setSortParameters({ command: "intervals", textureSize: 1, version: 1 });
   if (existingJob) sorter.setSortParams([{ x: -1 }], false);
-  const coordinator = new PreviewSortCoordinator(app as unknown as Application);
+  const coordinator = new PreviewSortCoordinator(app as unknown as Application, forceFrames);
   const worker = sorter.worker as unknown as WorkerFixture;
   const render = () => {
     sorter.applyPendingSorted();
@@ -56,6 +56,27 @@ describe("application-local latest-view sorting", () => {
     vi.unstubAllGlobals(); vi.useRealTimers();
   });
   const create = (existingJob = false) => { const f = fixture(existingJob); resources.push(f); return f; };
+
+  it("releases forced rendering on a ready frame, cancellation, timeout and scene destruction", async () => {
+    vi.useFakeTimers();
+    const releases: ReturnType<typeof vi.fn>[] = [];
+    const forceFrames = vi.fn(() => { const release = vi.fn(); releases.push(release); return release; });
+    const f = fixture(false, forceFrames); resources.push(f);
+    const ready = f.coordinator.waitForFrame(f.camera, new AbortController().signal, "timeout");
+    f.render(); f.worker.complete(); f.render(); await ready;
+    expect(releases[0]).toHaveBeenCalledTimes(1);
+    const cancel = new AbortController();
+    const cancelled = f.coordinator.waitForFrame(f.camera, cancel.signal, "timeout");
+    cancel.abort(); await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+    expect(releases[1]).toHaveBeenCalledTimes(1);
+    const timed = f.coordinator.waitForFrame(f.camera, new AbortController().signal, "timeout", 10);
+    const rejected = expect(timed).rejects.toThrow("timeout");
+    await vi.advanceTimersByTimeAsync(10); await rejected;
+    expect(releases[2]).toHaveBeenCalledTimes(1);
+    const destroyed = f.coordinator.waitForFrame(f.camera, new AbortController().signal, "timeout");
+    f.coordinator.destroy(); await expect(destroyed).rejects.toMatchObject({ name: "AbortError" });
+    expect(releases[3]).toHaveBeenCalledTimes(1);
+  });
 
   it("reissues a restored view dropped by a busy real PlayCanvas sorter, and waits for application plus rendering", async () => {
     const f = create();

@@ -24,6 +24,8 @@ import { UpdateNoticeDialog, UpdateSettingsRow } from "../components/UpdateNotic
 import { useUpdateNotice } from "./useUpdateNotice";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
+import { failureCopy, failureGuidanceKind } from "../lib/failureGuidance";
+import { taskFailureContext, type FailureContext } from "../lib/pipelineError";
 import { GaussianImportDialog } from "../components/GaussianImportDialog";
 import { ImportedProjectDetails } from "../components/ImportedProjectDetails";
 import {
@@ -61,7 +63,7 @@ type TaskGroupKey = "new" | "completed" | "unfinished";
 type TaskGroupVisibility = Record<TaskGroupKey, boolean>;
 const DEFAULT_TASK_GROUP_VISIBILITY: TaskGroupVisibility = { new: true, completed: true, unfinished: true };
 type DetailErrorSource = "action" | "detail" | "draft" | "persisted" | "global";
-type DetailErrorRecord = { message: string; occurredAt: number; source: DetailErrorSource; contextKey: string };
+type DetailErrorRecord = { message: string; occurredAt: number; source: DetailErrorSource; contextKey: string; errorContext?: FailureContext };
 type DraftDragHold = { pointerId: number; draftId: string; startX: number; startY: number; target: HTMLElement; timer: number; active: boolean };
 const ERROR_SOURCE_PRIORITY: Record<DetailErrorSource, number> = { action: 4, draft: 4, detail: 3, persisted: 2, global: 1 };
 
@@ -104,6 +106,7 @@ const loadTaskGroupVisibility = (): TaskGroupVisibility => {
 };
 type FailureDialogState = {
   kind: PipelineFailureKind | "generic";
+  classificationVersion?: number;
   projectId: string | null;
   rawMessage: string;
   failureId: string | null;
@@ -118,21 +121,13 @@ const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, timeoutMessag
   );
 });
 
-const inferFailureDialog = (error: unknown, fallbackStage?: string, fallbackProjectId?: string): FailureDialogState | null => {
+const inferFailureDialog = (error: unknown, fallbackProjectId?: string): FailureDialogState | null => {
   const structured = pipelineCommandError(error);
   if (structured?.code === "cancelled") return null;
-  const stage = structured?.failedStage ?? fallbackStage;
   const rawMessage = structured?.message ?? pipelineErrorMessage(error) ?? "";
-  let kind = structured?.failureKind;
-  if (!kind && stage === "reconstructing") kind = "mapper_source";
-  if (!kind && stage === "trainingSplats") {
-    kind = /devicelost|device lost|device_lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡设备连接中断/i.test(rawMessage)
-      ? "brush_device_lost"
-      : /early eof|failed to load dataset|i\/o error|io error|no such file|access denied|permission denied/i.test(rawMessage)
-        ? "brush_dataset"
-        : "brush_gpu";
-  }
-  return { kind: kind ?? "generic", projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
+  const kind = failureGuidanceKind(error);
+  if (kind == null) return null;
+  return { kind, classificationVersion: structured?.classificationVersion, projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
 };
 
 function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }: {
@@ -146,29 +141,11 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
   const [reportOpen, setReportOpen] = useState(false);
   const [reportSent, setReportSent] = useState(false);
   useEffect(() => { setReportOpen(false); setReportSent(false); }, [failure]);
-  const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage";
-  const dataset = failure.kind === "brush_dataset";
+  const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage" || failure.kind === "colmap_crash";
   const deviceLost = failure.kind === "brush_device_lost";
   const generic = failure.kind === "generic";
-  const title = generic ? t("failure.genericTitle") : mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
-  const description = generic ? t("failure.genericDescription") : failure.kind === "mapper_source"
-    ? t("failure.mapperSource")
-    : failure.kind === "mapper_storage"
-      ? t("failure.mapperStorage")
-      : dataset
-        ? t("failure.brushDataset")
-        : deviceLost
-          ? t("failure.brushDeviceLost")
-        : t("failure.brushGpu");
-  const tips: TranslationKey[] = generic ? ["failure.genericTip1", "failure.storageTip1"] : failure.kind === "mapper_source"
-    ? ["failure.mapperTip1", "failure.mapperTip2", "failure.mapperTip3"]
-    : failure.kind === "mapper_storage"
-      ? ["failure.storageTip1", "failure.storageTip2"]
-      : dataset
-        ? ["failure.datasetTip1", "failure.datasetTip2"]
-        : deviceLost
-          ? ["failure.deviceLostTip1", "failure.deviceLostTip2", "failure.deviceLostTip3"]
-        : ["failure.brushTip1", "failure.brushTip2", "failure.brushTip3"];
+  const copy = failureCopy(failure.kind, failure.classificationVersion);
+  const title = t(copy.title), description = t(copy.description), tips = copy.tips;
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -188,8 +165,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
         <button type="button" aria-label={t("common.close")} disabled={action !== null} onClick={onClose}><X size={17} /></button>
       </div>
       <p>{description}</p>
-      <strong>{t("failure.solutions")}</strong>
-      <ul>{tips.map((key) => <li key={key}>{t(key)}</li>)}</ul>
+      {tips.length > 0 && <><strong>{t("failure.solutions")}</strong><ul>{tips.map((key) => <li key={key}>{t(key)}</li>)}</ul></>}
       {failure.rawMessage && <details><summary>{t("failure.details")}</summary><pre>{deviceLost ? localizePipelineMessage(locale, failure.rawMessage) : failure.rawMessage}</pre></details>}
       <div className="failure-guidance-actions">
         <button type="button" className="secondary" disabled={action !== null || !failure.projectId} onClick={onOpenLogs}>{action === "logs" ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{t("failure.openLogs")}</button>
@@ -273,7 +249,7 @@ function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDe
 }) {
   const { t } = useI18n();
   const statusKeyByValue: Record<DraftDisplayStatus, TranslationKey> = { standby: "task.idle", preparing: "task.preparing", queued: "task.queued", running: "task.running" };
-  return <NewTaskRow draftId={draft.id} title={draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))} path={draft.inputPath} status={status} statusLabel={t(statusKeyByValue[status])} selected={selected} canReorder={!draft.running} error={draft.error} insertion={insertion} dragging={dragging} onSelect={onSelect} onDelete={onDelete} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerEnd={onPointerEnd} onKeyboardMove={onKeyboardMove} />;
+  return <NewTaskRow draftId={draft.id} title={draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))} path={draft.inputPath} status={status} statusLabel={t(statusKeyByValue[status])} selected={selected} canReorder={!draft.running} error={draft.error} errorContext={draft.errorContext} insertion={insertion} dragging={dragging} onSelect={onSelect} onDelete={onDelete} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerEnd={onPointerEnd} onKeyboardMove={onKeyboardMove} />;
 }
 
 
@@ -362,7 +338,7 @@ export function App() {
   const [projectEstimate, setProjectEstimate] = useState<{ projectId: string; value: Awaited<ReturnType<typeof estimateProjectRuntime>> } | null>(null);
   const [projectDetailLoading, setProjectDetailLoading] = useState(false);
   const [projectDetailError, setProjectDetailError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
-  const [projectActionError, setProjectActionError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
+  const [projectActionError, setProjectActionError] = useState<{ projectId: string; message: string; occurredAt: number; errorContext?: FailureContext } | null>(null);
   const [globalDetailError, setGlobalDetailError] = useState<DetailErrorRecord | null>(null);
   const dismissedErrorThrough = useRef(new Map<string, number>());
   const [dismissedErrorRevision, setDismissedErrorRevision] = useState(0);
@@ -436,7 +412,7 @@ export function App() {
         if (draft.id !== id) return draft;
         const patch = typeof update === "function" ? update(draft) : update;
         const errorStamp = Object.prototype.hasOwnProperty.call(patch, "error")
-          ? { errorAt: patch.error ? Date.now() : null }
+          ? { errorAt: patch.error ? Date.now() : null, errorContext: patch.errorContext }
           : {};
         return { ...draft, ...patch, ...errorStamp };
       }),
@@ -458,6 +434,7 @@ export function App() {
     const candidates: DetailErrorRecord[] = [];
     if (selectedDraft?.error && selectedDraft.error !== selectedDraft.inputError) candidates.push({
       message: selectedDraft.error,
+      errorContext: selectedDraft.errorContext,
       occurredAt: selectedDraft.errorAt ?? 0,
       source: "draft",
       contextKey: detailContextKey,
@@ -1361,7 +1338,7 @@ export function App() {
         setLiveElapsedMs(Math.max(backendElapsed, Date.now() - runStartedAt.current));
       }
       const message = messageOf(error);
-      updateDraft(draft.id, { error: message });
+      updateDraft(draft.id, { error: message, errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
@@ -1372,8 +1349,7 @@ export function App() {
         updateDraft(draft.id, { error: t('preflight.changed') });
       } else if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
       if (!cancelled && !taskBusy && !inputChanged) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage));
+        setFailureDialog(inferFailureDialog(error));
       }
     } finally {
       if (!succeeded) {
@@ -1429,14 +1405,13 @@ export function App() {
       const backendElapsed = useAppStore.getState().latestEvent?.elapsedMs ?? 0;
       setLiveElapsedMs(runElapsedOffset.current + backendElapsed);
       const message = messageOf(error);
-      setProjectActionError({ projectId: project.id, message, occurredAt: Date.now() });
+      setProjectActionError({ projectId: project.id, message, occurredAt: Date.now(), errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
       if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
       if (!cancelled && !taskBusy) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage, project.id));
+        setFailureDialog(inferFailureDialog(error, project.id));
       }
     } finally {
       if (!completedProject) {
@@ -1626,14 +1601,13 @@ export function App() {
       await refreshCompletedProject(promotion.project);
     } catch (error) {
       const message = messageOf(error);
-      updateDraft(draft.id, { error: message });
+      updateDraft(draft.id, { error: message, errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
       if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
       if (!cancelled && !taskBusy) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage));
+        setFailureDialog(inferFailureDialog(error));
       }
     } finally {
       if (!succeeded) {
@@ -1779,7 +1753,7 @@ export function App() {
     : stagePercent(store.latestEvent);
   const detailErrorDismissible = !selectedProject || selectedProject.status === "completed";
   const detailErrorBanner = visibleDetailError
-    ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
+    ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} context={visibleDetailError.errorContext} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
     : null;
   const projectConfigurationDetails = selectedProject && projectDetail
     ? projectDetail.imported
@@ -1799,7 +1773,7 @@ export function App() {
     return <NewTaskRow key={task.task_id} taskId={task.task_id} title={title} path={task.input_path}
       status={taskIsActive(task) ? "running" : task.status} statusLabel={taskStatusLabel(locale, task.status)}
       selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
-      canReorder={false} agentCreated={task.source === "mcp"} error={task.error?.message}
+      canReorder={false} agentCreated={task.source === "mcp"} error={task.error?.message} errorContext={taskFailureContext(task.error)}
       onSelect={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))} />;
   });
 

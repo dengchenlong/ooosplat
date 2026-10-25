@@ -25,7 +25,12 @@ async function verify() {
   localStorage.clear();
   localStorage.setItem("ooo-splat-language", locale);
   localStorage.setItem("ooo-splat-gizmo-mode-v1", "off");
-  mockIPC(() => undefined, { shouldMockEvents: true });
+  let videoCancels = 0, videoCommits = 0;
+  mockIPC(cmd => {
+    if (cmd === "begin_gaussian_video_export") return { exportId: "isolated-preview-video", destinationPath: "test-only.mp4" };
+    if (cmd === "cancel_gaussian_video_export") { videoCancels++; return; }
+    if (cmd === "commit_gaussian_video_export") { videoCommits++; throw Error("Verification must not publish a video"); }
+  }, { shouldMockEvents: true });
   const descriptor = await (await fetch("/descriptor.json")).json() as GaussianPreviewDescriptor;
   useGaussianTransformStore.getState().load({ ...descriptor, assetUrl: "/model.ply", editMaskAssetUrl: null });
   createRoot(document.getElementById("root")!).render(<LanguageProvider><GaussianViewer previewSessionId={1} onExit={() => undefined} onDisposed={() => undefined} pipelineRunning={false} /></LanguageProvider>);
@@ -47,6 +52,36 @@ async function verify() {
   const app = Application.getApplication();
   assert(app, "No real renderer");
   assert(app.graphicsDevice.deviceType === renderer, `Requested ${renderer}, actual ${app.graphicsDevice.deviceType}`);
+  assert(!app.autoRender, "Preview still renders continuously");
+  const frameTimes: number[] = [];
+  const rendered = app.on("postrender", () => frameTimes.push(performance.now()));
+  const idleChecks: Array<{ name: string; durationMs: number; frames: number }> = [];
+  const snapshot = async (name: string) => { const response = await fetch(`/snapshot?name=${name}`); assert(response.ok, "Could not capture verification screenshot"); };
+  const sorting = () => [...app.renderer.gsplatDirector!.camerasMap.values()].some(camera => [...camera.layersMap.values()].some(layer => {
+    const manager = layer.gsplatManager;
+    return manager && ((manager.cpuSorter?.jobsInFlight ?? 0) > 0 || manager.world.currentVersion !== manager.world.lastWorldStateVersion
+      || manager.world.awaitingLodUpdate || manager.world.pendingLoadCount > 0);
+  }));
+  const checkIdle = async (name: string, durationMs = 5000) => {
+    let quietAt = performance.now(), observedFrames = frameTimes.length;
+    await waitFor(() => {
+      if (observedFrames !== frameTimes.length || app.renderNextFrame || sorting()) { quietAt = performance.now(); observedFrames = frameTimes.length; }
+      return performance.now() - quietAt >= 1000;
+    }, `Preview ${name} never settled`);
+    const before = frameTimes.length;
+    await sleep(durationMs);
+    const frames = frameTimes.length - before;
+    idleChecks.push({ name, durationMs, frames });
+    assert(frames === 0, `Idle ${name} still rendered ${frames} frames`);
+  };
+  await checkIdle("adjust");
+  // Test-only same-model continuous baseline; immediately restore production policy.
+  const baselineStart = frameTimes.length;
+  app.autoRender = true; await sleep(500); app.autoRender = false;
+  const baselineFrames = frameTimes.length - baselineStart;
+  assert(baselineFrames > 0, "Continuous baseline did not draw");
+  const gizmoToggle = document.querySelector<HTMLButtonElement>('.transform-gizmo-control button')!;
+  gizmoToggle.click(); await checkIdle("gizmo"); await snapshot("gizmo"); gizmoToggle.click(); await sleep(100);
   const camera = app.root.findByName("OOOSplat Preview Camera")!;
   const canvas = app.graphicsDevice.canvas;
   // Synthetic PointerEvents cannot acquire native OS pointer capture. Keep capture
@@ -89,9 +124,9 @@ async function verify() {
   const beforeFly = camera.getPosition().clone();
   const flightHeight = 2 * saved().distance * Math.tan(camera.camera!.fov * Math.PI / 360);
   const flyStarted = performance.now();
-  const frameTimes: Array<{ frame: number; wall: number }> = [];
+  const flightFrameTimes: Array<{ frame: number; wall: number }> = [];
   let timingFrame = 0;
-  const observeFrame = (frame: number) => { frameTimes.push({ frame, wall: performance.now() }); timingFrame = requestAnimationFrame(observeFrame); };
+  const observeFrame = (frame: number) => { flightFrameTimes.push({ frame, wall: performance.now() }); timingFrame = requestAnimationFrame(observeFrame); };
   timingFrame = requestAnimationFrame(observeFrame);
   const flyKey = new KeyboardEvent("keydown", { code: "KeyW", key: "w", bubbles: true, cancelable: true });
   canvas.dispatchEvent(flyKey);
@@ -103,7 +138,7 @@ async function verify() {
   cancelAnimationFrame(timingFrame);
   assert(flyDistance > 0, "Focused WASD did not move");
   const flyMaximum = flightHeight * (flySeconds + 0.02);
-  assert(flyDistance <= flyMaximum + 0.00001, `Flight exceeded the zoom-relative speed: ${flyDistance} > ${flyMaximum}; height=${flightHeight}, start=${flyStarted}, seconds=${flySeconds}, frames=${JSON.stringify(frameTimes)}`);
+  assert(flyDistance <= flyMaximum + 0.00001, `Flight exceeded the zoom-relative speed: ${flyDistance} > ${flyMaximum}; height=${flightHeight}, start=${flyStarted}, seconds=${flySeconds}, frames=${JSON.stringify(flightFrameTimes)}`);
   const stopped = camera.getPosition().clone(); await sleep(100);
   assert(camera.getPosition().distance(stopped) < 1e-5, "Flight continued after key release");
   const checks = [];
@@ -115,6 +150,7 @@ async function verify() {
     // Direction can already match while the alignment animation is still
     // translating the camera. Let that transition finish before testing input.
     await sleep(400);
+    await checkIdle(name, 250);
     assert(camera.camera!.projection === PROJECTION_ORTHOGRAPHIC, "Fixed view must remain orthographic until Locate is clicked");
     const atRest = camera.getPosition().clone();
     canvas.focus();
@@ -156,7 +192,94 @@ async function verify() {
   const header = document.querySelector('.preview-header') ?? document.querySelector('.preview-input-hints')!.parentElement!;
   assert(header.scrollWidth <= header.clientWidth + 1, 'Header tips overflow');
   assert(header.getBoundingClientRect().right <= innerWidth + 1, 'Header is clipped by the browser viewport');
+  const cropBefore = useGaussianTransformStore.getState().editing;
+  const cropComparisons: Array<{ kind: string; meanByteDifference: number }> = [];
+  const canvasPixels = () => {
+    const copy = document.createElement("canvas"); copy.width = canvas.width; copy.height = canvas.height;
+    const context = copy.getContext("2d")!; context.drawImage(canvas, 0, 0);
+    return context.getImageData(0, 0, copy.width, copy.height).data;
+  };
+  for (const kind of ["sphere", "box"] as const) {
+    const crop = kind === "sphere" ? { kind, center: saved().target, radius: saved().distance * .5 }
+      : { kind, center: saved().target, size: [saved().distance, saved().distance, saved().distance] as [number, number, number] };
+    // Isolated in-memory UI fixture only; no edits are sent to a project.
+    useGaussianTransformStore.setState({ tool: kind, editing: { ...cropBefore, crop } });
+    await checkIdle(kind);
+    await snapshot(kind);
+    if (renderer === "webgl2") {
+      const idlePixels = canvasPixels();
+      app.autoRender = true; await sleep(500); app.autoRender = false;
+      const continuousPixels = canvasPixels();
+      let error = 0;
+      for (let i = 0; i < idlePixels.length; i++) error += Math.abs(idlePixels[i] - continuousPixels[i]);
+      const meanByteDifference = error / idlePixels.length;
+      cropComparisons.push({ kind, meanByteDifference });
+      await snapshot(`${kind}-continuous`);
+      assert(meanByteDifference < 1, `On-demand ${kind} differs from continuous rendering: ${meanByteDifference}`);
+    }
+  }
+  useGaussianTransformStore.setState({ tool: "transform", editing: cropBefore }); await sleep(100);
+  const animationName = locale === "en" ? "Animation" : "动画";
+  const splatComponent = app.root.findComponents("gsplat")[0] as import("playcanvas").GSplatComponent;
+  const animationSamples: Array<{ at: number; seconds: number }> = [];
+  const animationSampling = app.on("prerender", () => {
+    if (document.querySelector(".animation-time")) animationSamples.push({ at: performance.now(), seconds: Number(splatComponent.getParameter("uOoosplatAnimationTime")) });
+  });
+  button(animationName)!.click();
+  await waitFor(() => Boolean(document.querySelector(".animation-time")), "Did not enter Animation");
+  const animationFrameStart = frameTimes.length;
+  await sleep(1200);
+  await waitFor(() => animationSamples.length >= 2, "Animation did not produce two real frames");
+  animationSampling.off();
+  const firstAnimation = animationSamples[0], lastAnimation = animationSamples.at(-1)!;
+  const animationSeconds = lastAnimation.seconds - firstAnimation.seconds;
+  const animationWallSeconds = (lastAnimation.at - firstAnimation.at) / 1000;
+  const animationFrames = frameTimes.length - animationFrameStart;
+  // Sample the actual shader clock at frame submission, not React's throttled
+  // HUD: software GL can block a UI commit for longer than a whole frame.
+  assert(Math.abs(animationSeconds - animationWallSeconds) < .02, `Animation clock mismatch: ${animationSeconds} vs ${animationWallSeconds}`);
+  assert(animationSamples.length <= Math.ceil(animationWallSeconds * 60) + 2, "Animation exceeded 60 FPS");
+  document.querySelector<HTMLButtonElement>('.preview-export-menu > button')!.click(); await sleep(50);
+  const videoItem = button(locale === "en" ? "Export video" : "导出视频");
+  const videoSupported = Boolean(videoItem && !videoItem.disabled);
+  let videoFrameProgress = 0;
+  if (videoSupported) {
+    videoItem!.click();
+    await waitFor(() => {
+      videoFrameProgress = parseFloat(document.querySelector<HTMLElement>('.video-export-track > span')?.style.width ?? "0");
+      const error = document.querySelector('.video-export-error');
+      if (error) throw Error(error.textContent ?? "Video export failed");
+      return videoFrameProgress > 0;
+    }, "Video did not render/encode any frames");
+    button(locale === "en" ? "Cancel export" : "取消导出")!.click();
+    await waitFor(() => !document.querySelector('.video-export-overlay'), "Video cancel did not restore preview");
+    assert(videoCancels > 0 && videoCommits === 0, "Cancelled video was not released or was published");
+  } else document.querySelector<HTMLButtonElement>('.preview-export-menu > button')!.click();
+  button(locale === "en" ? "Adjust" : "调整")!.click();
+  await waitFor(() => Boolean(button(locateName) && !button(locateName)!.disabled), "Did not restore Adjust after Animation/export");
+  await checkIdle("after-animation", 250);
+  // The real training pose above retains roll. A user orbit must smoothly level
+  // it without modifying the world grid/model or zoom.
+  button(locateName)!.click(); await sleep(600);
+  await snapshot("rolled-reference");
+  const rolled = saved();
+  const initialRightY = camera.right.y;
+  for (const [type, x, buttons] of [["pointerdown", 120, 1], ["pointermove", 140, 1], ["pointerup", 140, 0]] as const) {
+    canvas.dispatchEvent(new PointerEvent(type, { pointerId: 2, button: 0, buttons, clientX: rect.left + x, clientY: rect.top + 180, bubbles: true }));
+  }
+  await sleep(400);
+  assert(Math.abs(saved().roll ?? 0) < 1e-6 && Math.abs(camera.right.y) < 1e-5, "Orbit did not level the horizon");
+  assert(Math.abs(saved().distance - rolled.distance) < 1e-5 && camera.camera!.fov === rolled.fov, "Leveling changed zoom");
+  await checkIdle("after-level", 250);
+  await snapshot("leveled");
+  const animationTimes = frameTimes.slice(animationFrameStart, animationFrameStart + animationFrames);
+  const minimumFrameMs = Math.min(...animationTimes.slice(1).map((t, i) => t - animationTimes[i]));
+  rendered.off();
   const proof = { renderer, locale, viewportWidth: innerWidth, viewportHeight: innerHeight, positionError, directionDot, focusReturned: true, immediateFlight: true,
+    idleChecks, baselineFrames, baselineMs: 500, minimumFrameMs, initialRightY, leveledRightY: camera.right.y,
+    backendAdapter: (app.graphicsDevice as unknown as { unmaskedRenderer?: string }).unmaskedRenderer ?? null,
+    animationSeconds, animationWallSeconds, animationFrames, videoSupported, videoFrameProgress, videoCancels, videoCommits,
+    cropComparisons,
     panDistance: moved, expectedPanDistance: expected, flyDistance, flySeconds, flyMaximum, orthographicReturns: checks, buttons };
   await fetch("/proof", { method: "POST", body: JSON.stringify(proof) });
 }

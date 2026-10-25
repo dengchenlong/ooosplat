@@ -31,6 +31,7 @@ export interface TaskDraft {
   reshootSource: ReshootSourceInfo | null;
   reshootPlan: ReshootInputInfo | null;
   error: string | null;
+  errorContext?: import('../lib/pipelineError').FailureContext;
   errorAt: number | null;
 }
 

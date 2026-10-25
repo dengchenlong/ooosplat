@@ -23,7 +23,7 @@ describe("OrbitAxisGuide", () => {
     expect(geometry.positions.some((point) => point.x > state.target[0])).toBe(true);
   });
 
-  it("only draws while visible and releases its update listener once", () => {
+  it("only draws on rendered frames while visible, caches geometry and releases its listener once", () => {
     const off = vi.fn();
     const drawLines = vi.fn();
     let draw: (() => void) | undefined;
@@ -38,16 +38,20 @@ describe("OrbitAxisGuide", () => {
     } as unknown as Application;
     const controls = { orbitGuideState: vi.fn(() => state) } as unknown as ViewerControls;
     const guide = new OrbitAxisGuide(app, controls, 8);
+    expect(app.on).toHaveBeenCalledWith("prerender", expect.any(Function));
 
     draw?.();
     expect(drawLines).not.toHaveBeenCalled();
     guide.setVisible(true);
     draw?.();
     expect(drawLines).toHaveBeenCalledWith(expect.any(Array), expect.any(Array), false, worldLayer);
+    const firstGeometry = drawLines.mock.calls[0][0];
+    draw?.(); expect(drawLines.mock.calls[1][0]).toBe(firstGeometry);
+    guide.setModelSpan(10); draw?.(); expect(drawLines.mock.calls[2][0]).not.toBe(firstGeometry);
     expect(guide.isVisible).toBe(true);
     guide.setVisible(false);
     draw?.();
-    expect(drawLines).toHaveBeenCalledTimes(1);
+    expect(drawLines).toHaveBeenCalledTimes(3);
     guide.destroy();
     guide.destroy();
     expect(off).toHaveBeenCalledTimes(1);

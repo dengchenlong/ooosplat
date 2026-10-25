@@ -5,6 +5,7 @@ const DEFAULT_YAW = 35;
 const DEFAULT_PITCH = 22;
 const DEFAULT_OCCUPANCY = 0.85;
 const VIEW_TRANSITION_MS = 320;
+const ROLL_LEVEL_MS = 180;
 const MAX_ORBIT_PITCH = 89.9;
 const ORBIT_POLE_EPSILON = 1e-6;
 const ROAM_VISIBLE_HEIGHT_PER_SECOND = 0.15;
@@ -82,6 +83,7 @@ export class ViewerControls {
   private transitionFrame = 0;
   private transitioning = false;
   private locating = false;
+  private leveling = false;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -144,13 +146,13 @@ export class ViewerControls {
     this._enabled = value;
     if (!value) {
       this.cancelGesture(); this.stopRoaming();
-      if (this.locating) this.stopNavigation();
+      if (this.locating || this.leveling) this.stopNavigation();
     }
   }
 
   setRoamingEnabled(value: boolean) {
     this.roamingEnabled = value;
-    if (!value) { this.stopRoaming(); if (this.locating) this.stopNavigation(); }
+    if (!value) { this.stopRoaming(); if (this.locating || this.leveling) this.stopNavigation(); }
   }
 
   get cameraDistance() {
@@ -395,6 +397,7 @@ export class ViewerControls {
     if (options.resetDirection) {
       this.yaw = DEFAULT_YAW;
       this.pitch = DEFAULT_PITCH;
+      this.roll = 0;
     }
 
     const occupancy = Math.max(0.5, Math.min(0.98, options.occupancy ?? DEFAULT_OCCUPANCY));
@@ -615,7 +618,7 @@ export class ViewerControls {
   private preventContextMenu = (event: MouseEvent) => event.preventDefault();
 
   private cancelViewTransition(preservePose = false) {
-    if (preservePose && this.transitioning) {
+    if (preservePose && this.transitioning && !this.leveling) {
       const forward = this.cameraEntity.forward.clone();
       const up = this.cameraEntity.up.clone();
       this.yaw = Math.hypot(forward.x, forward.z) < ORBIT_POLE_EPSILON ? 0 : Math.atan2(-forward.x, -forward.z) * 180 / Math.PI;
@@ -633,6 +636,32 @@ export class ViewerControls {
     this.transitionFrame = 0;
     this.transitioning = false;
     this.locating = false;
+    this.leveling = false;
+  }
+
+  private beginRollLeveling() {
+    if (this.leveling) return;
+    const startRoll = ((this.roll + 180) % 360 + 360) % 360 - 180;
+    if (Math.abs(startRoll) < 1e-6) { this.roll = 0; return; }
+    this.cancelViewTransition();
+    this.roll = startRoll;
+    this.transitioning = true;
+    this.leveling = true;
+    const started = performance.now();
+    const tick = (now: number) => {
+      if (this.destroyed || !this.leveling) return;
+      const t = Math.max(0, Math.min(1, (now - started) / ROLL_LEVEL_MS));
+      this.roll = t === 1 ? 0 : startRoll * (1 - t) ** 3;
+      this.updateCamera();
+      if (t < 1) this.transitionFrame = requestAnimationFrame(tick);
+      else {
+        this.transitionFrame = 0;
+        this.transitioning = false;
+        this.leveling = false;
+        this.onViewChange?.();
+      }
+    };
+    this.transitionFrame = requestAnimationFrame(tick);
   }
 
   stopNavigation() {
@@ -686,6 +715,7 @@ export class ViewerControls {
         this.orthographicView = null;
         this.onOrthographicViewChange?.(null, true);
       }
+      this.beginRollLeveling();
       this.yaw -= dx * 0.3;
       this.pitch = Math.max(-MAX_ORBIT_PITCH, Math.min(MAX_ORBIT_PITCH, this.pitch + dy * 0.3));
     } else {

@@ -80,8 +80,10 @@ describe("model gizmo transactions and lifecycle", () => {
     expect(native.intersectShapes.map((shape: any) => shape.entity.name)).toEqual(["arrow:x", "arrow:y", "arrow:z"]);
     const plane = native.allShapes.find((shape: any) => shape.entity.name === "plane:x");
     plane.entity.enabled = true; plane.visible = true;
+    const enabled = vi.spyOn(plane.entity, "enabled", "set");
     s.app.fire("prerender");
-    expect(plane.entity.enabled).toBe(false); expect(plane.visible).toBe(false);
+    expect(enabled).not.toHaveBeenCalled(); expect(plane.visible).toBe(false);
+    expect(plane.meshInstances.every((instance: { visible: boolean }) => !instance.visible)).toBe(true);
     s.canvas.dispatchEvent(new MouseEvent("pointerdown", { button: 0 }));
     expect(s.beforeStart).toHaveBeenCalledOnce();
     native.fire("transform:start");

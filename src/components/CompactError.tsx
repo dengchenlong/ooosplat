@@ -2,15 +2,16 @@ import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { localizePipelineMessage, useI18n } from "../i18n";
 import { errorSummaryKey, shortErrorMessage } from "../lib/errorSummary";
+import type { FailureContext } from "../lib/pipelineError";
 
-export function CompactError({ message }: { message: string }) {
+export function CompactError({ message, context }: { message: string; context?: FailureContext }) {
   const { locale, t } = useI18n();
   const id = useId();
   const anchor = useRef<HTMLSpanElement>(null);
   const tooltip = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [position, setPosition] = useState<CSSProperties | null>(null);
-  const summaryKey = errorSummaryKey(message);
+  const summaryKey = errorSummaryKey(message, context);
   const summary = summaryKey ? t(summaryKey) : shortErrorMessage(localizePipelineMessage(locale, message), locale === "en" ? 80 : 36);
 
   const cancelClose = () => {

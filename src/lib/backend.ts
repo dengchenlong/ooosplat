@@ -250,7 +250,7 @@ async function waitForSharedTask(taskId: string): Promise<PipelineResult> {
         revision = task.revision;
         if (taskIsActive(task)) return;
         if (task.status === 'completed' && task.result) resolve(task.result);
-        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, failureId: task.error?.failure_id, projectId: task.project_id });
+        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, classificationVersion: task.error?.classification_version, classificationIsHeuristic: task.error?.classification_is_heuristic, termination: task.error?.termination, failureId: task.error?.failure_id, projectId: task.project_id });
       };
       void (async () => {
         unsubscribe = await onTaskUpdate(update => apply(update.task));

@@ -1,7 +1,19 @@
 export type PipelineErrorCode = "cancelled" | "pipeline_failed";
-export type PipelineFailureKind = "mapper_source" | "mapper_storage" | "brush_gpu" | "brush_device_lost" | "brush_dataset";
+export type PipelineFailureKind = "mapper_source" | "mapper_storage" | "brush_gpu" | "brush_device_lost" | "brush_dataset" | "brush_out_of_memory" | "brush_resource_limit" | "colmap_crash";
 
-export interface PipelineCommandError {
+export interface FailureContext {
+  classificationVersion?: number;
+  failureKind?: PipelineFailureKind;
+}
+
+export interface ProcessTermination {
+  exitCode: number | null;
+  windowsStatus?: string;
+  signal?: number;
+  coreDumped?: boolean;
+}
+
+export interface PipelineCommandError extends FailureContext {
   code: PipelineErrorCode;
   message: string;
   failedStage?: string;
@@ -11,9 +23,17 @@ export interface PipelineCommandError {
   projectPath?: string;
   logsDirectory?: string;
   failureId?: string;
+  classificationIsHeuristic?: boolean;
+  termination?: ProcessTermination;
 }
 
-const failureKinds = new Set<PipelineFailureKind>(["mapper_source", "mapper_storage", "brush_gpu", "brush_device_lost", "brush_dataset"]);
+const failureKinds = new Set<PipelineFailureKind>(["mapper_source", "mapper_storage", "brush_gpu", "brush_device_lost", "brush_dataset", "brush_out_of_memory", "brush_resource_limit", "colmap_crash"]);
+
+export function taskFailureContext(error: { classification_version?: number | null; classification?: string | null } | null | undefined): FailureContext | undefined {
+  if (!error || error.classification_version == null) return undefined;
+  return { classificationVersion: error.classification_version,
+    failureKind: failureKinds.has(error.classification as PipelineFailureKind) ? error.classification as PipelineFailureKind : undefined };
+}
 
 export function pipelineCommandError(error: unknown): PipelineCommandError | null {
   if (typeof error !== "object" || error == null) return null;
@@ -33,10 +53,24 @@ export function pipelineCommandError(error: unknown): PipelineCommandError | nul
     failedStage: typeof candidate.failedStage === "string" ? candidate.failedStage : undefined,
     engine,
     failureKind,
+    classificationVersion: Number.isSafeInteger(candidate.classificationVersion) && Number(candidate.classificationVersion) > 0 ? Number(candidate.classificationVersion) : undefined,
+    classificationIsHeuristic: typeof candidate.classificationIsHeuristic === "boolean" ? candidate.classificationIsHeuristic : undefined,
+    termination: parseTermination(candidate.termination),
     projectId: typeof candidate.projectId === "string" ? candidate.projectId : undefined,
     projectPath: typeof candidate.projectPath === "string" ? candidate.projectPath : undefined,
     logsDirectory: typeof candidate.logsDirectory === "string" ? candidate.logsDirectory : undefined,
     failureId: typeof candidate.failureId === "string" ? candidate.failureId : undefined,
+  };
+}
+
+function parseTermination(value: unknown): ProcessTermination | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const status = value as Record<string, unknown>;
+  return {
+    exitCode: Number.isInteger(status.exitCode) ? Number(status.exitCode) : null,
+    windowsStatus: typeof status.windowsStatus === "string" && /^0x[\dA-F]{8}$/.test(status.windowsStatus) ? status.windowsStatus : undefined,
+    signal: Number.isInteger(status.signal) && Number(status.signal) > 0 ? Number(status.signal) : undefined,
+    coreDumped: typeof status.coreDumped === "boolean" ? status.coreDumped : undefined,
   };
 }
 

@@ -1,4 +1,5 @@
 import type { Application, CameraComponent, Entity } from "playcanvas";
+import { requestPreviewRender } from "./PreviewRenderScheduler";
 
 type Director = NonNullable<Application["renderer"]["gsplatDirector"]>;
 type CameraData = ReturnType<Director["getCameraData"]>;
@@ -27,7 +28,7 @@ export class PreviewSortCoordinator {
   private restorers: Array<() => void> = [];
   private waits = new Set<(error: Error) => void>();
 
-  constructor(private readonly app: Application) {
+  constructor(private readonly app: Application, private readonly forceFrames: () => () => void = () => () => {}) {
     const director = app.renderer.gsplatDirector;
     if (!director) throw new Error("The Gaussian sorting system is unavailable");
     const original = director.getCameraData;
@@ -119,7 +120,7 @@ export class PreviewSortCoordinator {
         if (pending.version === manager.world.lastWorldStateVersion && pending.view === this.view(manager)) send(pending);
         else { tracking.pending = null; manager.sortNeeded = true; }
       }
-      this.app.renderNextFrame = true;
+      requestPreviewRender(this.app);
     };
     sorter.worker.addEventListener("message", message);
     const applied = sorter.on("sorted", () => { tracking.applied = tracking.received; });
@@ -142,11 +143,12 @@ export class PreviewSortCoordinator {
   waitForFrame(camera: CameraComponent, signal: AbortSignal, timeoutMessage: string, timeoutMs = 8_000) {
     if (this.disposed || signal.aborted) return Promise.reject(cancelled());
     const floor = this.sequence;
+    const releaseFrames = this.forceFrames();
     const request = () => {
       for (const tracking of this.trackers) {
         if (tracking.manager.cameraNode === camera.entity) tracking.manager.sortNeeded = true;
       }
-      this.app.renderNextFrame = true;
+      requestPreviewRender(this.app);
     };
     request();
     return new Promise<void>((resolve, reject) => {
@@ -158,6 +160,7 @@ export class PreviewSortCoordinator {
         signal.removeEventListener("abort", abort);
         rendered.off();
         this.waits.delete(fail);
+        releaseFrames();
         if (error) reject(error); else resolve();
       };
       const fail = (error: Error) => finish(error);
@@ -179,7 +182,7 @@ export class PreviewSortCoordinator {
             if (!t.desired || t.desired.sequence <= floor || t.desired.view !== this.view(t.manager)
               || t.desired.version !== t.manager.world.lastWorldStateVersion) t.manager.sortNeeded = true;
           }
-          this.app.renderNextFrame = true;
+          requestPreviewRender(this.app);
         }
       });
       const timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);

@@ -23,13 +23,18 @@ if (!count) throw Error("Missing Gaussian count");
 const referenceView = JSON.parse(await readFile(referenceFile, "utf8"));
 const descriptor = { projectId: "00000000-0000-4000-8000-000000000001", modelPath: model, assetPath: model, format: "ply", fileSize: info.size, splatCount: count,
   transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 }, editing: { crop: null, revision: 0, sourceSplatCount: count, deletedCount: 0 }, editMaskAssetPath: null, referenceView };
-let complete, fail;
+let complete, fail, capture;
 const done = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
 const server = createServer(async (req, res) => {
   try {
     const pathname = new URL(req.url, "http://localhost").pathname;
     if (pathname === "/") { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end('<meta charset="utf-8"><link rel="stylesheet" href="/style.css"><div id="root"></div><script src="/runtime.js"></script>'); return; }
     if (pathname === "/descriptor.json") { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(descriptor)); return; }
+    if (pathname === "/snapshot") {
+      const name = new URL(req.url, "http://localhost").searchParams.get("name");
+      if (!capture || !/^[a-z0-9-]{1,40}$/.test(name ?? "")) throw Error("Invalid verification screenshot");
+      await capture(name); res.end("ok"); return;
+    }
     if (["/runtime.js", "/style.css", "/model.ply"].includes(pathname)) {
       const file = pathname === "/model.ply" ? model : path.join(out, pathname.slice(1));
       res.setHeader("Content-Type", pathname.endsWith(".js") ? "application/javascript" : pathname.endsWith(".css") ? "text/css" : "application/octet-stream");
@@ -63,7 +68,7 @@ console.log(`Preview verification: ${address}; artifacts: ${out}`);
 let debugReady;
 const debuggerReady = new Promise(resolve => { debugReady = resolve; });
 const browser = spawn("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", ["--headless=new", "--no-first-run", "--disable-background-networking", "--disable-sync", "--disable-extensions", `--window-size=${width},1050`, "--remote-debugging-port=0", "--enable-unsafe-webgpu",
-  ...(renderer === "webgl2" ? ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : []), `--user-data-dir=${path.join(out, "profile")}`, "about:blank"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+  ...(renderer === "webgl2" && process.env.OOOSPLAT_PREVIEW_HARDWARE_GL !== "1" ? ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : []), `--user-data-dir=${path.join(out, "profile")}`, "about:blank"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
 browser.on("error", fail);
 browser.once("exit", code => fail(Error(`Verification browser exited (${code}) before proof; see ${out}/browser.log`)));
 const diagnostics = createWriteStream(path.join(out, "browser.log"));
@@ -91,6 +96,10 @@ try {
   // OS window dimensions include chrome/borders. Set the actual CSS viewport
   // before loading, so the 1100px minimum-width layout is not silently clipped.
   await call("Emulation.setDeviceMetricsOverride", { width: Number(width), height: 1050, deviceScaleFactor: 1, mobile: false });
+  capture = async name => {
+    const screenshot = await call("Page.captureScreenshot", { format: "png" });
+    await writeFile(path.join(out, `${name}.png`), Buffer.from(screenshot.data, "base64"));
+  };
   await call("Page.navigate", { url: `${address}/?renderer=${renderer}&locale=${locale}` });
   const proof = await done;
   const screenshot = await call("Page.captureScreenshot", { format: "png" });

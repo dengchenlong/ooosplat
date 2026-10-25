@@ -20,6 +20,23 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); localStorage.clear(); vi.useRealTimers(); });
 
 describe("compact error hover details", () => {
+  it("shows the approved new classification in both languages without replacing raw evidence", async () => {
+    for (const [kind, zh, en] of [
+      ["brush_out_of_memory", "训练显存不足", "Not enough GPU memory for training"],
+      ["brush_resource_limit", "GPU 资源超出限制", "GPU resource limit exceeded"],
+      ["colmap_crash", "COLMAP 进程异常终止", "COLMAP terminated abnormally"],
+      ["mapper_storage", "重建文件访问失败", "Reconstruction file access failed"],
+      ["brush_dataset", "训练数据读取失败", "Training data could not be read"],
+    ] as const) {
+      await act(async () => root.render(<LanguageProvider><Toggle /><CompactError message={detail} context={{ classificationVersion: 1, failureKind: kind }} /></LanguageProvider>));
+      expect(anchor().textContent).toBe(zh);
+      await act(async () => anchor().focus());
+      expect(tooltip()?.textContent).toBe(detail);
+      await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+      expect(anchor().textContent).toBe(en);
+      await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    }
+  });
   it("keeps a short summary in the layout and reveals complete, copyable details on hover", async () => {
     expect(anchor().textContent).toBe("生成所需图片读取不完整"); expect(tooltip()).toBeNull();
     await act(async () => anchor().dispatchEvent(new MouseEvent("mouseover", { bubbles: true })));

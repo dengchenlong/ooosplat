@@ -5,6 +5,7 @@ import {
 import type { GaussianTransform } from "../../types/pipeline";
 import type { GizmoMode } from "./GizmoPreferences";
 import { modelWorldCenter, nearestEuler, rotateAroundModelCenter, translatedFromProxy, type ModelPivot } from "./ModelTransformMath";
+import { requestPreviewRender } from "./PreviewRenderScheduler";
 
 interface GizmoCallbacks {
   /** Null means this scene no longer owns the editor session. */
@@ -84,7 +85,7 @@ export class ModelTransformGizmo {
       this.sync();
       if (this.gizmo!.nodes.length === 0) this.gizmo!.attach([this.proxy]);
     }
-    this.app.renderNextFrame = true;
+    requestPreviewRender(this.app);
   }
 
   sync() {
@@ -94,7 +95,7 @@ export class ModelTransformGizmo {
     this.proxy.setPosition(modelWorldCenter(transform, this.pivot));
     this.proxy.setEulerAngles(...transform.rotation);
     this.gizmo?.update();
-    this.app.renderNextFrame = true;
+    requestPreviewRender(this.app);
   }
 
   private createGizmo() {
@@ -114,7 +115,7 @@ export class ModelTransformGizmo {
     const hiddenShapes: typeof gizmo.intersectShapes = [];
     for (const shape of gizmo.intersectShapes) {
       const keep = this.mode === "translate" ? /^arrow:[xyz]$/.test(shape.entity.name) : /^disk:[xyz]$/.test(shape.entity.name);
-      if (!keep) { shape.disabled = true; shape.visible = false; shape.entity.enabled = false; hiddenShapes.push(shape); }
+      if (!keep) { shape.disabled = true; shape.visible = false; hiddenShapes.push(shape); }
     }
     gizmo.intersectShapes = gizmo.intersectShapes.filter(shape => !shape.disabled);
     this.handles = [
@@ -132,14 +133,18 @@ export class ModelTransformGizmo {
           ? translatedFromProxy(this.gesture, this.pivot, this.proxy.getPosition())
           : rotateAroundModelCenter(this.gesture, this.pivot, nearestEuler(this.proxy.getRotation(), current.rotation));
         if ([...next.position, ...next.rotation, next.scale].every(Number.isFinite)) this.callbacks.change(next);
-        this.app.renderNextFrame = true;
+        requestPreviewRender(this.app);
       }),
       gizmo.on(TransformGizmo.EVENT_TRANSFORMEND, () => this.finish()),
-      gizmo.on(Gizmo.EVENT_RENDERUPDATE, () => { this.app.renderNextFrame = true; }),
-      // Native camera-facing and drag updates can re-enable their default handles.
-      // Keep excluded handles hidden after those updates, using only public APIs.
+      gizmo.on(Gizmo.EVENT_RENDERUPDATE, () => { requestPreviewRender(this.app); }),
+      // Do not fight the native camera-facing entity.enabled flags: doing so
+      // makes it flag render:update after EVERY render, creating an idle loop.
+      // Exclude picking above and hide mesh instances through public APIs.
       this.app.on("prerender", () => {
-        hiddenShapes.forEach(shape => { shape.entity.enabled = false; shape.visible = false; });
+        hiddenShapes.forEach(shape => {
+          shape.visible = false;
+          shape.meshInstances.forEach(instance => { instance.visible = false; });
+        });
       }),
     ];
   }
@@ -156,7 +161,7 @@ export class ModelTransformGizmo {
     if (this.pointerId !== null && canvas.hasPointerCapture(this.pointerId)) canvas.releasePointerCapture(this.pointerId);
     this.pointerId = null;
     this.callbacks.dragging(false);
-    this.app.renderNextFrame = true;
+    requestPreviewRender(this.app);
   }
 
   private releaseGizmo() {

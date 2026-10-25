@@ -64,6 +64,10 @@ pub struct TaskError {
     pub exit_code: Option<i32>,
     pub classification: Option<String>,
     pub classification_is_heuristic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<crate::process::ProcessTermination>,
     pub failure_id: Option<Uuid>,
     pub log_sources: Vec<String>,
 }
@@ -679,6 +683,8 @@ impl TaskService {
                     exit_code: None,
                     classification: None,
                     classification_is_heuristic: false,
+                    classification_version: None,
+                    termination: None,
                     failure_id: None,
                     log_sources: registered.keys().cloned().collect(),
                 }),
@@ -1227,13 +1233,11 @@ impl TaskService {
                     message: e.message,
                     failed_stage: e.failed_stage,
                     engine: e.engine,
-                    exit_code: t
-                        .runs
-                        .last()
-                        .and_then(|r| r.last_exit_code)
-                        .filter(|code| *code != 0),
+                    exit_code: e.termination.as_ref().and_then(|status| status.exit_code),
                     classification: e.failure_kind.map(str::to_owned),
-                    classification_is_heuristic: e.failure_kind.is_some(),
+                    classification_is_heuristic: e.classification_is_heuristic,
+                    classification_version: e.classification_version,
+                    termination: e.termination.map(|status| *status),
                     failure_id,
                     log_sources: t
                         .runs
@@ -1375,6 +1379,8 @@ impl TaskService {
                         exit_code: None,
                         classification: None,
                         classification_is_heuristic: false,
+                        classification_version: None,
+                        termination: None,
                         failure_id: None,
                         log_sources: task
                             .runs

@@ -3,6 +3,82 @@ use crate::pipeline::runner::default_engine_paths;
 
 type RecordedUpdates = Arc<SyncMutex<Vec<TaskUpdate>>>;
 
+#[test]
+fn legacy_task_errors_are_not_reclassified_or_rewritten() {
+    let legacy = serde_json::json!({
+        "code": "pipeline_failed", "message": "Brush 显存不足：wgpu error: Out of Memory\nAn IO error happened",
+        "failed_stage": "trainingSplats", "engine": "brush", "exit_code": 101,
+        "classification": "brush_dataset", "classification_is_heuristic": true,
+        "failure_id": null, "log_sources": ["brush"]
+    });
+    let error: TaskError = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(error.classification_version, None);
+    assert_eq!(error.termination, None);
+    assert_eq!(serde_json::to_value(error).unwrap(), legacy);
+}
+
+#[tokio::test]
+async fn current_failure_status_and_classification_survive_task_restart() {
+    let (root, service, task) = fixture().await;
+    *service.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
+        Box::pin(async {
+            let output = crate::process::ProcessOutput {
+                success: false,
+                exit_code: Some(-1073740940),
+                termination: crate::process::ProcessTermination {
+                    exit_code: Some(-1073740940),
+                    windows_status: Some("0xC0000374".into()),
+                    ..Default::default()
+                },
+                stdout: "435 (connected 435, loaded 435)\nRegistering image #235".into(),
+                stderr: "Could not register\nDiscarding reconstruction because it is too small"
+                    .into(),
+            };
+            Err(crate::error::SplatError::EngineProcess(Box::new(
+                crate::failure::EngineProcessFailure::from_output(
+                    crate::pipeline::PipelineEngine::Colmap,
+                    "mapper",
+                    &output,
+                ),
+            )))
+        })
+    }));
+    service
+        .start_inner(task.task_id, default_engine_paths(None), None, false)
+        .await
+        .unwrap();
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.wait(task.task_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(finished.status, TaskStatus::Failed);
+    let error = finished.error.unwrap();
+    assert_eq!(error.classification.as_deref(), Some("colmap_crash"));
+    assert_eq!(error.classification_version, Some(1));
+    assert!(!error.classification_is_heuristic);
+    assert_eq!(error.exit_code, Some(-1073740940));
+    assert_eq!(
+        error
+            .termination
+            .as_ref()
+            .unwrap()
+            .windows_status
+            .as_deref(),
+        Some("0xC0000374")
+    );
+    let reloaded = TaskService::at(root.path().join("registry"))
+        .get(task.task_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(reloaded.error.unwrap()).unwrap(),
+        serde_json::to_value(error).unwrap()
+    );
+}
+
 fn record_notifications(service: &TaskService) -> RecordedUpdates {
     let updates: RecordedUpdates = Default::default();
     let observed = updates.clone();

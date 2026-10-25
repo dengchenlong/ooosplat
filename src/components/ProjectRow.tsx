@@ -4,6 +4,7 @@ import { taskBasename, taskFormatBytes, taskStatusLabel } from '../app/taskPrese
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useTaskElapsed } from '../app/useTaskElapsed';
 import { displayPath } from '../lib/displayPath';
+import { taskFailureContext } from '../lib/pipelineError';
 import type { ProjectSummary } from '../types/pipeline';
 import { taskIsActive, type SharedTask } from '../types/tasks';
 import { CompactError } from './CompactError';
@@ -51,7 +52,7 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
       <div className="project-title-line"><span className={`project-status ${active ? 'running' : status}`} /><strong>{project?.name ?? taskBasename(task?.input_path ?? '')}</strong><span className="status-copy">{taskStatusLabel(locale, status)}</span></div>
       <p className="project-path" title={visiblePath}>{visiblePath}</p>
       {task?.source === 'mcp' && <p className="task-origin">{locale === 'zh-CN' ? '由 AI Agent 创建' : 'Created by AI Agent'}</p>}
-      {failure && <p className="project-failure"><CompactError message={failure} /></p>}
+      {failure && <p className="project-failure"><CompactError message={failure} context={taskFailureContext(task?.error)} /></p>}
       {project?.taskKind !== "import" && project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
     </div>
     <dl className="project-stats">

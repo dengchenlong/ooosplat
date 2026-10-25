@@ -3494,8 +3494,9 @@ impl PipelineRunner {
 
         match first {
             Ok(candidate) => Ok(candidate),
-            Err(SplatError::BrushOutOfMemory(detail))
-                if (quality == Quality::High || resolved.panorama.is_some())
+            Err(error)
+                if error.is_brush_oom()
+                    && (quality == Quality::High || resolved.panorama.is_some())
                     && state.planner_enabled
                     && !state.brush_training.oom_retry_used =>
             {
@@ -3506,7 +3507,7 @@ impl PipelineRunner {
                     resolved,
                     initial_sfm_points,
                 ) else {
-                    return Err(SplatError::BrushOutOfMemory(detail));
+                    return Err(error);
                 };
                 state.brush_training.oom_retry_used = true;
                 state.brush_training.resolved = Some(downgraded);
@@ -3550,6 +3551,7 @@ impl PipelineRunner {
                     )),
                 )
                 .await
+                .map_err(|retry_error| retry_error.with_previous_attempt(error))
             }
             Err(error) => Err(error),
         }

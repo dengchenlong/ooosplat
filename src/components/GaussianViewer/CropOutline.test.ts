@@ -1,7 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { buildCropOutline } from "./CropOutline";
+import { EventHandler, type Application } from "playcanvas";
+import { describe, expect, it, vi } from "vitest";
+import { buildCropOutline, CropOutline } from "./CropOutline";
 
 describe("buildCropOutline", () => {
+  it("queues lines only for actual render frames and releases its listener", () => {
+    const app = Object.assign(new EventHandler(), { drawLines: vi.fn(), scene: { layers: { getLayerById: () => undefined } } });
+    const outline = new CropOutline(app as unknown as Application);
+    outline.setCrop({ kind: "box", center: [0, 0, 0], size: [1, 1, 1] }); outline.setVisible(true);
+    for (let i = 0; i < 1000; i++) app.fire("update");
+    expect(app.drawLines).not.toHaveBeenCalled();
+    app.fire("prerender"); expect(app.drawLines).toHaveBeenCalledTimes(1);
+    outline.destroy(); outline.destroy(); app.fire("prerender");
+    expect(app.drawLines).toHaveBeenCalledTimes(1);
+  });
   it("builds only the twelve edges of an axis-aligned box", () => {
     const geometry = buildCropOutline({ kind: "box", center: [1, 2, 3], size: [4, 6, 8] });
 

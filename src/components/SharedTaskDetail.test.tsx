@@ -97,6 +97,17 @@ describe('restored shared task detail', () => {
     expect(document.querySelector('.error-detail-tooltip')?.textContent).toBe(error.message);
   });
 
+  it('uses the new classification for the error summary but leaves legacy summaries alone', async () => {
+    const error = { code: 'pipeline_failed', message: 'wgpu error: Out of Memory\nIO error while loading dataset: early eof', failed_stage: 'trainingSplats', engine: 'brush', exit_code: 101, failure_id: null,
+      classification: 'brush_out_of_memory', classification_version: 1, classification_is_heuristic: false };
+    await render(task({ status: 'failed', error }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('训练显存不足');
+    expect(container.textContent).not.toContain('错误分类为启发式判断');
+    await render(task({ status: 'failed', error: { ...error, classification: 'brush_dataset', classification_version: undefined, classification_is_heuristic: true } }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('生成所需图片读取不完整');
+    expect(container.textContent).toContain('错误分类为启发式判断');
+  });
+
   it('uses the original configuration, timeline and log layout with frozen settings and observed counters', async () => {
     await render(task({ input_path: '\\\\?\\E:\\Media\\orbit.mov', projects_root: '\\\\?\\E:\\Projects' }));
     expect(container.querySelectorAll('.path-picker.readonly')).toHaveLength(2);

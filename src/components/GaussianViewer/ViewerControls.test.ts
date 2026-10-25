@@ -468,6 +468,86 @@ describe("ViewerControls", () => {
 
 });
 
+describe("manual orbit horizon leveling", () => {
+  const setupFrames = () => {
+    const frames = new Map<number, FrameRequestCallback>(); let id = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation(cb => { frames.set(++id, cb); return id; });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(id => { frames.delete(id); });
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const f = setup();
+    const advance = (time: number) => { clock.mockReturnValue(time); const pending = [...frames.values()]; frames.clear(); pending.forEach(cb => cb(time)); };
+    const done = () => { f.controls.destroy(); request.mockRestore(); cancel.mockRestore(); clock.mockRestore(); };
+    return { ...f, frames, advance, done };
+  };
+  it.each([18, -18, 179, -179, 725])("smoothly levels roll %s after real orbit, keeps framing and persists the final pose", roll => {
+    const f = setupFrames();
+    try {
+      f.controls.restore({ ...f.controls.snapshot(), roll, fov: 70, projectionOffset: [.1, -.1], projectionScaleX: 1.2 });
+      const before = f.controls.snapshot();
+      f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0)); f.canvas.dispatchEvent(pointerEvent("pointermove", 10, 4));
+      const normalized = ((roll + 180) % 360 + 360) % 360 - 180;
+      expect(f.controls.snapshot().roll).toBe(normalized);
+      f.advance(90); expect(f.controls.snapshot().roll).toBeCloseTo(normalized / 8);
+      f.canvas.dispatchEvent(pointerEvent("pointermove", 20, 4));
+      f.canvas.dispatchEvent(pointerEvent("pointerup", 20, 4));
+      f.advance(180);
+      const after = f.controls.snapshot();
+      expect(after.roll).toBe(0); expect(after.yaw).toBeCloseTo(before.yaw - 6);
+      for (const key of ["target", "distance", "projection", "fov", "orthoHeight", "projectionOffset", "projectionScaleX"] as const) expect(after[key]).toEqual(before[key]);
+      expect(f.entity.right.y).toBeCloseTo(0, 5);
+      expect(f.onViewChange).toHaveBeenCalled(); expect(f.frames.size).toBe(0);
+    } finally { f.done(); }
+  });
+  it("does not level for clicks, sub-threshold drags, right pan or wheel; rectangle mode uses middle orbit", () => {
+    const f = setupFrames();
+    try {
+      f.controls.restore({ ...f.controls.snapshot(), roll: 20 });
+      for (const button of [0, 2]) {
+        f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0, button));
+        f.canvas.dispatchEvent(pointerEvent("pointermove", button ? 20 : 1, 1, button));
+        f.canvas.dispatchEvent(pointerEvent("pointerup", button ? 20 : 1, 1, button));
+      }
+      f.canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 50, cancelable: true }));
+      expect(f.frames.size).toBe(0); expect(f.controls.snapshot().roll).toBe(20);
+      f.controls.setRectangleSelectionMode(true);
+      f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0)); f.canvas.dispatchEvent(pointerEvent("pointermove", 20, 0));
+      expect(f.frames.size).toBe(0);
+      f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0, 1)); f.canvas.dispatchEvent(pointerEvent("pointermove", 20, 0, 1));
+      f.advance(180); expect(f.controls.snapshot().roll).toBe(0);
+    } finally { f.done(); }
+  });
+  it("cancels leveling when a fixed view takes over, keeps free orthographic scale and handles near-pole views", () => {
+    const f = setupFrames();
+    try {
+      f.controls.restore({ ...f.controls.snapshot(), roll: -30, pitch: 89.9, projection: PROJECTION_ORTHOGRAPHIC, orthoHeight: 8 });
+      f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0)); f.canvas.dispatchEvent(pointerEvent("pointermove", 10, 0));
+      f.advance(90); expect(f.controls.snapshot().projection).toBe(PROJECTION_ORTHOGRAPHIC);
+      expect(f.camera.orthoHeight).toBe(8);
+      f.controls.alignOrthographic("front", new BoundingBox(new Vec3(), new Vec3(1, 1, 1)), .85, false);
+      expect(f.frames.size).toBe(0); expect(f.controls.snapshot().roll).toBe(0);
+      expect(f.entity.forward.z).toBeCloseTo(-1);
+    } finally { f.done(); }
+  });
+  it("starts from the actual pose when dragging interrupts Locate and restores old rolled views unchanged", () => {
+    const f = setupFrames();
+    try {
+      const saved = { ...f.controls.snapshot(), roll: 35 };
+      f.controls.restore(saved);
+      expect(f.controls.snapshot()).toEqual(saved);
+      f.controls.locate({ position: new Vec3(3, 4, 5), forward: new Vec3(0, 0, -1), up: new Vec3(.5, .8660254, 0),
+        fov: 70, projectionOffset: [0, 0], projectionScaleX: 1 }, new BoundingBox(new Vec3(), new Vec3(1, 1, 1)));
+      f.advance(80);
+      const position = f.entity.getPosition().clone(), rotation = f.entity.getRotation().clone();
+      f.canvas.dispatchEvent(pointerEvent("pointerdown", 0, 0));
+      expect(f.entity.getPosition().distance(position)).toBeLessThan(1e-5);
+      expect(Math.abs(f.entity.getRotation().dot(rotation))).toBeCloseTo(1);
+      f.canvas.dispatchEvent(pointerEvent("pointermove", 10, 0)); f.advance(260);
+      expect(f.controls.snapshot().roll).toBe(0); expect(f.frames.size).toBe(0);
+      f.controls.restore(saved); expect(f.controls.snapshot()).toEqual(saved);
+    } finally { f.done(); }
+  });
+});
+
 describe("focused perspective WASD flight", () => {
   function flight(height = 800) {
     const frames = new Map<number, FrameRequestCallback>();

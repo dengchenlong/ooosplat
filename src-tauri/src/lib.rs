@@ -4,6 +4,7 @@ pub mod commands;
 pub mod diagnostics;
 pub mod engines;
 pub mod error;
+pub mod failure;
 pub mod imports;
 pub mod mcp;
 pub mod pipeline;

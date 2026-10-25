@@ -92,6 +92,7 @@ import {
   type NormalizedCaptureRegion,
 } from "./PreviewCapture";
 import { configurePreviewRenderer, previewDeviceTypes } from "./PreviewBackend";
+import { PreviewRenderScheduler, requestPreviewRender } from "./PreviewRenderScheduler";
 import {
   GAUSSIAN_VIDEO_FRAME_COUNT,
   gaussianVideoDimensions,
@@ -203,20 +204,6 @@ const PreviewCamera = memo(forwardRef<PcEntity>(function PreviewCamera(_props, r
   </Entity>;
 }));
 
-function nextAnimationFrame(signal: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    const abort = () => {
-      cancelAnimationFrame(frame);
-      reject(new DOMException(translate(getCurrentLocale(), "video.cancelled"), "AbortError"));
-    };
-    const frame = requestAnimationFrame(() => {
-      signal.removeEventListener("abort", abort);
-      resolve();
-    });
-    signal.addEventListener("abort", abort, { once: true });
-  });
-}
-
 interface SplatSceneProps {
   projectId: string;
   assetUrl: string;
@@ -252,6 +239,12 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const orbitAxisGuideRef = useRef<OrbitAxisGuide | null>(null);
   const selectionRef = useRef<GaussianSelectionController | null>(null);
   const sortCoordinatorRef = useRef<PreviewSortCoordinator | null>(null);
+  const renderSchedulerRef = useRef<PreviewRenderScheduler | null>(null);
+  useEffect(() => {
+    const scheduler = new PreviewRenderScheduler(app);
+    renderSchedulerRef.current = scheduler;
+    return () => { scheduler.destroy(); if (renderSchedulerRef.current === scheduler) renderSchedulerRef.current = null; };
+  }, [app]);
   const appDestroyedRef = useRef(false);
   const contextLostRef = useRef(false);
   const modeRef = useRef<ViewerMode>(mode);
@@ -280,7 +273,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   configurePreviewRenderer(app);
   app.scene.gsplat.colorUpdateAngle = 0;
   useEffect(() => {
-    const coordinator = new PreviewSortCoordinator(app);
+    const coordinator = new PreviewSortCoordinator(app, () => renderSchedulerRef.current!.forceFrames());
     sortCoordinatorRef.current = coordinator;
     return () => { coordinator.destroy(); if (sortCoordinatorRef.current === coordinator) sortCoordinatorRef.current = null; };
   }, [app]);
@@ -334,7 +327,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       component.setParameter("uOoosplatAnimationTime", Math.min(elapsedSeconds, ORBIT_START_SECONDS));
     }
     animationEffectActiveRef.current = effectActive;
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   const reportAnimation = useCallback((elapsedSeconds: number, force = false) => {
@@ -360,6 +353,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     } else {
       setAnimationUniforms(false, animationElapsedRef.current);
     }
+    renderSchedulerRef.current?.setAnimating(mode === "preview" && sceneReadyRef.current && !exportingRef.current);
   }, [mode, replay, setAnimationUniforms, tool]);
 
   useEffect(() => {
@@ -390,6 +384,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     const reportDeviceLost = () => {
       if (contextLostRef.current || appDestroyedRef.current) return;
       contextLostRef.current = true;
+      renderSchedulerRef.current?.destroy();
       sceneReadyRef.current = false;
       gizmoRef.current?.destroy(true);
       gizmoRef.current = null;
@@ -427,14 +422,14 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     component.setParameter("uOoosplatCropInverted", currentCrop?.inverted ? 1 : 0);
     component.setParameter("uOoosplatShowSelection", currentMode === "adjust" && currentTool === "rectangle" ? 1 : 0);
     if (!animationEffectActiveRef.current) component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   useEffect(() => { applyEditorUniforms(); }, [applyEditorUniforms, crop, mode, tool]);
   useEffect(() => {
     cropOutlineRef.current?.setCrop(crop);
     cropOutlineRef.current?.setVisible(mode === "adjust" && (tool === "sphere" || tool === "box") && crop !== null);
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app, crop, mode, tool]);
   useEffect(() => {
     void selectionRef.current?.applyMasks(deletedMask, selectionMask);
@@ -446,6 +441,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       if (appDestroyedRef.current || contextLostRef.current || exportingRef.current) return;
       app.graphicsDevice.maxPixelRatio = Math.max(1, window.devicePixelRatio || 1);
       app.resizeCanvas(Math.max(1, container.clientWidth), Math.max(1, container.clientHeight));
+      requestPreviewRender(app);
     };
     const observer = new ResizeObserver(resize);
     observer.observe(container);
@@ -611,7 +607,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     const persistView = () => {
       if (ready && !exportingRef.current && !contextLostRef.current) savePreviewView(projectId, controls.snapshot());
     };
-    const controls = new ViewerControls(app.graphicsDevice.canvas, cameraRef.current, onOrthographicViewChange, t("viewer.cameraUnavailable"), persistView, () => { app.renderNextFrame = true; });
+    const controls = new ViewerControls(app.graphicsDevice.canvas, cameraRef.current, onOrthographicViewChange, t("viewer.cameraUnavailable"), persistView, () => { requestPreviewRender(app); });
     controls.enabled = false;
     persistViewRef.current = persistView;
     window.addEventListener("pagehide", persistView);
@@ -623,9 +619,19 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       component,
       cameraRef.current.camera!,
       source.numSplats,
-      () => { app.renderNextFrame = true; },
+      () => { requestPreviewRender(app); },
     );
     selectionRef.current = selection;
+    // Update camera/uniforms before auxiliary prerender listeners capture lines.
+    const updateHandle = app.on("prerender", () => {
+      if (!ready || exportingRef.current || modeRef.current !== "preview") return;
+      const previous = animationElapsedRef.current;
+      const elapsed = previous + (renderSchedulerRef.current?.animationDelta() ?? 0);
+      animationElapsedRef.current = elapsed;
+      setAnimationUniforms(true, elapsed);
+      controls.orbitBy((elapsed - previous) * ORBIT_DEGREES_PER_SECOND);
+      reportAnimation(elapsed);
+    });
     const gridBounds = new BoundingBox();
     gridBounds.setFromTransformedAabb(source.aabb, splatRef.current.getWorldTransform());
     const grid = new GroundGrid(app, gridBounds);
@@ -674,16 +680,6 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     applyEditorUniforms();
     setAnimationUniforms(modeRef.current === "preview", animationElapsedRef.current);
 
-    const updateHandle = app.on("update", (deltaSeconds: number) => {
-      if (!ready || exportingRef.current || modeRef.current !== "preview") return;
-      const previous = animationElapsedRef.current;
-      const elapsed = previous + Math.min(Math.max(deltaSeconds, 0), 0.1);
-      animationElapsedRef.current = elapsed;
-      setAnimationUniforms(true, elapsed);
-      controls.orbitBy((elapsed - previous) * ORBIT_DEGREES_PER_SECOND);
-      reportAnimation(elapsed);
-    });
-
     const initialization = new AbortController();
     void (async () => {
       await selection.applyMasks(editorStateRef.current.deletedMask, editorStateRef.current.selectionMask);
@@ -696,6 +692,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       initialization.signal.throwIfAborted();
       ready = true;
       sceneReadyRef.current = true;
+      renderSchedulerRef.current?.setAnimating(modeRef.current === "preview");
       controls.enabled = true;
       configureGizmo();
       if (modeRef.current === "preview") replay();
@@ -709,6 +706,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     return () => {
       initialization.abort();
       sceneReadyRef.current = false;
+      renderSchedulerRef.current?.setAnimating(false);
       gizmo.destroy();
       if (gizmoRef.current === gizmo) gizmoRef.current = null;
       updateHandle.off();
@@ -802,6 +800,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     });
 
     exportingRef.current = true;
+    renderSchedulerRef.current?.setAnimating(false);
     configureGizmo();
     controls.enabled = false;
     gridRef.current?.setVisible(false);
@@ -827,7 +826,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
           cameraEntity.camera!.orthoHeight = previousOrthoHeight * captureRegion.height;
           controls.setOrbitYaw(cameraState.yaw + orbitDegreesAt(timeSeconds));
           await sortCoordinatorRef.current!.waitForFrame(cameraEntity.camera!, signal, t("video.sortTimeout"));
-          await nextAnimationFrame(signal);
+          signal.throwIfAborted();
           app.render();
           const pixels = await videoTexture.read(
             0,
@@ -850,6 +849,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       });
     } finally {
       exportingRef.current = false;
+      renderSchedulerRef.current?.setAnimating(modeRef.current === "preview");
       configureGizmo();
       animationElapsedRef.current = elapsed;
       cameraEntity.camera.renderTarget = previousRenderTarget;
@@ -863,7 +863,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       videoRenderTarget.destroy();
       setAnimationUniforms(modeRef.current === "preview", elapsed);
       reportAnimation(elapsed, true);
-      app.renderNextFrame = true;
+      requestPreviewRender(app);
     }
   }, [app, configureGizmo, reportAnimation, setAnimationUniforms]);
 
@@ -901,7 +901,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
     cropOutlineRef.current?.setCrop(null);
     cropOutlineRef.current?.setVisible(false);
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   const cropBounds = useCallback(() => {
@@ -925,7 +925,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     if (!referenceView || !bounds || !sceneReadyRef.current || gizmoStateRef.current.interactionBlocked) return;
     const current = useGaussianTransformStore.getState();
     controlsRef.current?.locate(trainingReferenceInWorld(referenceView, current.transform), bounds);
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app, referenceView, transformedEffectBounds]);
 
   const initializeCrop = useCallback((kind: "sphere" | "box", previous: GaussianCrop) => {
@@ -1683,7 +1683,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     {pipelineRunning && <div className="preview-resource-note">{t("viewer.resourceNote")}</div>}
     <div className="preview-editor">
       <div ref={viewportElementRef} inert={operationBusy} className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
-        <Application key={`${store.descriptor.projectId}-${rendererRevision}`} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
+        <Application key={`${store.descriptor.projectId}-${rendererRevision}`} autoRender={false} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
           <SplatScene ref={sceneApiRef} projectId={store.descriptor.projectId} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} readToken={store.descriptor.readToken} referenceView={store.descriptor.referenceView} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} editorMasksReady={!store.descriptor.editMaskAssetUrl || loadedMaskKey === `${store.descriptor.projectId}:${store.descriptor.editMaskAssetUrl}`} gizmoMode={gizmoMode} interactionBlocked={interactionBlocked || selectionDrag !== null} onGizmoDragging={onGizmoDragging} onOrthographicViewChange={onViewDirectionChange} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
         </Application>
         {mode === "preview" && <div ref={captureGuideRef} className={`portrait-capture-guide orientation-${orientation}`} style={guideSize} aria-hidden="true">

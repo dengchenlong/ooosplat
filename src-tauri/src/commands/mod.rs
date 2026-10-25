@@ -71,7 +71,12 @@ pub struct PipelineCommandError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) project_id: Option<String>,
+    pub(crate) classification_version: Option<u32>,
+    pub(crate) classification_is_heuristic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) termination: Option<Box<crate::process::ProcessTermination>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_id: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) project_path: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,6 +87,11 @@ pub struct PipelineCommandError {
 
 impl From<SplatError> for PipelineCommandError {
     fn from(error: SplatError) -> Self {
+        let classification = crate::failure::classify(None, &error);
+        let termination = match &error {
+            SplatError::EngineProcess(failure) => Some(Box::new(failure.termination.clone())),
+            _ => None,
+        };
         Self {
             code: if matches!(error, SplatError::Cancelled) {
                 "cancelled"
@@ -90,8 +100,12 @@ impl From<SplatError> for PipelineCommandError {
             },
             message: error.to_string(),
             failed_stage: None,
-            engine: None,
-            failure_kind: None,
+            engine: classification.engine,
+            failure_kind: classification.kind,
+            classification_version: (!matches!(error, SplatError::Cancelled))
+                .then_some(crate::failure::CLASSIFICATION_VERSION),
+            classification_is_heuristic: classification.heuristic,
+            termination,
             project_id: None,
             project_path: None,
             logs_directory: None,
@@ -110,7 +124,7 @@ impl PipelineCommandError {
             project_path,
             logs_directory,
         } = runner.failure_context();
-        let (engine, failure_kind) = classify_pipeline_failure(failed_stage, &message);
+        let classification = crate::failure::classify(failed_stage, error);
         Self {
             code: if cancelled {
                 "cancelled"
@@ -119,9 +133,15 @@ impl PipelineCommandError {
             },
             message,
             failed_stage,
-            engine,
-            failure_kind: if cancelled { None } else { failure_kind },
-            project_id: project_id.map(|value| value.to_string()),
+            engine: classification.engine,
+            failure_kind: if cancelled { None } else { classification.kind },
+            classification_version: (!cancelled).then_some(crate::failure::CLASSIFICATION_VERSION),
+            classification_is_heuristic: classification.heuristic,
+            termination: match error {
+                SplatError::EngineProcess(failure) => Some(Box::new(failure.termination.clone())),
+                _ => None,
+            },
+            project_id: project_id.map(|value| value.to_string().into_boxed_str()),
             project_path: project_path.map(Box::new),
             logs_directory: logs_directory.map(Box::new),
             failure_id: None,
@@ -129,118 +149,13 @@ impl PipelineCommandError {
     }
 }
 
+#[cfg(test)]
 fn classify_pipeline_failure(
     stage: Option<PipelineStage>,
     message: &str,
 ) -> (Option<PipelineEngine>, Option<&'static str>) {
-    let lower = message.to_ascii_lowercase();
-    match stage {
-        Some(PipelineStage::Reconstructing | PipelineStage::ValidatingReconstruction) => {
-            let source_error = [
-                "no initial image pair",
-                "no good initial image pair",
-                "could not find a good initial image pair",
-                "failed to find an initial image pair",
-                "failed to register",
-                "could not register",
-                "no images registered",
-                "registered 0 images",
-                "discarding reconstruction",
-                "failed to create any sparse model",
-                "did not produce a usable sparse model",
-                "未生成完整的稀疏模型",
-                "稀疏重建没有可用的注册图像或三维点",
-                "稀疏重建输出不完整",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            let database_io_error = ["io error", "i/o error"]
-                .iter()
-                .any(|needle| lower.contains(needle))
-                && ["database", "sqlite", "filesystem", "project file"]
-                    .iter()
-                    .any(|needle| lower.contains(needle));
-            let storage_error = database_io_error
-                || [
-                    "database is locked",
-                    "database locked",
-                    "unable to open database",
-                    "failed to open database",
-                    "cannot open database",
-                    "unable to open database file",
-                    "read-only database",
-                    "readonly database",
-                    "no space left",
-                    "disk full",
-                    "input/output error",
-                    "being used by another process",
-                    "used by another process",
-                    "sharing violation",
-                    "access denied",
-                    "permission denied",
-                    "数据库被锁定",
-                    "无法打开数据库",
-                    "磁盘空间不足",
-                    "磁盘已满",
-                    "另一个进程正在使用",
-                    "拒绝访问",
-                    "权限不足",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle));
-            (
-                Some(PipelineEngine::Colmap),
-                Some(if source_error {
-                    "mapper_source"
-                } else if storage_error {
-                    "mapper_storage"
-                } else {
-                    "mapper_source"
-                }),
-            )
-        }
-        Some(PipelineStage::TrainingSplats) => {
-            let device_lost = [
-                "devicelost",
-                "device lost",
-                "device_lost",
-                "parent device is lost",
-                "vk_error_device_lost",
-                "dxgi_error_device_removed",
-                "显卡设备连接中断",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            let dataset_error = [
-                "early eof",
-                "failed to load dataset",
-                "io error",
-                "i/o error",
-                "no such file",
-                "access denied",
-                "permission denied",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            (
-                Some(PipelineEngine::Brush),
-                Some(if device_lost {
-                    "brush_device_lost"
-                } else if dataset_error {
-                    "brush_dataset"
-                } else {
-                    "brush_gpu"
-                }),
-            )
-        }
-        Some(PipelineStage::ProbingVideo | PipelineStage::ExtractingFrames) => {
-            (Some(PipelineEngine::Ffmpeg), None)
-        }
-        Some(PipelineStage::ExtractingFeatures | PipelineStage::Matching) => {
-            (Some(PipelineEngine::Colmap), None)
-        }
-        _ => (Some(PipelineEngine::System), None),
-    }
+    let result = crate::failure::classify(stage, &SplatError::Process(message.into()));
+    (result.engine, result.kind)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1281,8 +1196,11 @@ async fn wait_task_result(
             message: error.message,
             failed_stage: error.failed_stage,
             engine: error.engine,
-            failure_kind: None,
-            project_id: task.project_id.map(|v| v.to_string()),
+            failure_kind: crate::failure::known_kind(error.classification.as_deref()),
+            classification_version: error.classification_version,
+            classification_is_heuristic: error.classification_is_heuristic,
+            termination: error.termination.map(Box::new),
+            project_id: task.project_id.map(|v| v.to_string().into_boxed_str()),
             project_path: task.project_path.map(Box::new),
             logs_directory: None,
             failure_id: error.failure_id.map(Box::new),
@@ -2714,17 +2632,19 @@ mod tests {
         let cancelled =
             serde_json::to_value(PipelineCommandError::from(SplatError::Cancelled)).unwrap();
         assert_eq!(cancelled["code"], "cancelled");
+        assert!(cancelled.get("classificationVersion").is_none());
         let failed = serde_json::to_value(PipelineCommandError::from(SplatError::Process(
             "boom".into(),
         )))
         .unwrap();
         assert_eq!(failed["code"], "pipeline_failed");
+        assert_eq!(failed["classificationVersion"], 1);
         assert!(failed["message"].as_str().unwrap().contains("boom"));
     }
 
     #[test]
     fn pipeline_command_error_stays_below_clippy_large_error_threshold() {
-        assert!(std::mem::size_of::<PipelineCommandError>() <= 128);
+        assert!(std::mem::size_of::<PipelineCommandError>() < 128);
     }
 
     #[test]
@@ -2859,7 +2779,7 @@ mod tests {
                 Some(PipelineStage::Reconstructing),
                 "I/O error while reading feature descriptors",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineEngine::Colmap), None),
         );
         assert_eq!(
             classify_pipeline_failure(
