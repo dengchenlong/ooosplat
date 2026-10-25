@@ -386,11 +386,8 @@ impl DepthBuffer {
         let downsample = f64::from(self.downsample);
         let centre_x = pixel[0] / downsample;
         let centre_y = pixel[1] / downsample;
-        let radius = (frame
-            .projection
-            .footprint_radius_px(splat.scale, depth)
-            / downsample)
-            .clamp(1.0, 3.0);
+        let radius =
+            (frame.projection.footprint_radius_px(splat.scale, depth) / downsample).clamp(1.0, 3.0);
         let depth = depth as f32;
         let r2 = radius * radius;
         for y in (centre_y - radius).floor() as i64..=(centre_y + radius).ceil() as i64 {
@@ -1618,10 +1615,7 @@ mod tests {
         // invariant to assert is the decision boundary itself: no background
         // splat may reach the candidate threshold.
         assert!(mean(object_ratios) > 0.9, "object mean ratio too low");
-        let worst_background = background_ratios
-            .iter()
-            .cloned()
-            .fold(f32::MIN, f32::max);
+        let worst_background = background_ratios.iter().cloned().fold(f32::MIN, f32::max);
         assert!(
             worst_background < VoteConfig::default().vote_threshold as f32,
             "a background splat reached the candidate threshold: {worst_background}"
