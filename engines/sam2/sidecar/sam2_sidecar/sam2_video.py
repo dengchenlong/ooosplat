@@ -173,6 +173,7 @@ def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
     upto = sam2_state["propagated_upto"].get(object_id, -1)
     if frame_index > upto:
         state = sam2_state["inference_state"]
+        last_idx = upto
         for idx, _obj_ids, video_res_masks in predictor.propagate_in_video(
             state, start_frame_idx=upto + 1
         ):
@@ -192,7 +193,13 @@ def segment_frame(predictor, sam2_state: dict, prompt: dict, frame_index: int):
             # so the per-frame drain loop can re-read any frame.
             boolean = np.asarray(raw) > 0.0
             cache[int(idx)] = (boolean.shape, np.packbits(boolean))
-        sam2_state["propagated_upto"][object_id] = frame_index
+            last_idx = int(idx)
+        # `propagate_in_video` runs from `start_frame_idx` to the end of the
+        # clip, so one call fills every later frame. Record how far the cache
+        # actually reaches; storing `frame_index` here instead made every
+        # subsequent frame re-propagate the remaining clip -> O(N^2) work
+        # (184 frames ground for ~60h instead of ~20min on CPU).
+        sam2_state["propagated_upto"][object_id] = last_idx
 
     if frame_index not in cache:
         raise KeyError(f"SAM2 produced no mask for frame index {frame_index}")

@@ -162,3 +162,33 @@ class TestAnchorRegistration:
         assert len(predictor.calls) == 1
         sam2_video.segment_frame(predictor, state, prompt, 1)
         assert len(predictor.calls) == 1, "base prompt must not re-register"
+
+
+class _CountingPredictor(_RecordingPredictor):
+    """Counts how many times the whole-clip propagation is (re)started."""
+
+    def __init__(self, total_frames=6):
+        super().__init__(total_frames=total_frames)
+        self.propagate_calls = 0
+
+    def propagate_in_video(self, state, start_frame_idx=0):
+        self.propagate_calls += 1
+        yield from super().propagate_in_video(state, start_frame_idx=start_frame_idx)
+
+
+def test_walking_every_frame_propagates_the_clip_once():
+    """Draining frames 0..N-1 must reuse the clip-wide cache.
+
+    Regression: ``propagated_upto`` used to be set to the requested
+    ``frame_index`` although ``propagate_in_video`` had already cached every
+    later frame, so each frame restarted propagation from the next index —
+    O(N^2) work (184 frames ran ~60h on CPU instead of ~20min).
+    """
+    state = _state()
+    predictor = _CountingPredictor(total_frames=6)
+    prompt = {"objectId": "obj"}
+    for idx in range(6):
+        mask = sam2_video.segment_frame(predictor, state, prompt, idx)
+        assert mask.shape == (8, 8)
+    assert predictor.propagate_calls == 1, "one clip-wide propagation must serve every frame"
+    assert state["propagated_upto"]["obj"] == 5, "cache must record the last propagated index"
