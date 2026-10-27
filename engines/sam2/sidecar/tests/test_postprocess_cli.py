@@ -59,13 +59,13 @@ def _pixels(path):
 @pytest.fixture
 def masks_dir(tmp_path):
     source = tmp_path / "masks"
-    _write_masks(source, [[MAIN, BLOB], [MAIN, BLOB], [MAIN, BLOB]])
+    _write_masks(source, [[MAIN, BLOB, BIG_SECOND]] * 3)
     _state(
         source,
         {
-            "frame_000001": _entry("frame_000001", 265 / (WIDTH * HEIGHT)),
-            "frame_000002": _entry("frame_000002", 265 / (WIDTH * HEIGHT)),
-            "frame_000003": _entry("frame_000003", 265 / (WIDTH * HEIGHT)),
+            "frame_000001": _entry("frame_000001", 365 / (WIDTH * HEIGHT)),
+            "frame_000002": _entry("frame_000002", 365 / (WIDTH * HEIGHT)),
+            "frame_000003": _entry("frame_000003", 365 / (WIDTH * HEIGHT)),
         },
     )
     (source / "notes.txt").write_text("keep me", encoding="utf-8")
@@ -142,15 +142,17 @@ def test_min_area_ratio_is_configurable(tmp_path, masks_dir, capsys):
     assert _pixels(out_dir / "frame_000001.png") == 256
 
 
-def test_refuses_to_overwrite_the_input_directory(tmp_path, masks_dir):
-    with pytest.raises(SystemExit) as excinfo:
-        main(["--masks-dir", str(masks_dir), "--out-dir", str(masks_dir)])
-    assert excinfo.value.code == 2
+def test_refuses_to_overwrite_the_input_directory(tmp_path, masks_dir, capsys):
+    code = main(["--masks-dir", str(masks_dir), "--out-dir", str(masks_dir)])
+    assert code == 2
+    assert "read-only" in capsys.readouterr().err
 
 
 def test_rejects_invalid_options(tmp_path, masks_dir):
     with pytest.raises(SystemExit) as excinfo:
-        main(["--masks-dir", str(masks_dir), "--out-dir", str(tmp_path / "o"), "--connectivity", "6"])
+        main(
+            ["--masks-dir", str(masks_dir), "--out-dir", str(tmp_path / "o"), "--connectivity", "6"]
+        )
     assert excinfo.value.code == 2
     with pytest.raises(SystemExit) as excinfo:
         main(
@@ -205,6 +207,4 @@ def test_state_coverage_stale_entries_are_left_alone(tmp_path, masks_dir, capsys
     main(["--masks-dir", str(partial), "--out-dir", str(out2)])
     capsys.readouterr()
     state = json.loads((out2 / "state.json").read_text(encoding="utf-8"))
-    assert state["completed"]["frame_000003"]["coverage"] == pytest.approx(
-        265 / (WIDTH * HEIGHT)
-    )
+    assert state["completed"]["frame_000003"]["coverage"] == pytest.approx(365 / (WIDTH * HEIGHT))
