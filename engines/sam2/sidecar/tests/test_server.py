@@ -506,6 +506,143 @@ class TestAnchors:
         assert len(h.server.sessions["s1"]["prompts"]["obj1"]["anchors"]) == 1
 
 
+class TestMaskPostprocess:
+    """Issue #14: propagation writes post-processed masks by default."""
+
+    MAIN = (8, 8, 23, 23)  # 16x16 = 256 px of a 64x48 frame
+    BLOB = (52, 4, 54, 6)  # 3x3 = 9 px isolated speck (floor reflection)
+    EDGE = (60, 40, 63, 41)  # 4x2 = 8 px block glued to the right edge
+
+    @pytest.fixture
+    def blob_backend(self):
+        from sam2_sidecar.backends import SyntheticBackend
+
+        class BlobBackend(SyntheticBackend):
+            """Every frame carries the object plus reflection false positives."""
+
+            def segment(self, session, prompt, frame, frame_index):
+                from sam2_sidecar.mask_io import rows_from_rects
+
+                return rows_from_rects(
+                    [TestMaskPostprocess.MAIN, TestMaskPostprocess.BLOB, TestMaskPostprocess.EDGE],
+                    width=frame["width"],
+                    height=frame["height"],
+                )
+
+        return BlobBackend()
+
+    def _run(self, backend, frame_dir, masks_dir, postprocess=None):
+        h = Harness(backend)
+        init_session(h, frame_dir)
+        h.request(
+            {
+                "type": "add_prompt",
+                "sessionId": "s1",
+                "objectId": "obj1",
+                "frameId": "0000",
+                "points": [[16, 16]],
+                "pointLabels": [1],
+            }
+        )
+        request = {
+            "type": "propagate",
+            "sessionId": "s1",
+            "objectId": "obj1",
+            "masksDir": str(masks_dir),
+        }
+        if postprocess is not None:
+            request["maskPostprocess"] = postprocess
+        return h.request(request)
+
+    def test_default_filters_blobs_and_reports_filtered_coverage(
+        self, frame_dir, tmp_path, blob_backend
+    ):
+        from sam2_sidecar.mask_io import read_mask_png
+
+        masks_dir = tmp_path / "masks"
+        resp = self._run(blob_backend, frame_dir, masks_dir)
+        masks = [r for r in resp if r["type"] == "mask"]
+        assert len(masks) == 4
+
+        filtered = 256 / (64 * 48)
+        for mask in masks:
+            assert mask["coverage"] == pytest.approx(filtered)
+            width, height, rows = read_mask_png(mask["maskPath"])
+            assert (width, height) == (64, 48)
+            assert rows[8][8] == 255, "main object must survive"
+            assert rows[23][23] == 255
+            assert rows[4][52] == 0, "isolated blob must be gone"
+            assert rows[40][60] == 0, "edge-touching blob must be gone"
+
+        state = json.loads((masks_dir / "state.json").read_text(encoding="utf-8"))
+        for entry in state["completed"].values():
+            assert entry["coverage"] == pytest.approx(filtered)
+
+    def test_enabled_false_keeps_masks_untouched_and_recomputes(
+        self, frame_dir, tmp_path, blob_backend
+    ):
+        from sam2_sidecar.mask_io import read_mask_png
+
+        masks_dir = tmp_path / "masks"
+        self._run(blob_backend, frame_dir, masks_dir)
+
+        # Same directory, post-processing disabled: the checkpoint must not
+        # serve the already-filtered masks, or `enabled: false` would be a lie.
+        resp = self._run(blob_backend, frame_dir, masks_dir, {"enabled": False})
+        done = next(r for r in resp if r["type"] == "propagate_done")
+        assert done["completed"] == 4
+        assert done["skipped"] == 0
+
+        raw = 273 / (64 * 48)
+        masks = [r for r in resp if r["type"] == "mask"]
+        for mask in masks:
+            assert mask["coverage"] == pytest.approx(raw)
+            _width, _height, rows = read_mask_png(mask["maskPath"])
+            assert rows[4][52] == 255
+            assert rows[40][60] == 255
+
+    def test_toggle_back_on_refilters_the_same_directory(self, frame_dir, tmp_path, blob_backend):
+        masks_dir = tmp_path / "masks"
+        self._run(blob_backend, frame_dir, masks_dir, {"enabled": False})
+        resp = self._run(blob_backend, frame_dir, masks_dir)
+        masks = [r for r in resp if r["type"] == "mask"]
+        assert len(masks) == 4
+        assert masks[0]["coverage"] == pytest.approx(256 / (64 * 48))
+
+    @pytest.mark.parametrize(
+        "postprocess",
+        [
+            {"minAreaRatio": -0.1},
+            {"minAreaRatio": 1.5},
+            {"connectivity": 6},
+            {"connectivity": "8"},
+            {"enabled": "yes"},
+            {"keepLargest": 1},
+            {"min_area_ratio": 0.01},  # snake_case typo must not pass silently
+            {"bogus": True},
+            [],
+        ],
+    )
+    def test_invalid_config_is_rejected_before_writing(
+        self, frame_dir, tmp_path, blob_backend, postprocess
+    ):
+        masks_dir = tmp_path / "masks"
+        resp = self._run(blob_backend, frame_dir, masks_dir, postprocess)
+        assert resp[0]["type"] == "error"
+        assert resp[0]["code"] == "invalid_request"
+        assert not masks_dir.exists(), "invalid requests must not create the masks dir"
+
+    def test_postprocess_config_is_part_of_the_checkpoint_identity(
+        self, frame_dir, tmp_path, blob_backend
+    ):
+        masks_dir = tmp_path / "masks"
+        self._run(blob_backend, frame_dir, masks_dir)
+        first = json.loads((masks_dir / "state.json").read_text(encoding="utf-8"))
+        self._run(blob_backend, frame_dir, masks_dir, {"minAreaRatio": 0.02})
+        second = json.loads((masks_dir / "state.json").read_text(encoding="utf-8"))
+        assert second["framesHash"] != first["framesHash"]
+
+
 class TestShutdown:
     def test_shutdown_replies_bye(self, frame_dir):
         h = Harness()
