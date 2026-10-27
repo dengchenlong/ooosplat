@@ -287,6 +287,17 @@ struct CreateRequest {
     input_path: String,
     quality: Quality,
     client_request_id: String,
+    #[serde(default)]
+    source_project_id: Option<Uuid>,
+    #[serde(default)]
+    reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectReshootRequest {
+    source_project_id: Uuid,
+    input_path: String,
+    quality: Quality,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,9 +386,45 @@ impl McpTools {
                     json!({"app_version":env!("CARGO_PKG_VERSION"),"engines":engines.into_iter().map(|e|json!({"name":e.kind,"version":e.version,"available":e.exists&&e.can_start})).collect::<Vec<_>>(),"authorized_input_roots":self.settings.input_roots,"capabilities":["local_video_generation","local_image_generation","task_status","bounded_logs","cancellation"],"running_task":active.map(public_task).transpose()?,"can_start_task":can_start,"recommended_poll_seconds":20}),
                 )
             }
+            "inspect_reshoot_input" => {
+                let request: InspectReshootRequest = parse(args)?;
+                let path = authorize_input(
+                    &PathBuf::from(request.input_path),
+                    &self.settings.input_roots,
+                )?;
+                let runner =
+                    crate::pipeline::runner::PipelineRunner::new(self.engines.clone(), |_| {});
+                let source = runner
+                    .inspect_reshoot_source_v2(request.source_project_id)
+                    .await?;
+                let input = runner
+                    .probe_reshoot_input_v2(
+                        request.source_project_id,
+                        &path,
+                        if path.is_dir() {
+                            crate::pipeline::runner::ReshootInputType::Images
+                        } else {
+                            crate::pipeline::runner::ReshootInputType::Video
+                        },
+                        request.quality,
+                    )
+                    .await?;
+                Ok(json!({"source":source,"input":input}))
+            }
             "create_generation_task" => {
                 let request: CreateRequest = parse(args)?;
-                let parameters = json!({"input_path":request.input_path,"quality":request.quality});
+                if request.source_project_id.is_some() != request.reshoot_options.is_some() {
+                    return Err(ServiceError::new(
+                        "INVALID_ARGUMENT",
+                        "source_project_id and reshoot_options must be supplied together",
+                    ));
+                }
+                let mut parameters =
+                    json!({"input_path":request.input_path,"quality":request.quality});
+                if let Some(options) = &request.reshoot_options {
+                    parameters["reshootOptions"] = serde_json::to_value(options)?;
+                    parameters["source_project_id"] = json!(request.source_project_id);
+                }
                 if let Some(old) =
                     self.tasks.all().await?.into_iter().find(|t| {
                         t.client_request_id.as_deref() == Some(&request.client_request_id)
@@ -396,20 +443,44 @@ impl McpTools {
                     &self.settings.input_roots,
                 )?;
                 let settings = crate::project::catalog::load_settings().await?;
-                public_task(
-                    self.tasks
-                        .create(
-                            None,
-                            path,
-                            request.quality,
-                            settings.projects_root,
-                            settings.planner_enabled,
-                            "mcp",
-                            Some(request.client_request_id),
-                            Some(parameters),
-                        )
-                        .await?,
-                )
+                if let (Some(source), Some(options)) =
+                    (request.source_project_id, &request.reshoot_options)
+                {
+                    crate::pipeline::runner::PipelineRunner::new_with_planner(
+                        self.engines.clone(),
+                        settings.planner_enabled,
+                        |_| {},
+                    )
+                    .validate_reshoot_request_v2(
+                        source,
+                        &path,
+                        if path.is_dir() {
+                            crate::pipeline::runner::ReshootInputType::Images
+                        } else {
+                            crate::pipeline::runner::ReshootInputType::Video
+                        },
+                        request.quality,
+                        options,
+                    )
+                    .await?;
+                }
+                let task = self
+                    .tasks
+                    .create(
+                        None,
+                        path,
+                        request.quality,
+                        settings.projects_root,
+                        settings.planner_enabled,
+                        "mcp",
+                        Some(request.client_request_id),
+                        Some(parameters),
+                    )
+                    .await?;
+                if let Some(source) = request.source_project_id {
+                    self.tasks.mark_reshoot(task.task_id, source).await?;
+                }
+                public_task(self.tasks.get(task.task_id).await?)
             }
             "start_task" => {
                 let request: TaskRequest = parse(args)?;
@@ -479,9 +550,15 @@ impl McpTools {
 }
 fn definitions() -> Vec<Tool> {
     let id = json!({"type":"string","format":"uuid"});
+    let reshoot_options = json!({"type":"object","additionalProperties":false,"required":["condition","allowFallback","sourceIdentity","inputIdentity","projection"],"properties":{
+        "condition":{"type":"string","enum":["good","appearance","geometry","unsure"]},"allowFallback":{"type":"boolean"},
+        "sourceIdentity":{"type":"string"},"inputIdentity":{"type":"string"},"projection":{"type":"string","enum":["perspective","equirectangular"]},
+        "imageMatchingStrategy":{"type":"string","enum":["sequential","exhaustive"]},
+        "cameraRelation":{"type":"string","enum":["same","different","unsure"]}}});
     [
         ("get_app_status","Read the running desktop application's capabilities and current task.",json!({}),json!([]),true),
-        ("create_generation_task","Persist a local generation task without starting it. Reuse client_request_id to recover a lost response.",json!({"input_path":{"type":"string","minLength":1},"quality":{"type":"string","enum":["fast","balanced","high"]},"client_request_id":{"type":"string","minLength":1,"maxLength":256}}),json!(["input_path","quality","client_request_id"]),false),
+        ("inspect_reshoot_input","Inspect a registered source project and authorized supplemental input. Use returned identities for an explicit reshoot request. Does not start reconstruction or scan a full PLY.",json!({"source_project_id":id,"input_path":{"type":"string","minLength":1},"quality":{"type":"string","enum":["fast","balanced","high"]}}),json!(["source_project_id","input_path","quality"]),true),
+        ("create_generation_task","Persist a generation task without starting it. For a reshoot, supply source_project_id and explicit reshoot_options from inspect_reshoot_input. Fallback requires explicit authorization. Reuse client_request_id to recover a lost response.",json!({"input_path":{"type":"string","minLength":1},"quality":{"type":"string","enum":["fast","balanced","high"]},"client_request_id":{"type":"string","minLength":1,"maxLength":256},"source_project_id":id,"reshoot_options":reshoot_options}),json!(["input_path","quality","client_request_id"]),false),
         ("start_task","Accept a task for application-owned background execution. Poll status every 15–30 seconds; acceptance is not completion.",json!({"task_id":id}),json!(["task_id"]),false),
         ("list_tasks","List shared GUI and MCP tasks.",json!({"cursor":{"type":"string","format":"uuid"},"limit":{"type":"integer","minimum":1,"maximum":100,"default":50}}),json!([]),true),
         ("get_task_status","Read task status, evidence, heuristic error classification and local artifact metadata.",json!({"task_id":id}),json!(["task_id"]),true),

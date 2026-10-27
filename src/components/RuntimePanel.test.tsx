@@ -54,6 +54,18 @@ afterEach(async () => {
 });
 
 describe("runtime panel", () => {
+  it.each(['zh-CN', 'en'])('does not retain the finishing monitor after a durable completion (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    const value = { ...snapshot(), phase: 'finishing', training: { ...snapshot().training!, iteration: 100 } };
+    const show = async (status: string) => act(async () => root.render(<LanguageProvider><TaskProgress status={status} stage={status === 'completed' ? 'completed' : 'trainingSplats'} progress={100} runtime={value} logs={[{ key: 'published', text: '已发布 200 个 Splat', source: 'system' }]} /></LanguageProvider>));
+    await show('running');
+    expect(container.querySelector('.runtime-panel')).not.toBeNull();
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('99.9%');
+    await show('completed');
+    expect(container.querySelector('.runtime-panel')).toBeNull();
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('100.0%');
+    expect(container.querySelector('.live-log')?.textContent).toContain('200');
+  });
   it('keeps the same monitor container across preparation, samples and a true operation transition', async () => {
     const renderTask = async (runtime: RuntimeSnapshot | null, substage: string) => act(async () => root.render(<LanguageProvider><TaskProgress status="running" stage="trainingSplats" substage={substage} progress={99.99} runtime={runtime} logs={[]} message="正在准备训练图片" /></LanguageProvider>));
     await renderTask(null, 'panoramaTrainingPreparation');

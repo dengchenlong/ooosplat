@@ -243,6 +243,34 @@ describe("App preview workspace", () => {
     window.localStorage.clear();
   });
 
+  it("exposes the specific failed engine and its diagnostics", async () => {
+    await act(async () => {
+      useAppStore.setState({ engines: [{
+        kind: "ffprobe", path: "E:\\engines\\ffprobe.exe", exists: true,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "exit code -1073741515\nMissing runtime dependency",
+      }, {
+        kind: "ffmpeg", path: "E:\\engines\\ffmpeg.exe", exists: false,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "Executable not found",
+      }] });
+    });
+    const { checkEngines } = await import('../lib/backend');
+    const previousChecks = vi.mocked(checkEngines).mock.calls.length;
+    const details = container.querySelector<HTMLElement>(".engine-diagnostics")!;
+    const trigger = details.querySelector<HTMLButtonElement>(".engine-summary")!;
+    expect(trigger.textContent).toBe("2 个引擎异常");
+    expect(trigger.textContent).not.toMatch(/ffmpeg|ffprobe|colmap|brush/i);
+    expect(details.querySelector(".engine-diagnostics-panel")).toBeNull();
+    await act(async () => { trigger.focus(); });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(details.textContent).toContain("FFprobe");
+    expect(details.textContent).toContain("E:\\engines\\ffprobe.exe");
+    expect(details.querySelector('.engine-item-flags')?.textContent).toContain("可启动否");
+    expect(details.textContent).toContain("Missing runtime dependency");
+    expect(vi.mocked(checkEngines).mock.calls.length).toBe(previousChecks);
+  });
+
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
     expect(container.querySelector(".version-tag")?.textContent).toBe(`LOCAL / ${packageMetadata.version}`);
@@ -261,6 +289,23 @@ describe("App preview workspace", () => {
     expect(tooltip?.textContent).toContain("60%–80% 重叠");
     expect(tooltip?.textContent).toContain("固定镜头、焦距、分辨率和曝光");
     expect(tooltip?.textContent).toContain("AI 生成图片容易出现");
+  });
+
+  it('accepts a portrait MOV as ordinary video without a panorama warning or extra confirmation', async () => {
+    mocks.selectVideo.mockResolvedValueOnce('E:/Download/LocalSend/IMG_8023.MOV');
+    mocks.probeAndPlan.mockResolvedValueOnce({
+      inputType: 'video', video: { duration: 10, width: 1920, height: 1080, rotation: -90 }, imageSequence: null,
+      plan: { estimatedFrames: 60 }, projectionDetection: { sourceIdentity: 'phone-mov', confirmedErp: false, requiresChoice: false, supportedErp: false, unsupported: false, reason: '', previewJpeg: [] },
+    });
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.media-source-status')?.textContent).toContain('将按普通视频处理');
+    expect(container.querySelector('.media-source-warning, .video-type-select')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startPipeline).toHaveBeenCalledWith('E:/Download/LocalSend/IMG_8023.MOV', 'balanced', 'E:\\Projects', true, expect.any(String), 'auto', 'phone-mov', 'exhaustive');
   });
 
   it("requires an inline choice for ambiguous ERP and never opens a projection dialog", async () => {
@@ -998,15 +1043,17 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".reshoot-workflow-dialog")).toBeNull();
     expect(container.querySelector(".reshoot-task-page")).not.toBeNull();
     expect(container.querySelector(".reshoot-source-summary")).toBeNull();
-    expect(container.querySelectorAll(".reshoot-task-page .quality-option:disabled")).toHaveLength(3);
-    expect(container.querySelector(".reshoot-task-page .locked-setting")?.textContent).toContain("继承源任务 · 不可修改");
-    expect(container.querySelector(".reshoot-task-page .locked-quality-settings .quality-option.selected")).not.toBeNull();
-    expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.disabled).toBe(true);
+    expect(container.querySelector('.reshoot-capture-tips')).toBeNull();
+    expect(container.querySelector('.reshoot-task-page')?.textContent).not.toContain('让补拍画面与原素材保持足够重叠，缓慢移动并避免模糊和大量运动物体。');
+    expect(container.querySelectorAll(".reshoot-task-page .quality-option:disabled")).toHaveLength(0);
+    expect(container.querySelector(".reshoot-task-page .locked-setting")).toBeNull();
+    expect(container.querySelector(".reshoot-task-page .quality-option.selected")).not.toBeNull();
+    expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.disabled).toBe(false);
     expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.getAttribute("aria-checked")).toBe("true");
     expect(container.querySelector(".reshoot-task-page .planner-switch em")).toBeNull();
   });
 
-  it("shows automatic optimization as locked off when the source task disabled it", async () => {
+  it("defaults optimization to the source value but allows changing it", async () => {
     mocks.inspectReshootSource.mockResolvedValueOnce({
       projectId: project.id,
       projectName: project.name,
@@ -1025,7 +1072,7 @@ describe("App preview workspace", () => {
     await flush();
 
     const planner = container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch");
-    expect(planner?.disabled).toBe(true);
+    expect(planner?.disabled).toBe(false);
     expect(planner?.getAttribute("aria-checked")).toBe("false");
     expect(planner?.textContent).not.toContain("继承源任务");
   });
@@ -1067,7 +1114,34 @@ describe("App preview workspace", () => {
     expect(planner.getAttribute("aria-checked")).toBe("false");
   });
 
-  it("probes Alpha reshoot media and blocks a mismatched camera resolution", async () => {
+  it.each([false, true].flatMap(allowFallback => ['same', 'different', 'unsure'].map(cameraRelation => ({ allowFallback, cameraRelation }))))('starts reshoot after both answers (Auto Optimize=$allowFallback, camera=$cameraRelation)', async ({ allowFallback, cameraRelation }) => {
+    mocks.inspectReshootSource.mockResolvedValue({ projectId:project.id,projectName:project.name,quality:'balanced',plannerEnabled:true,cameraId:1,cameraModel:'SIMPLE_RADIAL',width:1920,height:1080,sourceImageCount:100,eligible:true,reason:null,sourceIdentity:'source-v1',projection:'perspective',warmAvailable:true });
+    mocks.selectVideo.mockResolvedValue('E:/new-camera.mov');
+    mocks.probeReshootInput.mockResolvedValue({ inputType:'video',imageCount:null,duration:12,preparedWidth:1280,preparedHeight:1920,estimatedFrames:30,hasAlpha:false,maskCount:0,compatible:true,incompatibilityReason:null,sourceIdentity:'input-v1',estimate:{estimatedMs:1000,lowerBoundMs:500,upperBoundMs:2000,confidence:'low',sampleCount:0,basis:''} });
+    mocks.startReshootPipeline.mockImplementation(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-link')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .input-picker > .path-picker')!.click()); await flush();
+    if (!allowFallback) await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .planner-switch')!.click());
+    expect(container.querySelector<HTMLButtonElement>('.reshoot-task-page .planner-switch')?.getAttribute('aria-checked')).toBe(String(allowFallback));
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    expect(container.querySelectorAll('.preflight-dialog input:checked')).toHaveLength(0);
+    await act(async () => container.querySelector<HTMLInputElement>('.preflight-dialog input[value="good"]')!.click());
+    expect(container.querySelector('.preflight-dialog input[type="checkbox"]')).toBeNull();
+    expect(container.querySelector('.preflight-dialog')?.textContent).not.toContain('补拍方案');
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    expect(container.querySelector('.preflight-dialog h2')?.textContent).toBe('补拍素材与原素材的拍摄设置相同吗？');
+    expect(container.querySelector('.preflight-dialog input:checked')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')?.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLInputElement>(`.preflight-dialog input[value="${cameraRelation}"]`)!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startReshootPipeline).toHaveBeenCalledWith(expect.objectContaining({plannerEnabled:allowFallback,reshootOptions:expect.objectContaining({condition:'good',cameraRelation,allowFallback,sourceIdentity:'source-v1',inputIdentity:'input-v1',projection:'perspective'})}));
+  });
+
+  it("probes Alpha reshoot media and preserves a backend incompatibility refusal", async () => {
     mocks.selectVideo.mockResolvedValue("E:\\Capture\\reshoot.mov");
     mocks.probeReshootInput.mockResolvedValue({
       inputType: "video",
@@ -1091,7 +1165,7 @@ describe("App preview workspace", () => {
     await act(async () => { videoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
 
-    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video");
+    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video", "balanced", true);
     expect(container.querySelector(".reshoot-plan.incompatible")?.textContent).toContain("1080 × 1920");
     expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .primary-action")?.disabled).toBe(true);
   });
@@ -1192,7 +1266,7 @@ describe("App preview workspace", () => {
     expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("Task List");
     expect(container.textContent).toContain("Start Generation");
-    expect(container.textContent).toContain("Checking bundled engines");
+    expect(container.textContent).toContain("Checking engines");
     expect(languageButton?.textContent).toContain("中文");
     expect(languageButton?.title).toBe("中英文切换 / Switch language");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
@@ -1923,7 +1997,31 @@ describe("App preview workspace", () => {
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
   });
 
-  it("shows completed-project statistics without a duplicate detail action bar", async () => {
+  it('hides the reshoot plan and inherited-setting badge in a running legacy project detail', async () => {
+    const running: ProjectSummary = { ...project, id: '22222222-2222-2222-2222-222222222222', status: 'running', finalPly: null };
+    mocks.getProjectTaskDetail.mockResolvedValue({
+      project: running, inputType: 'video', sourcePath: 'E:/new-captures.mov', projectsRoot: 'E:/Projects',
+      plannerEnabled: true, estimatedFrames: 90, stage: 'trainingSplats', progress: 65, video: null, imageSequence: null,
+      sourceProjectId: project.id, logs: [], reshootRecipe: {
+        options: { condition: 'appearance', allowFallback: true, sourceIdentity: 'source', inputIdentity: 'input', projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+        initial: { reconstruction: 'incremental', training: 'cold' }, actual: { reconstruction: 'incremental', training: 'cold' },
+      },
+    });
+    await act(async () => useAppStore.getState().setProjects([running]));
+    await flush();
+    await act(async () => container.querySelector<HTMLElement>('#unfinished-task-group-content .project-row')!.click());
+    await flush();
+    const configuration = container.querySelector('.unfinished-task-detail .project-configuration-detail')!;
+    expect(configuration).not.toBeNull();
+    expect(configuration.textContent).toContain('new-captures.mov');
+    for (const caption of ['补拍方案', '整体结构正常，但生成效果不满意', '增量重建', '允许失败后']) expect(configuration.textContent).not.toContain(caption);
+    expect(configuration.querySelector('.locked-setting')).toBeNull();
+    expect(configuration.querySelectorAll('.quality-option:disabled')).toHaveLength(3);
+    expect(configuration.querySelector<HTMLButtonElement>('.planner-switch')?.disabled).toBe(true);
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("shows completed-project statistics without plan details or a duplicate action bar (reshoot: %s)", async reshoot => {
     mocks.getProjectTaskDetail.mockResolvedValueOnce({
       project,
       inputType: "video",
@@ -1937,7 +2035,11 @@ describe("App preview workspace", () => {
       registeredImages: 90,
       video: { duration: 3, width: 2560, height: 3840, fps: 30, totalFrames: 90, codec: "h264", rotation: 0, hasAlpha: true, pixelFormat: "rgba" },
       imageSequence: null,
-      sourceProjectId: null,
+      sourceProjectId: reshoot ? 'original-project' : null,
+      reshootRecipe: reshoot ? {
+        options: { condition: 'appearance', allowFallback: true, sourceIdentity: 'source', inputIdentity: 'input', projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+        initial: { reconstruction: 'incremental', training: 'cold' }, actual: { reconstruction: 'incremental', training: 'cold' },
+      } : null,
       logs: [],
     });
     await act(async () => useAppStore.getState().setColmapAcceleration({
@@ -1961,6 +2063,7 @@ describe("App preview workspace", () => {
     expect(detail?.querySelector(".locked-quality-settings [aria-checked=true]")?.textContent).toContain("均衡");
     expect(detail?.querySelector<HTMLButtonElement>(".planner-switch")?.disabled).toBe(true);
     expect(detail?.querySelector(".locked-setting")).toBeNull();
+    for (const caption of ['补拍方案', '整体结构正常，但生成效果不满意', '增量重建', '允许失败后']) expect(detail?.querySelector('.project-configuration-detail')?.textContent).not.toContain(caption);
     expect(detail?.textContent).toContain("COLMAP GPU 加速开启");
     expect(detail?.textContent).not.toContain("COLMAP GPU 加速已开启");
     expect(detail?.textContent).toContain("已自动提取透明画面和 COLMAP Mask · rgba");

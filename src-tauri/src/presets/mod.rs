@@ -4,6 +4,7 @@ pub mod quality;
 
 pub use panorama_training::{
     resolve_panorama_training_preset, PanoramaTrainingConfig, PanoramaTrainingSnapshot,
+    MAX_PANORAMA_SPLATS,
 };
 
 pub use pipeline_config::{

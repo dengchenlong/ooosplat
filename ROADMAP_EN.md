@@ -34,7 +34,8 @@ Current `main` version identifier: **0.7.0**. This page tracks source implementa
 | P1 | Panorama platform and large-scene acceptance | Main supports standard ERP video and images. Continue checking source diversity, long inputs, seams, directional coverage, and large-scale densification. The 10-million cap is permitted, not a verified achieved count. | [Verification record](docs/PANORAMA_IMAGES_V1.md) |
 | P2 | AI masking and fine image matting Beta | Validate native person-exclusion and subject-Alpha inference, corrections, model distribution, and COLMAP/Brush semantics before enabling verified platforms. Not available on current main. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
-| P3 | Panorama input expansion and reshoots | Explore additional projections and panorama reshoots beyond standard full monoscopic ERP. Dual-fisheye, stereo, VR180, cropped panoramas, and private camera originals remain unsupported. | To be created |
+| Under validation | Reshoot v2 | Multiple cameras, mixed sizes, warm-start training and multi-batch ERP reshoots. The native Ballintoy core flow passed; real cross-device inputs and desktop interaction still need acceptance. | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) · [Validation notes](docs/RESHOOT_V2.md) |
+| P3 | Panorama input expansion | Explore additional projections; dual-fisheye, stereo, VR180, cropped panoramas, and private originals remain unsupported. | To be created |
 
 ## Completed
 

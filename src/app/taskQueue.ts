@@ -11,17 +11,18 @@ export function draftIsRunnable(draft: TaskDraft): boolean {
 }
 
 export function draftProjectionReady(draft: TaskDraft): boolean {
-  if (draft.kind !== "generation") return true;
+  if (draft.kind === 'reshoot' && !draft.projectionDetection) return true;
   const projection = resolvedProjection(draft);
+  if (draft.kind === 'reshoot' && draft.reshootSource?.projection && projection !== 'auto' && projection !== draft.reshootSource.projection) return false;
   if (projection === 'equirectangular') return !!draft.projectionDetection?.supportedErp;
   return projection !== 'auto' || !draft.projectionDetection?.requiresChoice;
 }
 
 export function firstQueueInputIssue(drafts: TaskDraft[]): { draft: TaskDraft; reason: 'checking' | 'analysis' | 'projection' } | null {
   for (const draft of drafts) {
-    if (draft.kind !== 'generation' || draft.running || !draft.inputPath) continue;
+    if (draft.running || !draft.inputPath) continue;
     if (draft.inputChecking || draft.needsValidation) return { draft, reason: 'checking' };
-    if (draft.inputError || draft.error || !draft.plan) return { draft, reason: 'analysis' };
+    if (draft.inputError || draft.error || (draft.kind === 'reshoot' ? !draft.reshootPlan?.compatible : !draft.plan)) return { draft, reason: 'analysis' };
     if (!draftProjectionReady(draft)) return { draft, reason: 'projection' };
   }
   return null;

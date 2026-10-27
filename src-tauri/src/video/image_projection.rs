@@ -205,6 +205,15 @@ pub fn source_identity(dir: &Path) -> Result<String> {
 }
 
 pub fn analyze(dir: &Path) -> Result<ImageFolderAnalysis> {
+    analyze_impl(dir, false)
+}
+
+/// Reshoot-only input inspection: never weaken ordinary generation validation.
+pub fn analyze_reshoot(dir: &Path) -> Result<ImageFolderAnalysis> {
+    analyze_impl(dir, true)
+}
+
+fn analyze_impl(dir: &Path, mixed_sizes: bool) -> Result<ImageFolderAnalysis> {
     let identity = source_identity(dir)?;
     let files = list_images(dir)?;
     if files.len() < 2 {
@@ -229,7 +238,7 @@ pub fn analyze(dir: &Path) -> Result<ImageFolderAnalysis> {
     let first = &images[0];
     if let Some(other) = images
         .iter()
-        .find(|p| (p.width, p.height) != (first.width, first.height))
+        .find(|p| !mixed_sizes && (p.width, p.height) != (first.width, first.height))
     {
         return Err(SplatError::InvalidVideo(format!(
             "图片序列分辨率不一致：{} 为 {}×{}，预期 {}×{}",
@@ -240,13 +249,19 @@ pub fn analyze(dir: &Path) -> Result<ImageFolderAnalysis> {
             first.height
         )));
     }
-    let ratio = first.width >= 64 && first.width == first.height.saturating_mul(2);
+    let ratio = images
+        .iter()
+        .all(|p| p.width >= 64 && p.width == p.height.saturating_mul(2));
     let unsupported = images.iter().any(|p| p.unsupported);
     let confirmed = ratio && !unsupported && images.iter().all(|p| p.complete_erp);
     let info = ImageSequenceInfo {
         image_count: images.len() as u64,
-        width: first.width,
-        height: first.height,
+        width: images.iter().map(|p| p.width).max().unwrap_or(first.width),
+        height: images
+            .iter()
+            .map(|p| p.height)
+            .max()
+            .unwrap_or(first.height),
         has_alpha: images.iter().any(|p| p.alpha),
         requires_large_sequence_confirmation: images.len() as u64 > LARGE_SEQUENCE_WARNING_COUNT,
     };

@@ -4,12 +4,14 @@ import { ProjectRow } from "../components/ProjectRow";
 import { ProjectResultStats } from "../components/ProjectResultStats";
 import { TaskConfiguration } from "../components/TaskConfiguration";
 import { MediaSourceStatus } from '../components/MediaSourceStatus';
+import { EngineStatusPopover } from '../components/EngineStatusPopover';
 import { isProgressEvent, stagePercent } from '../lib/progressState';
 import { TaskProgress } from "../components/TaskProgress";
 import { taskIsActive } from "../types/tasks";
 import { SharedTaskDetail } from "../components/SharedTaskDetail";
 import { useSharedTasks } from "./useSharedTasks";
 import { useProgressMessage } from "./useProgressMessage";
+import { useGpsDetection } from './useGpsDetection';
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   BellDot, Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu,
@@ -358,7 +360,6 @@ export function App() {
   submittedIdsRef.current = new Set(Object.keys(sharedTasks));
   const submittedIdsKey = Object.keys(sharedTasks).sort().join('|');
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
-  const selectedReshootSourceProject = selectedDraft?.kind === "reshoot" ? store.projects.find(project => project.id === selectedDraft.sourceProjectId) ?? null : null;
   const selectedProject = selectedTask.kind === "project"
     ? store.projects.find((project) => project.id === selectedTask.id)
       ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
@@ -418,6 +419,18 @@ export function App() {
       }),
     }));
   }, [mutateTaskWorkspace]);
+
+  useGpsDetection(drafts, updateDraft);
+  const lastGpsEvent = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeDraftId || !store.liveTask || !drafts.find(d => d.id === activeDraftId)?.running) return;
+    const event = [...store.events].reverse().find(e => e.taskId === store.liveTask!.task_id && e.runId === store.liveTask!.run_id && (e.message === '[GPS] detected' || e.message === 'GPS 辅助未启用，已切换为不使用 GPS 的生成方式。'));
+    if (!event) return;
+    const key = `${activeDraftId}:${event.taskId}:${event.runId}:${event.sequence}`;
+    if (lastGpsEvent.current === key) return;
+    lastGpsEvent.current = key;
+    updateDraft(activeDraftId, draft => ({ gpsFallback: event.message !== '[GPS] detected' ? projectionIdentity(draft) : undefined, gpsDetection: { sourceIdentity: projectionIdentity(draft), detected: true } }));
+  }, [store.events, store.liveTask, drafts, activeDraftId, updateDraft]);
 
   useEffect(() => {
     if (!store.error) {
@@ -544,11 +557,14 @@ export function App() {
     queueCompletionRef.current = new Promise<void>(resolve => { complete = resolve; });
     try {
       while (true) {
-        const draft = taskWorkspaceRef.current.drafts.find(item => item.kind === 'generation' && !item.running && item.inputPath && (item.needsValidation || item.inputChecking || (!item.plan && !item.inputError && !item.error)));
+        const draft = taskWorkspaceRef.current.drafts.find(item => !item.running && item.inputPath && (item.needsValidation || item.inputChecking || (!(item.kind === 'reshoot' ? item.reshootPlan : item.plan) && !item.inputError && !item.error)));
         if (!draft?.inputPath) break;
         const pending = inputAnalysisPromises.current.get(draft.id);
         if (pending) await pending;
-        else if (!draft.inputChecking) await analyze(draft.id, draft.inputPath, draft.quality, draft.plannerEnabled);
+        else if (!draft.inputChecking) {
+          if (draft.kind === 'reshoot' && draft.sourceProjectId) await analyzeReshoot(draft.id, draft.sourceProjectId, draft.inputPath, draft.inputType);
+          else await analyze(draft.id, draft.inputPath, draft.quality, draft.plannerEnabled);
+        }
         else break;
       }
       const issue = firstQueueInputIssue(taskWorkspaceRef.current.drafts);
@@ -1132,14 +1148,16 @@ export function App() {
       try {
         const source = await inspectReshootSource(sourceProjectId);
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }) });
+        const current = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+        updateDraft(draftId, { reshootSource: source, ...(current?.plannerDefaultPending && !source.imported ? { plannerEnabled: source.plannerEnabled, plannerDefaultPending: false } : {}) });
         if (!source.eligible) {
           updateDraft(draftId, { error: source.reason ?? t("reshoot.ineligible"), inputChecking: false });
           return false;
         }
-        const plan = await probeReshootInput(sourceProjectId, path, inputType);
+        const settings = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+        const plan = await probeReshootInput(sourceProjectId, path, inputType, settings?.quality, settings?.plannerEnabled);
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { reshootPlan: plan, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible"), inputChecking: false });
+        updateDraft(draftId, { reshootPlan: plan, projectionDetection: plan.projectionDetection ?? null, imageSequence: plan.imageSequence ?? null, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible"), inputChecking: false });
         return plan.compatible;
       } catch (error) {
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
@@ -1199,6 +1217,10 @@ export function App() {
         plan: null,
         estimate: null,
         reshootPlan: null,
+        projectionDetection: null,
+        projectionAnswer: null,
+        videoProjection: 'auto',
+        inputChecking: false,
         error: null,
       });
     }
@@ -1247,14 +1269,15 @@ export function App() {
   };
 
   const chooseQuality = async (quality: Quality) => {
-    if (!selectedDraft || selectedDraft.running || selectedDraft.quality === quality || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
+    if (!selectedDraft || selectedDraft.running || selectedDraft.quality === quality) return;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
     if (selectedDraft.kind === "generation" && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled, true);
+    if (selectedDraft.kind === "reshoot") updateDraft(selectedDraft.id, { estimate: selectedDraft.reshootPlan?.estimate ?? null });
   };
 
   const changePlannerEnabled = async () => {
-    if (!selectedDraft || selectedDraft.running || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
+    if (!selectedDraft || selectedDraft.running) return;
     const enabled = !selectedDraft.plannerEnabled;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { plannerEnabled: enabled, plannerDefaultPending: false, plan: null, estimate: null, error: null });
@@ -1546,22 +1569,34 @@ export function App() {
 
   const runReshoot = async (draftId = selectedDraft?.id) => {
     const draft = taskWorkspaceRef.current.drafts.find((item) => item.id === draftId);
-    if (!draft || draft.kind !== "reshoot" || !draft.sourceProjectId || !draft.inputPath || !draft.reshootPlan?.compatible || !store.projectsRoot) return;
+    if (!draft || draft.kind !== "reshoot" || !draft.sourceProjectId || !draft.inputPath || !draft.reshootPlan?.compatible || !store.projectsRoot || !draftProjectionReady(draft)) return;
     if (!claimRunGate()) return;
     let preflightPassed = false;
+    let reshootAnswers: PreflightAnswers | null = null;
+    let confirmedDraft = draft;
     try {
       const source = await inspectReshootSource(draft.sourceProjectId);
       if (!source.eligible) {
-        updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.reason ?? t("reshoot.ineligible") });
+        updateDraft(draft.id, { reshootSource: source, error: source.reason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
-      const finalPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType);
+      const finalPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, draft.quality, draft.plannerEnabled);
       if (!finalPlan.compatible) {
         updateDraft(draft.id, { reshootPlan: finalPlan, error: finalPlan.incompatibilityReason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
+      updateDraft(draft.id, { reshootSource: source, reshootPlan: finalPlan, projectionDetection: finalPlan.projectionDetection ?? null });
+      confirmedDraft = taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft;
+      if (!draftProjectionReady(confirmedDraft)) return;
+      reshootAnswers = await confirmPreflight(collectPreflightQuestions([confirmedDraft]), t('generate.start'));
+      if (!reshootAnswers) { if (autoRunNextRef.current) setAutoQueueEnabled(false); return; }
+      const latestSource = await inspectReshootSource(draft.sourceProjectId);
+      const latestPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, confirmedDraft.quality, confirmedDraft.plannerEnabled);
+      if (latestSource.sourceIdentity !== source.sourceIdentity || latestPlan.sourceIdentity !== finalPlan.sourceIdentity) throw new Error(t('preflight.changed'));
+      const current = taskWorkspaceRef.current.drafts.find(item => item.id === draft.id);
+      if (!current || current.inputChecking || preflightSnapshot(current) !== preflightSnapshot(confirmedDraft) || useAppStore.getState().projectsRoot !== store.projectsRoot) throw new Error(t('preflight.changed'));
       preflightPassed = true;
     } catch (error) {
       updateDraft(draft.id, { error: messageOf(error) });
@@ -1589,8 +1624,17 @@ export function App() {
         inputType: draft.inputType,
         projectsRoot: store.projectsRoot,
         workspaceTaskId: draft.id,
-        quality: draft.quality,
-        plannerEnabled: draft.plannerEnabled,
+        quality: confirmedDraft.quality,
+        plannerEnabled: confirmedDraft.plannerEnabled,
+        reshootOptions: {
+          condition: reshootAnswers![`${draft.id}:reshootCondition`] as import('../types/pipeline').ReshootCondition,
+          cameraRelation: confirmedDraft.reshootSource!.projection === 'equirectangular' ? undefined : reshootAnswers![`${draft.id}:reshootCamera`] as import('../types/pipeline').ReshootCameraRelation,
+          allowFallback: confirmedDraft.plannerEnabled,
+          sourceIdentity: confirmedDraft.reshootSource!.sourceIdentity!,
+          inputIdentity: confirmedDraft.reshootPlan!.sourceIdentity!,
+          projection: confirmedDraft.reshootSource!.projection ?? 'perspective',
+          imageMatchingStrategy: imageMatchingStrategy(confirmedDraft,reshootAnswers!),
+        },
       });
       store.setResult(result);
       store.setPhase("completed");
@@ -1675,10 +1719,16 @@ export function App() {
     if (!draft.sourceProjectId) return;
     if (draft.inputPath) void analyzeReshoot(draft.id, draft.sourceProjectId, draft.inputPath, draft.inputType);
     else {
+      const revision = (inputAnalysisRevisions.current.get(draft.id) ?? 0) + 1;
+      inputAnalysisRevisions.current.set(draft.id, revision);
       updateDraft(draft.id, { inputChecking: true, needsValidation: false });
       void inspectReshootSource(draft.sourceProjectId)
-        .then((source) => updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
-        .catch((error) => updateDraft(draft.id, { error: messageOf(error), inputChecking: false }));
+        .then((source) => {
+          if (inputAnalysisRevisions.current.get(draft.id) !== revision) return;
+          const current = taskWorkspaceRef.current.drafts.find(item => item.id === draft.id);
+          updateDraft(draft.id, { reshootSource: source, ...(current?.plannerDefaultPending && !source.imported ? { plannerEnabled: source.plannerEnabled, plannerDefaultPending: false } : {}), error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false });
+        })
+        .catch((error) => { if (inputAnalysisRevisions.current.get(draft.id) === revision) updateDraft(draft.id, { error: messageOf(error), inputChecking: false }); });
     }
   // Validation is intentionally lazy and keyed only by selection.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1758,7 +1808,7 @@ export function App() {
   const projectConfigurationDetails = selectedProject && projectDetail
     ? projectDetail.imported
       ? <ImportedProjectDetails detail={projectDetail} onRevealSource={() => void revealImportedSource(selectedProject.id).catch(error => setProjectActionError({ projectId: selectedProject.id, message: messageOf(error), occurredAt: Date.now() }))} onRelink={() => void relinkImportedSource(selectedProject.id)} />
-      : <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} videoProjection={projectDetail.videoProjection} inputProjection={projectDetail.inputProjection} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
+      : <TaskConfiguration active={selectedProject.status === "running"} reshootRecipe={projectDetail.reshootRecipe} sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} videoProjection={projectDetail.videoProjection} inputProjection={projectDetail.inputProjection} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
     : null;
   const historicalTaskProgress = selectedProject && projectDetail
     ? projectDetail.imported || projectDetail.stage == null || projectDetail.progress == null
@@ -1807,7 +1857,7 @@ export function App() {
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
         {updates.release && <button className="settings-action update-notice-action" type="button" onClick={updates.open}><BellDot size={15} />{t("update.found")}</button>}
         <button className="settings-action" type="button" onClick={() => setSettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>
-        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
+        <EngineStatusPopover engines={store.engines} />
       </div>
     </header>
 
@@ -1839,7 +1889,7 @@ export function App() {
             </button>
             {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
           </div>
-          {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} checking={(selectedDraft.inputChecking && !selectedDraft.inputPlanning) || selectedDraft.needsValidation} error={selectedDraft.inputError} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyze(selectedDraft.id, selectedDraft.inputPath!, selectedDraft.quality, selectedDraft.plannerEnabled)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
+          {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} gpsDetected={selectedDraft.gpsDetection?.sourceIdentity === projectionIdentity(selectedDraft) && selectedDraft.gpsDetection.detected} gpsFallback={selectedDraft.gpsFallback === projectionIdentity(selectedDraft)} checking={(selectedDraft.inputChecking && !selectedDraft.inputPlanning) || selectedDraft.needsValidation} error={selectedDraft.inputError} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyze(selectedDraft.id, selectedDraft.inputPath!, selectedDraft.quality, selectedDraft.plannerEnabled)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
           </div>
         </div>
 
@@ -1892,11 +1942,11 @@ export function App() {
         </>}
 
         {selectedDraft?.kind === "reshoot" && <section className="reshoot-task-page">
-          <p className="reshoot-task-intro">{t("reshoot.sameCameraHint")}</p>
-          <ul className="reshoot-capture-tips"><li>{t("reshoot.sameDevice")}</li><li>{t("reshoot.sameFraming")}</li><li>{t("reshoot.keepOverlap")}</li></ul>
+          <p className="reshoot-task-intro">{t(selectedDraft.reshootSource?.projection === 'equirectangular' ? 'reshoot.panoramaHint' : 'reshoot.multiCameraHint')}</p>
 
           <div className="form-section">
             <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
+            <div className="source-input-card">
             <div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
               <div className="input-type-picker">
                 <button className="input-picker-toggle" type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
@@ -1917,7 +1967,8 @@ export function App() {
               </button>
               {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
             </div>
-            {reshootBusy && <p className="reshoot-analysis"><LoaderCircle className="spin" size={14} />{t("reshoot.analyzing")}</p>}
+            {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} gpsDetected={selectedDraft.gpsDetection?.sourceIdentity === projectionIdentity(selectedDraft) && selectedDraft.gpsDetection.detected} gpsFallback={selectedDraft.gpsFallback === projectionIdentity(selectedDraft)} checking={selectedDraft.inputChecking || selectedDraft.needsValidation} error={selectedDraft.error} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyzeReshoot(selectedDraft.id, selectedDraft.sourceProjectId!, selectedDraft.inputPath!, selectedDraft.inputType)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
+            </div>
           </div>
 
           <div className="form-section">
@@ -1929,14 +1980,14 @@ export function App() {
           </div>
 
           <div className="form-section">
-            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label>{selectedReshootSourceProject?.taskKind !== "import" && <span className="locked-setting"><Lock size={12} />{t("reshoot.inheritedReadonly")}</span>}</div>
-            <div className={`quality-settings ${selectedReshootSourceProject?.taskKind === "import" ? "" : "locked-quality-settings"}`}>
+            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label></div>
+            <div className="quality-settings">
               <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>
-                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
+                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                   <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
                 </button>)}
               </div>
-              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} onClick={() => void changePlannerEnabled()}>
+              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
                 <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
                 <i aria-hidden="true"><span /></i>
               </button>
@@ -1959,7 +2010,7 @@ export function App() {
           </div>}
           {selectedDraft.reshootPlan?.hasAlpha && <div className="alpha-source-status" role="status"><Blend size={17} /><span><strong>{selectedDraft.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{t("reshoot.alphaDetected")}</small></span></div>}
           {selectedDraft.reshootPlan && !selectedDraft.reshootPlan.compatible && <div className="reshoot-plan incompatible"><strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : ""}</strong><span>{selectedDraft.reshootPlan.preparedWidth} × {selectedDraft.reshootPlan.preparedHeight}</span><span>{selectedDraft.reshootPlan.incompatibilityReason}</span></div>}
-          <button className="primary-action" type="button" disabled={runBusy || reshootBusy || selectedDraft.inputChecking || !selectedDraft.reshootPlan?.compatible || !store.projectsRoot || missingEngines.length > 0} onClick={() => void runReshoot()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+          <button className="primary-action" type="button" disabled={runBusy || reshootBusy || !!preflight || selectedDraft.inputChecking || !draftProjectionReady(selectedDraft) || !selectedDraft.reshootPlan?.compatible || !store.projectsRoot || missingEngines.length > 0} onClick={() => void runReshoot()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
           {detailErrorBanner}
         </section>}
 

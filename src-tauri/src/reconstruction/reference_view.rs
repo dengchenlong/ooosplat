@@ -337,6 +337,8 @@ fn read_view(dataset: &Path, wanted: Option<&str>) -> Result<TrainingReferenceVi
 #[derive(Deserialize)]
 struct PanoramaManifest {
     #[serde(default)]
+    reference_image: Option<String>,
+    #[serde(default)]
     config: PanoramaSource,
     faces: Vec<PanoramaFace>,
 }
@@ -371,6 +373,16 @@ fn load(root: &Path) -> Result<TrainingReferenceView> {
             &dataset.join("manifest.json"),
             32 * 1024 * 1024,
         )?)?;
+        if let Some(reference) = &manifest.reference_image {
+            if !manifest
+                .faces
+                .iter()
+                .any(|f| f.face == "front" && &f.image_name == reference)
+            {
+                return Err(invalid());
+            }
+            return read_view(&dataset, Some(reference));
+        }
         let images = manifest.config.image_sources.is_some();
         let first = manifest
             .faces

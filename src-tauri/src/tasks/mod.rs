@@ -847,6 +847,13 @@ impl TaskService {
             ))
         });
         let observe = session.clone();
+        let reshoot_options = task
+            .request_parameters
+            .as_ref()
+            .and_then(|v| v.get("reshootOptions"))
+            .map(|v| serde_json::from_value::<crate::pipeline::reshoot::ReshootOptions>(v.clone()))
+            .transpose()
+            .map_err(|_| ServiceError::new("INVALID_ARGUMENT", "Invalid saved reshoot options"))?;
         let runner = Arc::new(
             PipelineRunner::new_with_planner(engines, task.planner_enabled, move |event| {
                 if let Some(s) = &observe {
@@ -863,6 +870,7 @@ impl TaskService {
                     .unwrap_or_default(),
             )
             .with_workspace_task_id(Some(id))
+            .with_reshoot_options(reshoot_options)
             .with_image_matching_strategy(
                 task.request_parameters
                     .as_ref()
@@ -1460,7 +1468,12 @@ pub fn authorize_input(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
 
 fn actual_snapshot(state: Value) -> Value {
     let frames = state.get("frames");
-    serde_json::json!({"quality":state.get("preset"),"planner_enabled":state.get("plannerEnabled"),"resolution_policy_version":state.get("resolutionPolicyVersion"),"resolution_plan":state.get("resolutionPlan"),"brush_training":state.get("brushTraining"),"frame_plan":{"sampling_fps":frames.and_then(|f|f.get("samplingFps")),"estimated_frames":frames.and_then(|f|f.get("estimatedFrames")),"extracted_frames":frames.and_then(|f|f.get("extractedFrames")),"mask_count":frames.and_then(|f|f.get("maskCount"))}})
+    let mut result = serde_json::json!({"quality":state.get("preset"),"planner_enabled":state.get("plannerEnabled"),"resolution_policy_version":state.get("resolutionPolicyVersion"),"resolution_plan":state.get("resolutionPlan"),"brush_training":state.get("brushTraining"),"frame_plan":{"sampling_fps":frames.and_then(|f|f.get("samplingFps")),"estimated_frames":frames.and_then(|f|f.get("estimatedFrames")),"extracted_frames":frames.and_then(|f|f.get("extractedFrames")),"mask_count":frames.and_then(|f|f.get("maskCount"))}});
+    result["reshoot_recipe"] = state
+        .pointer("/reshoot/recipe")
+        .cloned()
+        .unwrap_or(Value::Null);
+    result
 }
 
 struct ExecutionCleanup {
@@ -1499,5 +1512,5 @@ impl Drop for ExecutionCleanup {
 }
 
 pub(crate) fn checkpoint_snapshot(state: &crate::project::PipelineStateFile) -> Value {
-    serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}})
+    serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"reshoot_recipe":state.reshoot.as_ref().and_then(|r|r.recipe.as_ref()),"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}})
 }

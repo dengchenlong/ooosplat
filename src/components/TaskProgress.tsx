@@ -52,7 +52,7 @@ export function TaskProgress({ status, stage, progress, stageProgress, substage,
       const className = (knownStage && position < index) || status === 'completed' ? 'done' : terminal || (knownStage && position === index && active ? 'active' : '');
       return <li key={key} className={className}><span /><b>{t(label)}</b>{position === index && active && <small>{stageProgress == null ? t('progress.processing') : `${Math.min(100, Math.max(0, stageProgress)).toFixed(1)}%`}</small>}</li>;
     })}</ol>
-    {showRuntimePanel && (active || runtime) && <RuntimePanel snapshot={runtime ?? null} running={active} waitingMessage={message} />}
+    {showRuntimePanel && status !== 'completed' && (active || runtime) && <RuntimePanel snapshot={runtime ?? null} running={active} waitingMessage={message} />}
     <div className="log-toolbar"><span>{t('progress.log')}</span><small>{t('progress.logCount', { count: logs.length })}</small></div>
     {logsTruncated && <p className="runtime-note">{t('progress.logsTruncated')}</p>}
     <div className="live-log" aria-live="polite" role="log" ref={logRef ?? internalRef} onScroll={onLogScroll ?? (() => { const node = internalRef.current; if (node) follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24; })}>

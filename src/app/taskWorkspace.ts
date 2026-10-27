@@ -5,6 +5,8 @@ export const TASK_WORKSPACE_STORAGE_KEY = "ooo-splat-task-workspace-v1";
 export type TaskSelection = { kind: "draft" | "project" | "task"; id: string };
 
 export interface TaskDraft {
+  gpsDetection?: { sourceIdentity: string; detected: boolean };
+  gpsFallback?: string;
   videoProjection: import("../types/pipeline").VideoProjection;
   projectionDetection: import("../types/pipeline").ProjectionDetection | null;
   projectionAnswer?: { identity: string; projection: "perspective" | "equirectangular" } | null;
@@ -67,7 +69,7 @@ export function createGenerationDraft(ordinal: number, plannerEnabled = true, pl
 export function createReshootDraft(ordinal: number, sourceProjectId: string, sourceProjectName: string, quality: Quality, plannerEnabled = true): TaskDraft {
   return {
     ...createGenerationDraft(ordinal, plannerEnabled), kind: "reshoot", sourceProjectId, sourceProjectName,
-    quality, needsValidation: true,
+    quality, needsValidation: true, plannerDefaultPending: true,
   };
 }
 

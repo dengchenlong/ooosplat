@@ -4,6 +4,30 @@ export type Locale = "zh-CN" | "en";
 export type TranslationParams = Record<string, string | number>;
 
 const zhCN = {
+  "reshoot.conditionTitle": "原模型目前是什么情况？",
+  "reshoot.cameraTitle": "补拍素材与原素材的拍摄设置相同吗？",
+  "reshoot.cameraDescription": "请确认设备、镜头、焦距、分辨率、画面裁切和防抖设置是否相同。拿不准时请选择“不确定”。",
+  "reshoot.camera.same": "相同",
+  "reshoot.camera.different": "不同",
+  "reshoot.camera.unsure": "不确定",
+  "reshoot.condition.good": "整体正常，只想补充细节",
+  "reshoot.condition.appearance": "整体结构正常，但生成效果不满意",
+  "reshoot.condition.geometry": "明显变形或位置错乱",
+  "reshoot.condition.unsure": "不确定",
+  "reshoot.condition.goodHint": "沿用原模型，用补拍内容补充细节；原模型不可用时重新生成。",
+  "reshoot.condition.appearanceHint": "沿用已确定的拍摄位置，把原素材和补拍素材一起重新生成。",
+  "reshoot.condition.geometryHint": "重新确定所有画面的拍摄位置，再把原素材和补拍素材一起重新生成。",
+  "reshoot.condition.unsureHint": "先沿用已确定的拍摄位置，把原素材和补拍素材一起重新生成。",
+  "reshoot.planTitle": "补拍方案",
+  "reshoot.planWarm": "增量重建＋原模型优化",
+  "reshoot.planCold": "增量重建＋重新训练",
+  "reshoot.planFull": "全量重建＋重新训练",
+  "reshoot.allowFallback": "允许失败后自动改用更耗时的方案",
+  "reshoot.fallbackHint": "可能重新重建场景或重新训练模型，耗时可能明显增加。",
+  "reshoot.multiCameraHint": "支持不同分辨率、宽高比及设备或镜头，请确保新旧素材属于同一场景并有足够重叠。",
+  "reshoot.panoramaHint": "全景项目仅支持完整全景视频或全景图片补拍，暂不支持普通素材。",
+  "reshoot.warmEdits": "本次使用原始生成模型，不继承预览中的删除或裁切；原项目及编辑结果保持不变。",
+  "reshoot.fallbackRunning": "当前方案未能完成，正在自动改用更耗时的方案。",
   "export.model": "导出模型",
   "export.compactSizeHint": "SOG、SPZ 通常更小，实际大小取决于模型；压缩可能影响细节。",
   "export.spzRange": "模型包含超出当前 SPZ 编码器约 ±2048 场景单位范围的坐标。为避免坐标溢出，已停止导出；请选择标准 PLY、压缩 PLY 或 SOG。不会自动缩放或删点。",
@@ -44,6 +68,9 @@ const zhCN = {
   "source.manualPanorama": "已选择完整全景视频，将按全景视频生成",
   "source.images": "普通图片",
   "source.imagesHint": "将按普通图片处理",
+  "source.gpsDetected": "已识别图片中的 GPS 信息",
+  "source.gpsHint": "将使用有效位置信息辅助生成",
+  "source.gpsFallback": "GPS 辅助未启用，已切换为不使用 GPS 的生成方式。",
   "source.historyImages": "本任务按普通图片处理",
   "source.panoramaImages": "全景图片",
   "source.chooseImageType": "请选择图片类型",
@@ -206,9 +233,14 @@ const zhCN = {
   "language.switchTo": "中英文切换 / Switch language",
   "language.target": "EN",
   "top.settings": "设置",
-  "top.checkingEngines": "正在检查内置引擎",
+  "top.checkingEngines": "正在检查引擎",
   "top.engineIssues": "{count} 个引擎异常",
-  "top.enginesReady": "FFmpeg · COLMAP · Brush 就绪",
+  "top.enginesReady": "引擎就绪",
+  "top.enginePath": "路径",
+  "top.engineExists": "文件存在",
+  "top.engineCanStart": "可启动",
+  "top.yes": "是",
+  "top.no": "否",
   "update.install": "更新至 {version}",
   "update.found": "发现新版本",
   "update.settingsTitle": "版本更新",
@@ -788,6 +820,30 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
+  "reshoot.conditionTitle": "What is the current model like?",
+  "reshoot.cameraTitle": "Were the new captures taken with the same settings as the originals?",
+  "reshoot.cameraDescription": "Check that the device, lens, focal length, resolution, cropping, and stabilization settings are the same. Choose “Not sure” if you cannot confirm.",
+  "reshoot.camera.same": "Same",
+  "reshoot.camera.different": "Different",
+  "reshoot.camera.unsure": "Not sure",
+  "reshoot.condition.good": "Generally good; I only want to add detail",
+  "reshoot.condition.appearance": "The overall structure is correct, but the generated result is unsatisfactory",
+  "reshoot.condition.geometry": "Clearly distorted or incorrectly positioned",
+  "reshoot.condition.unsure": "Not sure",
+  "reshoot.condition.goodHint": "Use the original model and add detail from the new captures. Generate a new model if the original is unavailable.",
+  "reshoot.condition.appearanceHint": "Keep the camera positions already found and generate a new model using both the original and new captures.",
+  "reshoot.condition.geometryHint": "Work out the camera positions for all images again, then generate a new model using both the original and new captures.",
+  "reshoot.condition.unsureHint": "First try keeping the camera positions already found and generate a new model using both the original and new captures.",
+  "reshoot.planTitle": "Reshoot plan",
+  "reshoot.planWarm": "Incremental reconstruction + refinement of the original model",
+  "reshoot.planCold": "Incremental reconstruction + retraining",
+  "reshoot.planFull": "Full reconstruction + retraining",
+  "reshoot.allowFallback": "Allow a slower fallback if the initial approach fails",
+  "reshoot.fallbackHint": "The scene may be reconstructed again or the model retrained, which can take considerably longer.",
+  "reshoot.multiCameraHint": "Different resolutions, aspect ratios, devices, and lenses are supported. Keep the new and original inputs in the same scene with sufficient overlap.",
+  "reshoot.panoramaHint": "Panorama projects only accept full panorama videos or images for reshoots. Ordinary inputs are not supported yet.",
+  "reshoot.warmEdits": "This uses the originally generated model, without preview deletions or cropping. The original project and its edits remain unchanged.",
+  "reshoot.fallbackRunning": "The current approach could not complete. Automatically switching to a slower approach.",
   "export.model": "Export model",
   "export.compactSizeHint": "SOG and SPZ are usually smaller. Actual size depends on the model; compression may affect detail.",
   "export.spzRange": "Some coordinates exceed the current SPZ encoder's range of about ±2048 scene units. Export was stopped to prevent overflow. Choose standard PLY, compressed PLY, or SOG; the model is not automatically rescaled or filtered.",
@@ -834,6 +890,9 @@ const en: Record<TranslationKey, string> = {
   "source.manualPanorama": "Full panorama selected. This video will use panorama generation.",
   "source.images": "Ordinary images",
   "source.imagesHint": "These images will use ordinary-image processing.",
+  "source.gpsDetected": "GPS information detected in images",
+  "source.gpsHint": "Valid location information will be used to assist generation.",
+  "source.gpsFallback": "GPS assistance is unavailable. Generation will continue without GPS.",
   "source.historyImages": "This task uses ordinary-image processing.",
   "source.panoramaImages": "Panorama images",
   "source.chooseImageType": "Choose image type",
@@ -996,7 +1055,7 @@ const en: Record<TranslationKey, string> = {
   "export.htmlWarning": "Package the current edits at full quality into a single HTML file. Double-click to view offline and play the animation. File size is about 4/3 of the corresponding PLY (unfiltered source estimate: {size}, plus the viewer). Large models still depend on browser and device capacity. The original model and edit.ply will not be overwritten.",
   "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat optimizes reconstruction and training parameters and automatically applies recovery, usually reducing generation time and improving detail, especially for image inputs",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
-  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
+  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "Engines ready", "top.enginePath": "Path", "top.engineExists": "File exists", "top.engineCanStart": "Can start", "top.yes": "Yes", "top.no": "No", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
   "task.create": "Create New Task", "task.running": "Running", "task.idle": "Standby", "task.preparing": "Preparing", "task.queued": "Queued", "task.console": "Generation console",
   "input.label": "Input media", "input.typeAria": "Choose input media type", "input.video": "Video", "input.images": "Images", "input.videoTypes": "MP4 or MOV", "input.imageTypes": "JPG, JPEG, or PNG folder", "input.selectImages": "Choose image sequence folder", "input.selectVideo": "Choose an MP4 or MOV video", "input.selectImagesHint": "Choose a folder containing JPG, JPEG, or PNG images", "input.selectVideoHint": "Choose a video file on this computer", "input.dropHere": "Drop to import media", "input.dropSingle": "Drop exactly one MP4/MOV file or one image folder",
   "project.root": "Projects root", "project.readingRoot": "Reading default folder", "project.rootHint": "Each generation creates a separate project folder here, with final.ply saved at its root.", "project.syncMissing": "The completed project has not appeared in the project list yet", "project.syncFailed": "The task completed, but the project list could not be refreshed: {detail}",
@@ -1202,7 +1261,20 @@ export function useI18n() {
   };
 }
 
+const reshootCacheEnglish: Record<string, string> = {
+  "原项目文件": "original project files",
+  "补拍画面": "reshoot frames",
+  "特征提取": "feature extraction",
+  "图像匹配": "image matching",
+  "Splat 训练": "Splat training",
+};
+
 const exactPipelineEnglish: Record<string, string> = {
+  "正在准备原模型训练副本": "Preparing the original model training snapshot",
+  "补拍处理仍在进行，当前步骤可能耗时较长，请耐心等待": "Reshoot processing is still running. This step may take a while. Please wait.",
+  "补拍相机设置：沿用原设置": "Reshoot camera settings: reusing the original settings",
+  "补拍相机设置：独立处理": "Reshoot camera settings: processing independently",
+  "补拍相机设置：条件不兼容，独立处理": "Reshoot camera settings: incompatible conditions, processing independently",
   "初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。": "Initial point count exceeds the current panorama training budget. Training stopped to avoid dropping initial points.",
   "外部进程执行失败：初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。": "Initial point count exceeds the current panorama training budget. Training stopped to avoid dropping initial points.",
   "已校验并复用训练缓存": "Verified and reused training caches",
@@ -1255,6 +1327,7 @@ const exactPipelineEnglish: Record<string, string> = {
   "正在校验并发布 final.ply": "Validating and publishing final.ply",
   "全部处理完成": "All processing completed",
   "任务已取消": "Task cancelled",
+  "引擎可启动": "Engine can start",
   "正在创建项目": "Creating project",
   "已有任务正在运行": "Another task is already running",
   "任务运行期间不能删除项目": "Projects cannot be deleted while a task is running",
@@ -1301,12 +1374,21 @@ const exactPipelineEnglish: Record<string, string> = {
 
 export function localizePipelineMessage(locale: Locale, message: string): string {
   if (locale === "zh-CN") return message;
-  for (const key of ['source.unsupportedImages','source.panoramaImagesBudget','source.panoramaReshoot','source.ambiguousImages'] as const) {
+  const diagnosticSuffix = message.search(/\n(?:Diagnostic log:|Could not save diagnostic log:)/);
+  if (diagnosticSuffix >= 0) {
+    return localizePipelineMessage(locale, message.slice(0, diagnosticSuffix)) + message.slice(diagnosticSuffix);
+  }
+  for (const key of ['source.gpsFallback','source.unsupportedImages','source.panoramaImagesBudget','source.panoramaReshoot','source.ambiguousImages','reshoot.fallbackRunning','reshoot.multiCameraHint','reshoot.panoramaHint'] as const) {
     if (message === zhCN[key]) return en[key];
   }
   const exact = exactPipelineEnglish[message];
   if (exact) return exact;
   const patterns: Array<[RegExp, (...values: string[]) => string]> = [
+    [/^帮助命令退出码：([^\n]+)\n([\s\S]*)$/, (code, detail) => `Engine check exit code: ${code}\n${detail}`],
+    [/^未找到 ([\s\S]+)$/, (path) => `Not found: ${path}`],
+    [/^本地处理引擎无法启动：(.+)（缺少运行所需的 DLL（退出码 0xC0000135）\n([\s\S]*)）$/, (engine, detail) => `Local processing engine could not start: ${engine} (required DLL missing, exit code 0xC0000135)\n${detail}`],
+    [/^本地处理引擎无法启动：([\s\S]+)$/, (detail) => `Local processing engine could not start: ${detail}`],
+    [/^外部进程执行失败：FFprobe 视频分析失败，退出码 ([^，]+)，引擎 ([\s\S]+)$/, (code, detail) => `FFprobe video analysis failed, exit code ${code}, executable ${detail}`],
     [/^正在准备全景图片 ([\d,]+)\/([\d,]+)$/, (current,total) => `Preparing panorama images ${current}/${total}`],
     [/^正在准备训练图片：全景图片 ([\d,]+)\/([\d,]+)，六面图片 ([\d,]+)\/([\d,]+)$/, (current,total,faces,totalFaces) => `Preparing training images: panorama images ${current}/${total}, face images ${faces}/${totalFaces}`],
     [/^图像匹配进程仍在运行，最近 (\d+) 秒无新输出。此步骤可能耗时较长，请耐心等待$/, seconds => `The image-matching process is still running, with no new output for ${seconds} seconds. This step may take a while. Please wait.`],
@@ -1342,6 +1424,13 @@ export function localizePipelineMessage(locale: Locale, message: string): string
     [/^正在补全补拍不透明 Mask ([\d,]+)\/([\d,]+) 张$/, (current, total) => `Completing opaque reshoot masks ${current}/${total}`],
     [/^将处理全部 ([\d,]+) 张图片$/, (count) => `All ${count} images will be processed`],
     [/^已复用 ([\d,]+) 帧检查点$/, (count) => `Reused checkpoint with ${count} frames`],
+    [/^正在准备原项目文件：(\d+)\/(\d+)$/, (current,total) => `Preparing original project files: ${current}/${total}`],
+    [/^正在准备补拍画面：(\d+)\/(\d+)$/, (current,total) => `Preparing reshoot frames: ${current}/${total}`],
+    [/^正在整理补拍画面：(\d+)\/(\d+)$/, (current,total) => `Organizing reshoot frames: ${current}/${total}`],
+    [/^正在检查画面与蒙版：(\d+)\/(\d+)$/, (current,total) => `Checking images and masks: ${current}/${total}`],
+    [/^补拍画面准备完成：原画面 (\d+) 张，新增 (\d+) 张$/, (source,added) => `Reshoot frames prepared: ${source} original images, ${added} new images`],
+    [/^补拍画面已加入：(\d+)\/(\d+)$/, (current,total) => `Reshoot images registered: ${current}/${total}`],
+    [/^复用已完成的补拍缓存：(.+)$/, stage => `Reusing completed reshoot cache: ${reshootCacheEnglish[stage] ?? localizePipelineMessage('en', stage)}`],
     [/^已发布 ([\d,]+) 个 Splat$/, (count) => `Published ${count} splats`],
     [/^进程已启动 · PID ([\d]+)$/, (pid) => `Process started · PID ${pid}`],
     [/^FFmpeg 已输出 ([\d,]+) 帧$/, (count) => `FFmpeg produced ${count} frames`],

@@ -68,6 +68,7 @@ pub fn run_app() {
             commands::check_colmap_acceleration,
             commands::probe_and_plan,
             commands::analyze_input,
+            commands::detect_image_gps,
             commands::classify_dropped_input,
             commands::estimate_project_runtime,
             commands::start_pipeline,

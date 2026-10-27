@@ -19,6 +19,72 @@ use crate::{
 
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const ROWS_PER_CHUNK: usize = 4096;
+
+/// Full bounded read, used for reshoot initialization and publication validation.
+/// Unlike header inspection this rejects truncated/non-finite Gaussian payloads.
+pub fn validate_training_ply(
+    path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(PlyInfo, u32, String)> {
+    use sha2::{Digest, Sha256};
+    let file = File::open(path)?;
+    let info = file.metadata()?;
+    let mut reader = BufReader::new(file);
+    let layout = parse_layout(&mut reader)?;
+    let expected = (layout.header.len() as u64)
+        .checked_add(
+            layout
+                .count
+                .checked_mul(layout.stride as u64)
+                .ok_or_else(|| unsupported("PLY size overflow"))?,
+        )
+        .ok_or_else(|| unsupported("PLY size overflow"))?;
+    if info.len() != expected {
+        return Err(unsupported("PLY data length mismatch"));
+    }
+    let mut hash = Sha256::new();
+    hash.update(&layout.header);
+    let mut row = vec![0; layout.stride];
+    let rotation_offsets: Vec<_> = (0..4)
+        .map(|i| layout.offsets[&format!("rot_{i}")])
+        .collect();
+    for _ in 0..layout.count {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        reader.read_exact(&mut row)?;
+        if row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|b| !f32::from_le_bytes(*b).is_finite())
+        {
+            return Err(unsupported("Non-finite Gaussian attributes"));
+        }
+        let norm: f64 = rotation_offsets
+            .iter()
+            .map(|offset| read_float(&row, *offset).powi(2))
+            .sum();
+        if norm < 1e-20 {
+            return Err(unsupported("Invalid Gaussian rotation"));
+        }
+        hash.update(&row);
+    }
+    let sh = match layout.rest_count {
+        0 => 0,
+        9 => 1,
+        24 => 2,
+        _ => 3,
+    };
+    Ok((
+        PlyInfo {
+            file_size: info.len(),
+            splat_count: layout.count,
+        },
+        sh,
+        format!("{:x}", hash.finalize()),
+    ))
+}
 pub mod export_view;
 
 #[cfg(windows)]
@@ -833,6 +899,29 @@ mod tests {
 
     fn write_fixture(path: &Path) {
         write_fixture_rows(path, &[[1.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn reshoot_full_ply_validation_rejects_nonfinite_truncated_and_cancelled_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.ply");
+        let token = tokio_util::sync::CancellationToken::new();
+        write_fixture(&path);
+        let original = std::fs::read(&path).unwrap();
+        let (info, sh, hash) = validate_training_ply(&path, &token).unwrap();
+        assert_eq!((info.splat_count, sh), (1, 0));
+        assert_eq!(hash, crate::video::panorama::fingerprint(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, &original[..original.len() - 1]).unwrap();
+        assert!(validate_training_ply(&path, &token).is_err());
+        write_fixture_rows(&path, &[[f32::NAN, 0., 0.]]);
+        assert!(validate_training_ply(&path, &token).is_err());
+        write_fixture(&path);
+        token.cancel();
+        assert!(matches!(
+            validate_training_ply(&path, &token),
+            Err(SplatError::Cancelled)
+        ));
     }
 
     #[test]

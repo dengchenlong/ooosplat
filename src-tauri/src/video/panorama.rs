@@ -86,8 +86,14 @@ pub fn detect_metadata(
     // FFmpeg's 180-degree display rotation remains a full ERP; quarter turns do not.
     let rotated = video.rotation.rem_euclid(180) != 0;
     let ratio = video.width > 0 && video.width == video.height.saturating_mul(2);
-    let unsupported =
-        stereo || cropped || rotated || (!projection.is_empty() && projection != "equirectangular");
+    // A phone's display matrix is also normal perspective-video metadata.
+    // Quarter-turn restrictions apply only to spherical metadata or a 2:1
+    // MP4 candidate that could otherwise be selected as full ERP.
+    let rotated_panorama = rotated && (spherical.is_some() || (mp4 && ratio));
+    let unsupported = stereo
+        || cropped
+        || rotated_panorama
+        || (!projection.is_empty() && projection != "equirectangular");
     let supported_erp = mp4 && ratio && video.width >= 64 && !unsupported;
     let confirmed_erp = supported_erp && projection == "equirectangular";
     ProjectionDetection {
@@ -559,6 +565,48 @@ pub struct PosedImage {
     pub tvec: V3,
 }
 pub fn read_poses(model: &Path) -> Result<Vec<PosedImage>> {
+    if !model.join("images.bin").is_file() {
+        let text = fs::read_to_string(model.join("images.txt"))?;
+        let mut lines = text.lines().filter(|l| !l.trim_start().starts_with('#'));
+        let mut poses = Vec::new();
+        while let Some(line) = lines.next() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 {
+                return Err(process_error("Invalid COLMAP image pose"));
+            }
+            let numbers = fields[1..8]
+                .iter()
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map_err(|_| process_error("Invalid COLMAP pose"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if numbers.iter().any(|n| !n.is_finite()) {
+                return Err(process_error("Non-finite COLMAP pose"));
+            }
+            let name = fields[9..].join(" ");
+            if name.contains(['/', '\\']) || name == ".." {
+                return Err(process_error("Invalid panorama image path"));
+            }
+            poses.push(PosedImage {
+                id: fields[0]
+                    .parse()
+                    .map_err(|_| process_error("Invalid image id"))?,
+                camera_id: fields[8]
+                    .parse()
+                    .map_err(|_| process_error("Invalid camera id"))?,
+                name,
+                qvec: numbers[0..4].try_into().unwrap(),
+                tvec: numbers[4..7].try_into().unwrap(),
+            });
+            lines.next(); // Observations are deliberately not carried into training faces.
+        }
+        poses.sort_by(|a, b| a.name.cmp(&b.name));
+        return Ok(poses);
+    }
     let mut r = BufReader::new(File::open(model.join("images.bin"))?);
     let n = u64r(&mut r)?;
     if n > 1_000_000 {
@@ -615,6 +663,228 @@ pub fn read_poses(model: &Path) -> Result<Vec<PosedImage>> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Multi-batch ERP conversion. Pixels are independent of world pose, while the
+/// camera model is rebuilt from the authoritative sphere on every invocation.
+pub fn prepare_reshoot_training_cache(
+    frames: &Path,
+    model: &Path,
+    root: &Path,
+    records: &[crate::pipeline::reshoot::PanoramaFrameRecord],
+    quality: Quality,
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: impl Fn(TrainingCacheUpdate),
+) -> Result<PathBuf> {
+    let cameras = crate::reconstruction::colmap_model::read_cameras(model)?;
+    let poses = read_poses(model)?;
+    let cap = match quality {
+        Quality::Fast => 512,
+        Quality::Balanced => 768,
+        Quality::High => 1024,
+    };
+    let images = root.join("images");
+    let sparse = root.join("sparse/0");
+    fs::create_dir_all(&images)?;
+    fs::create_dir_all(&sparse)?;
+    let ordered: Vec<_> = records
+        .iter()
+        .filter_map(|record| {
+            poses
+                .iter()
+                .find(|p| p.name == record.prepared_name)
+                .map(|pose| (record, pose))
+        })
+        .collect();
+    if ordered.len() != poses.len() || ordered.is_empty() {
+        return Err(process_error("Incomplete panorama batch/source mapping"));
+    }
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut face_rows = Vec::new();
+    let mut manifest = Vec::new();
+    for (index, (record, pose)) in ordered.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let camera = cameras
+            .iter()
+            .find(|c| c.id == pose.camera_id)
+            .ok_or_else(|| process_error("Missing ERP camera"))?;
+        if camera.model_id != 17
+            || camera.width != camera.height.checked_mul(2).unwrap_or(0)
+            || camera.params != vec![camera.width as f64, camera.height as f64]
+        {
+            return Err(process_error("Invalid ERP camera"));
+        }
+        let size = cap.min(
+            u32::try_from(camera.width / 4)
+                .map_err(|_| process_error("ERP dimensions overflow"))?,
+        );
+        validate_training_cache_size(1, camera.width, camera.height, size)?;
+        if size == 0 {
+            return Err(process_error("Invalid panorama face size"));
+        }
+        if !sizes.contains(&size) {
+            sizes.push(size);
+        }
+        let camera_id = (sizes.iter().position(|s| *s == size).unwrap() + 1) as u32;
+        let basename = format!("frame_{index:010}");
+        let published = images.join(&basename);
+        let source = frames.join(&pose.name);
+        let key = format!(
+            "reshoot-v2:{}:{}:{}",
+            fingerprint_cancellable(&source, cancel)?,
+            size,
+            FOV_DEGREES
+        );
+        let reusable = fs::read_to_string(published.join("complete"))
+            .ok()
+            .as_deref()
+            == Some(&key)
+            && FACES.iter().all(|(name, _)| {
+                image::image_dimensions(published.join(format!("{name}.png"))).ok()
+                    == Some((size, size))
+            });
+        if !reusable {
+            let staging = images.join(format!("{basename}.partial"));
+            if staging.exists() {
+                fs::remove_dir_all(&staging)?;
+            }
+            fs::create_dir_all(&staging)?;
+            let prepared = (|| -> Result<()> {
+                let mut reader = image::ImageReader::open(&source)?.with_guessed_format()?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(MAX_DECODE_BYTES);
+                reader.limits(limits);
+                let rgba = reader
+                    .decode()
+                    .map_err(|e| process_error(e.to_string()))?
+                    .to_rgba8();
+                if rgba.width() as u64 != camera.width || rgba.height() as u64 != camera.height {
+                    return Err(process_error("ERP image/camera dimensions differ"));
+                }
+                for (face_index, (name, q)) in FACES.iter().enumerate() {
+                    render_face(&rgba, None, *q, size, cancel)?
+                        .save(staging.join(format!("{name}.png")))
+                        .map_err(|e| process_error(e.to_string()))?;
+                    progress(TrainingCacheUpdate::Faces {
+                        completed: (index * 6 + face_index + 1) as u64,
+                        total: ordered.len() as u64 * 6,
+                        reused: false,
+                    });
+                }
+                fs::write(staging.join("complete"), &key)?;
+                Ok(())
+            })();
+            if let Err(error) = prepared {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+            if published.exists() {
+                fs::remove_dir_all(&published)?;
+            }
+            fs::rename(staging, published)?;
+        } else {
+            progress(TrainingCacheUpdate::Faces {
+                completed: (index + 1) as u64 * 6,
+                total: ordered.len() as u64 * 6,
+                reused: true,
+            });
+        }
+        for (face_index, (name, q)) in FACES.iter().enumerate() {
+            let id = u32::try_from(
+                index
+                    .checked_mul(6)
+                    .and_then(|n| n.checked_add(face_index + 1))
+                    .ok_or_else(|| process_error("Face count overflow"))?,
+            )
+            .map_err(|_| process_error("Face count overflow"))?;
+            let image_name = format!("{basename}/{name}.png");
+            let qvec = quaternion(product(*q, rotation(pose.qvec)));
+            let tvec = mul(*q, pose.tvec);
+            face_rows.push((id, camera_id, image_name.clone(), qvec, tvec));
+            manifest.push(serde_json::json!({"source_frame_index":record.source_index,"source_image_index":if record.timestamp_seconds.is_none() {Some(record.source_index)} else {None},"timestamp_seconds":record.timestamp_seconds,"pts":record.pts,"source_name":record.source_name,"source_sha256":record.source_sha256,"orientation":record.orientation,"batch_id":record.batch_id,"erp_image_id":pose.id,"erp_name":pose.name,"face":name,"image_id":id,"image_name":image_name,"qvec":qvec,"tvec":tvec}));
+        }
+    }
+    progress(TrainingCacheUpdate::Validating);
+    let mut out = BufWriter::new(File::create(sparse.join("cameras.bin"))?);
+    out.write_all(&(sizes.len() as u64).to_le_bytes())?;
+    for (index, size) in sizes.iter().enumerate() {
+        out.write_all(&((index + 1) as u32).to_le_bytes())?;
+        out.write_all(&1i32.to_le_bytes())?;
+        out.write_all(&(*size as u64).to_le_bytes())?;
+        out.write_all(&(*size as u64).to_le_bytes())?;
+        for value in [
+            focal(*size),
+            focal(*size),
+            *size as f64 / 2.,
+            *size as f64 / 2.,
+        ] {
+            out.write_all(&value.to_le_bytes())?;
+        }
+    }
+    out.flush()?;
+    let mut out = BufWriter::new(File::create(sparse.join("images.bin"))?);
+    out.write_all(&(face_rows.len() as u64).to_le_bytes())?;
+    for (id, camera_id, name, q, t) in &face_rows {
+        out.write_all(&id.to_le_bytes())?;
+        for value in q.iter().chain(t) {
+            out.write_all(&value.to_le_bytes())?;
+        }
+        out.write_all(&camera_id.to_le_bytes())?;
+        out.write_all(name.as_bytes())?;
+        out.write_all(&[0])?;
+        out.write_all(&0u64.to_le_bytes())?;
+    }
+    out.flush()?;
+    let mut source = BufReader::new(File::open(model.join("points3D.bin"))?);
+    let count = u64r(&mut source)?;
+    let mut out = BufWriter::new(File::create(sparse.join("points3D.bin"))?);
+    out.write_all(&count.to_le_bytes())?;
+    for _ in 0..count {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let mut point = [0u8; 43];
+        source.read_exact(&mut point)?;
+        out.write_all(&point)?;
+        let n = u64r(&mut source)?
+            .checked_mul(8)
+            .ok_or_else(|| process_error("Invalid tracks"))?;
+        if std::io::copy(&mut source.by_ref().take(n), &mut std::io::sink())? != n {
+            return Err(process_error("Truncated points3D tracks"));
+        }
+        out.write_all(&0u64.to_le_bytes())?;
+    }
+    out.flush()?;
+    if read_poses_for_training_count(&sparse)? != face_rows.len() as u64 {
+        return Err(process_error("Incomplete face camera model"));
+    }
+    let reference = face_rows
+        .first()
+        .map(|r| r.2.clone())
+        .ok_or_else(|| process_error("Missing front camera"))?;
+    let pending = root.join("manifest.json.partial");
+    fs::write(
+        &pending,
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"recipeVersion":2,"reference_image":reference,"faces":manifest}),
+        )?,
+    )?;
+    let manifest_path = root.join("manifest.json");
+    if manifest_path.exists() {
+        fs::remove_file(&manifest_path)?;
+    }
+    fs::rename(pending, manifest_path)?;
+    fs::write(
+        root.join("signature.json"),
+        serde_json::to_vec(&(CONVERSION_VERSION, quality, records.len()))?,
+    )?;
+    Ok(root.into())
+}
+
+fn read_poses_for_training_count(model: &Path) -> Result<u64> {
+    Ok(crate::reconstruction::colmap_model::read_registered_images(model)?.len() as u64)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1291,6 +1561,119 @@ mod tests {
             "original-sha"
         );
     }
+
+    #[test]
+    fn reshoot_cache_handles_mixed_erp_sizes_and_reuses_faces_without_old_observations() {
+        use crate::pipeline::reshoot::PanoramaFrameRecord;
+        let temp = tempfile::tempdir().unwrap();
+        let (frames, _, sparse, _) = fixture(temp.path());
+        image::RgbaImage::from_pixel(128, 64, image::Rgba([90, 60, 30, 64]))
+            .save(frames.join("new.png"))
+            .unwrap();
+        let mut cameras = fs::read(sparse.join("cameras.bin")).unwrap();
+        cameras[..8].copy_from_slice(&2u64.to_le_bytes());
+        cameras.extend(2u32.to_le_bytes());
+        cameras.extend(17i32.to_le_bytes());
+        for n in [128u64, 64] {
+            cameras.extend(n.to_le_bytes());
+        }
+        for n in [128f64, 64.] {
+            cameras.extend(n.to_le_bytes());
+        }
+        fs::write(sparse.join("cameras.bin"), cameras).unwrap();
+        let mut poses = fs::read(sparse.join("images.bin")).unwrap();
+        poses[..8].copy_from_slice(&2u64.to_le_bytes());
+        poses.extend(100u32.to_le_bytes());
+        for n in [1f64, 0., 0., 0., 2., -3., 5.] {
+            poses.extend(n.to_le_bytes());
+        }
+        poses.extend(2u32.to_le_bytes());
+        poses.extend(b"new.png\0");
+        poses.extend(0u64.to_le_bytes());
+        fs::write(sparse.join("images.bin"), poses).unwrap();
+        let records: Vec<_> = ["frame_0000000000.png", "new.png"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| PanoramaFrameRecord {
+                prepared_name: (*name).into(),
+                batch_id: format!("batch-{i}"),
+                source_name: (*name).into(),
+                source_sha256: format!("source-{i}"),
+                orientation: Some(1),
+                source_index: i as u64,
+                timestamp_seconds: None,
+                pts: None,
+            })
+            .collect();
+        let token = tokio_util::sync::CancellationToken::new();
+        let out = temp.path().join("reshoot-cache");
+        let run = || {
+            prepare_reshoot_training_cache(
+                &frames,
+                &sparse,
+                &out,
+                &records,
+                Quality::Fast,
+                &token,
+                |_| {},
+            )
+            .unwrap()
+        };
+        run();
+        let derived = out.join("sparse/0");
+        assert_eq!(
+            crate::reconstruction::colmap_model::read_cameras(&derived)
+                .unwrap()
+                .len(),
+            2
+        );
+        let poses = crate::reconstruction::colmap_model::read_registered_images(&derived).unwrap();
+        assert_eq!(poses.len(), 12);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        for pose in manifest["faces"].as_array().unwrap() {
+            let qvec: [f64; 4] = serde_json::from_value(pose["qvec"].clone()).unwrap();
+            let tvec: [f64; 3] = serde_json::from_value(pose["tvec"].clone()).unwrap();
+            let center = mul(transpose(rotation(qvec)), tvec).map(|v| -v);
+            for (a, b) in center.iter().zip([-2., 3., -5.]) {
+                assert!((a - b).abs() < 1e-9);
+            }
+        }
+        let front = out.join("images/frame_0000000001/front.png");
+        assert_eq!(image::image_dimensions(&front).unwrap(), (32, 32));
+        assert_eq!(
+            image::open(&front).unwrap().to_rgba8().get_pixel(16, 16)[3],
+            64
+        );
+        let mtime = front.metadata().unwrap().modified().unwrap();
+        run();
+        assert_eq!(front.metadata().unwrap().modified().unwrap(), mtime);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["reference_image"], "frame_0000000000/front.png");
+        assert!(manifest["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["pts"].is_null()));
+        assert_eq!(
+            fs::metadata(derived.join("points3D.bin")).unwrap().len(),
+            59
+        );
+        token.cancel();
+        assert!(matches!(
+            prepare_reshoot_training_cache(
+                &frames,
+                &sparse,
+                &out,
+                &records,
+                Quality::Fast,
+                &token,
+                |_| {}
+            ),
+            Err(SplatError::Cancelled)
+        ));
+    }
     #[test]
     fn training_cache_preserves_world_points_but_replaces_erp_observations_and_tracks() {
         let temp = tempfile::tempdir().unwrap();
@@ -1490,6 +1873,107 @@ mod tests {
         vr["streams"][0]["tags"] = serde_json::json!({"projection":"VR180"});
         assert!(!detect_metadata(&vr, &info, true).supported_erp);
         assert!(!detect_metadata(&full, &info, false).confirmed_erp);
+    }
+
+    #[test]
+    fn ordinary_display_rotation_is_not_an_unsupported_panorama() {
+        for mp4 in [false, true] {
+            for rotation in [-270, -90, 0, 90, 180, 270] {
+                let video = VideoInfo {
+                    width: 1920,
+                    height: 1080,
+                    duration: 1.,
+                    fps: 30.,
+                    total_frames: 30,
+                    codec: "h264".into(),
+                    rotation,
+                    pixel_format: "yuv420p".into(),
+                    has_alpha: false,
+                };
+                let json = serde_json::json!({"streams":[{"width":1920,"height":1080,"side_data_list":[{"side_data_type":"Display Matrix","rotation":rotation}]}]});
+                let detection = detect_metadata(&json, &video, mp4);
+                assert!(!detection.unsupported, "rotation={rotation}, mp4={mp4}");
+                assert!(
+                    !detection.supported_erp
+                        && !detection.confirmed_erp
+                        && !detection.requires_choice
+                );
+                assert!(!resolve(VideoProjection::Auto, &detection).unwrap());
+                assert!(resolve(VideoProjection::Equirectangular, &detection).is_err());
+                let size = crate::video::prepared_video_dimensions(&video);
+                assert_eq!(
+                    size,
+                    if rotation.rem_euclid(180) == 90 {
+                        (1080, 1920)
+                    } else {
+                        (1920, 1080)
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_ambiguous_or_explicit_panorama_stays_blocked_without_rejecting_perspective() {
+        let video = VideoInfo {
+            width: 2000,
+            height: 1000,
+            duration: 1.,
+            fps: 30.,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: -90,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        let unknown = serde_json::json!({"streams":[{"side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]}]});
+        let detection = detect_metadata(&unknown, &video, true);
+        assert!(detection.unsupported && detection.requires_choice);
+        assert!(!detection.supported_erp && !detection.confirmed_erp);
+        assert!(resolve(VideoProjection::Equirectangular, &detection).is_err());
+        assert!(!resolve(VideoProjection::Perspective, &detection).unwrap());
+        let spherical = serde_json::json!({"streams":[{"side_data_list":[{"side_data_type":"Spherical Mapping","projection":"equirectangular"}]}]});
+        for mp4 in [false, true] {
+            let detection = detect_metadata(&spherical, &video, mp4);
+            assert!(detection.unsupported && !detection.supported_erp && !detection.confirmed_erp);
+        }
+        let stereo = serde_json::json!({"streams":[{"side_data_list":[{"side_data_type":"Stereo 3D","type":"side by side"}]}]});
+        assert!(detect_metadata(&stereo, &video, false).unsupported);
+    }
+
+    #[tokio::test]
+    #[ignore = "Read-only IMG_8023.MOV regression; requires the local phone video and bundled FFprobe"]
+    async fn native_ordinary_rotated_mov_is_not_a_panorama_error() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let input = Path::new("E:/Download/LocalSend/IMG_8023.MOV");
+        let before = input.metadata().unwrap();
+        let (video, json) = crate::engines::ffprobe::probe_video_metadata(
+            &repo.join("engines/ffmpeg/ffprobe.exe"),
+            input,
+            None,
+            &ProcessManager::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (video.width, video.height, video.rotation),
+            (1920, 1080, -90)
+        );
+        let detection = detect_metadata(&json, &video, false);
+        assert!(
+            !detection.unsupported
+                && !detection.confirmed_erp
+                && !detection.requires_choice
+                && !detection.supported_erp
+        );
+        assert!(!resolve(VideoProjection::Auto, &detection).unwrap());
+        assert_eq!(
+            crate::video::prepared_video_dimensions(&video),
+            (1080, 1920)
+        );
+        let after = input.metadata().unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
     }
     #[test]
     fn face_centers_cover_both_hemispheres_and_poles() {

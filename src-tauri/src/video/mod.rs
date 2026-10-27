@@ -1,5 +1,6 @@
 pub mod extract;
 pub mod frame_plan;
+pub mod gps;
 pub mod image_projection;
 pub mod image_sequence;
 pub mod panorama;

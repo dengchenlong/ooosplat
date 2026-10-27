@@ -46,6 +46,7 @@
     "resources": {
       "../.cache/html-viewer/runtime.js": "html-viewer/runtime.js",
       "../licenses/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
+      "../licenses/Kamadak-Exif-BSD-2-Clause.txt": "licenses/Kamadak-Exif-BSD-2-Clause.txt",
       "../licenses/FFmpeg-LGPL-2.1.txt": "licenses/FFmpeg-LGPL-2.1.txt",
       "../licenses/FFmpeg-LGPL-3.0.txt": "licenses/FFmpeg-LGPL-3.0.txt",
       "../licenses/FFmpeg-GPL-3.0.txt": "licenses/FFmpeg-GPL-3.0.txt",

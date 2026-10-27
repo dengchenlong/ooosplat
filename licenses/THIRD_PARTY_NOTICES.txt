@@ -15,6 +15,14 @@ separate from this direct component notice.
 This direct component list is not represented as a complete audit of
 transitive dependencies such as Qt, Boost, Ceres, or their dependencies.
 
+Kamadak Exif (Rust metadata reader)
+----------------------------------
+Version: 0.6.1 (kamadak-exif)
+License: BSD-2-Clause
+License text: licenses/Kamadak-Exif-BSD-2-Clause.txt
+Source: https://github.com/kamadak/exif-rs
+Used for bounded local GPS metadata inspection, not image decoding.
+
 FFmpeg / FFprobe
 ----------------
 Version/build: n8.1.3-9-g29e619e767-20260930

@@ -391,6 +391,8 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gps: Option<crate::reconstruction::gps::Checkpoint>,
     /// Frozen at creation. Legacy image projects retain exhaustive matching.
     #[serde(default)]
     pub image_matching_strategy: ImageMatchingStrategy,
@@ -437,6 +439,8 @@ pub struct PipelineStateFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
     pub source_snapshot_complete: bool,
     pub supplemental_frames_complete: bool,
     pub supplemental_features_complete: bool,
@@ -468,6 +472,7 @@ impl PipelineStateFile {
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
             // Older projects were always perspective. Never reinterpret their caches.
+            gps: None,
             temporary_png_focal: None,
             image_matching_strategy: ImageMatchingStrategy::default(),
             video_projection: crate::video::panorama::VideoProjection::Perspective,

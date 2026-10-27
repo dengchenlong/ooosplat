@@ -139,6 +139,28 @@ impl ProjectManager {
         observer: Option<ProjectImportObserver>,
         cancellation: Option<CancellationToken>,
     ) -> Result<(ProjectPaths, ProjectMetadata)> {
+        self.create_inner(input, quality, observer, cancellation, false)
+            .await
+    }
+
+    pub async fn create_reshoot_v2(
+        &self,
+        input: &Path,
+        quality: Quality,
+        cancellation: CancellationToken,
+    ) -> Result<(ProjectPaths, ProjectMetadata)> {
+        self.create_inner(input, quality, None, Some(cancellation), true)
+            .await
+    }
+
+    async fn create_inner(
+        &self,
+        input: &Path,
+        quality: Quality,
+        observer: Option<ProjectImportObserver>,
+        cancellation: Option<CancellationToken>,
+        mixed_sizes: bool,
+    ) -> Result<(ProjectPaths, ProjectMetadata)> {
         let import_identity = if input.is_dir() {
             Some(crate::video::image_projection::source_identity(input)?)
         } else {
@@ -159,7 +181,11 @@ impl ProjectManager {
                                 .map_err(|e| SplatError::Process(e.to_string()))?;
                         }
                     }
-                    let scan = crate::video::image_projection::analyze(&source)?;
+                    let scan = if mixed_sizes {
+                        crate::video::image_projection::analyze_reshoot(&source)?
+                    } else {
+                        crate::video::image_projection::analyze(&source)?
+                    };
                     Ok(crate::video::image_sequence::ImageSequenceScan {
                         info: scan.info,
                         images: scan

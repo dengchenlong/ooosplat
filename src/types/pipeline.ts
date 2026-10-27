@@ -82,7 +82,21 @@ export type VideoProjection = "auto" | "perspective" | "equirectangular";
 export type ImageMatchingStrategy = "sequential" | "exhaustive";
 export interface ProjectionDetection { sourceIdentity?: string; unsupported?: boolean; confirmedErp: boolean; requiresChoice: boolean; supportedErp: boolean; reason: string; previewJpeg: number[]; }
 
+export type ReshootCondition = "good" | "appearance" | "geometry" | "unsure";
+export type ReshootCameraRelation = "same" | "different" | "unsure";
+export interface ReshootOptions {
+  condition: ReshootCondition;
+  cameraRelation?: ReshootCameraRelation;
+  allowFallback: boolean;
+  sourceIdentity: string;
+  inputIdentity: string;
+  projection: "perspective" | "equirectangular";
+  imageMatchingStrategy: ImageMatchingStrategy;
+}
 export interface ReshootSourceInfo {
+  sourceIdentity?: string;
+  projection?: "perspective" | "equirectangular";
+  warmAvailable?: boolean;
   projectId: string;
   projectName: string;
   quality: Quality;
@@ -98,6 +112,9 @@ export interface ReshootSourceInfo {
 }
 
 export interface ReshootInputInfo {
+  sourceIdentity?: string;
+  projectionDetection?: ProjectionDetection;
+  imageSequence?: ImageSequenceInfo;
   inputType: InputType;
   imageCount: number | null;
   duration: number | null;
@@ -222,6 +239,7 @@ export interface AppRuntimeStatus {
 
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
+  reshootRecipe?: ReshootRecipeSummary | null;
   videoProjection?: VideoProjection | null;
   inputProjection?: VideoProjection | null;
   project: ProjectSummary;
@@ -239,6 +257,12 @@ export interface ProjectTaskDetail {
   sourceProjectId: string | null;
   logs: ProjectTaskLogLine[];
   imported: ImportedProjectDetail | null;
+}
+
+export interface ReshootRecipeSummary {
+  options: ReshootOptions;
+  initial: { reconstruction: 'incremental' | 'full'; training: 'warm' | 'cold' };
+  actual: { reconstruction: 'incremental' | 'full'; training: 'warm' | 'cold' };
 }
 
 export type ImportedGaussianFormat = "ply" | "compressedPly" | "sog" | "spz" | "splat" | "ksplat";

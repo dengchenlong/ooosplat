@@ -8,11 +8,21 @@ const readyGeneration = (ordinal: number): TaskDraft => ({
 
 const readyReshoot = (ordinal: number): TaskDraft => ({
   ...createReshootDraft(ordinal, "source", "source", "balanced"), id: `r${ordinal}`, inputPath: `images-${ordinal}`,
+  needsValidation: false,
   reshootSource: { eligible: true } as TaskDraft["reshootSource"],
   reshootPlan: { compatible: true } as TaskDraft["reshootPlan"],
 });
 
 describe("task queue ordering", () => {
+  it('does not skip a reshoot that is checking, incompatible or has an unanswered projection', () => {
+    const draft = readyReshoot(1);
+    expect(firstQueueInputIssue([{ ...draft, inputChecking: true }, readyGeneration(2)])?.reason).toBe('checking');
+    expect(firstQueueInputIssue([{ ...draft, reshootPlan: null }, readyGeneration(2)])?.reason).toBe('analysis');
+    const ambiguous:TaskDraft = { ...draft, projectionDetection:{sourceIdentity:'new',requiresChoice:true,supportedErp:true,confirmedErp:false,reason:'',previewJpeg:[]},reshootSource:{...draft.reshootSource!,projection:'equirectangular'} };
+    expect(firstQueueInputIssue([ambiguous,readyGeneration(2)])?.reason).toBe('projection');
+    expect(draftIsRunnable({...ambiguous,projectionAnswer:{identity:'new',projection:'perspective'}})).toBe(false);
+    expect(draftIsRunnable({...ambiguous,projectionAnswer:{identity:'new',projection:'equirectangular'}})).toBe(true);
+  });
   it('blocks panorama image detection and unanswered types without skipping ahead',()=>{
     const images:TaskDraft={...readyGeneration(1),inputType:'images',inputPath:'images',projectionDetection:{sourceIdentity:'photos-v1',confirmedErp:false,requiresChoice:true,supportedErp:true,reason:'',previewJpeg:[]}};
     expect(draftIsRunnable(images)).toBe(false);

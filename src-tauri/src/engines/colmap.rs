@@ -123,7 +123,7 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     }
 }
 
-async fn run_colmap(
+pub(crate) async fn run_colmap(
     executable: &Path,
     mut args: Vec<OsString>,
     working_directory: &Path,
@@ -868,9 +868,386 @@ fn incremental_mapper_args(
     ]
 }
 
+pub struct ReshootFeatureOptions<'a> {
+    pub images: &'a Path,
+    pub list: &'a Path,
+    pub masks: Option<&'a Path>,
+    pub panorama_dimensions: Option<(u32, u32)>,
+    pub existing_camera_id: Option<u32>,
+    pub max_size: u32,
+    pub max_features: u32,
+}
+
+pub async fn extract_reshoot_group(
+    executable: &Path,
+    database: &Path,
+    options: ReshootFeatureOptions<'_>,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu: Option<u32>,
+) -> Result<()> {
+    let (use_gpu, gpu_option) = feature_gpu_options(executable, manager).await?;
+    let focal = if options.panorama_dimensions.is_none() && options.existing_camera_id.is_none() {
+        crate::video::temporary_png_focal_workaround::detect(
+            executable,
+            manager,
+            crate::video::temporary_png_focal_workaround::Request {
+                images: options.images,
+                image_list: Some(options.list),
+                ordinary_images: true,
+                camera_model: "SIMPLE_RADIAL",
+                single_camera: true,
+                explicit_params: None,
+                existing_camera_id: None,
+                calibrated: false,
+            },
+        )
+        .await
+    } else {
+        None
+    };
+    let params = options
+        .panorama_dimensions
+        .map(|(w, h)| format!("{w},{h}"))
+        .or_else(|| focal.as_ref().map(|f| f.camera_params()));
+    let mut args = if let Some(camera_id) = options.existing_camera_id {
+        incremental_feature_extraction_args(
+            database,
+            options.images,
+            options.list,
+            camera_id,
+            options.masks,
+            gpu,
+            use_gpu,
+            gpu_option,
+            Some(options.max_size),
+            Some(options.max_features),
+        )
+    } else {
+        feature_extraction_args(
+            database,
+            options.images,
+            options.masks,
+            gpu,
+            use_gpu,
+            gpu_option,
+            Some(options.max_size),
+            Some(options.max_features),
+            Some(options.list),
+            params.as_deref(),
+        )
+    };
+    if options.panorama_dimensions.is_some() {
+        let index = args
+            .iter()
+            .position(|a| a == "--ImageReader.camera_model")
+            .expect("model argument");
+        args[index + 1] = "EQUIRECTANGULAR".into();
+    }
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(options.images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn match_reshoot_candidates(
+    executable: &Path,
+    database: &Path,
+    query_list: &Path,
+    candidates: u32,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu: Option<u32>,
+) -> Result<()> {
+    let vocab = vocabulary::prepare(executable, manager.child_token()).await?;
+    let (use_gpu, gpu_option) =
+        matching_gpu_options(executable, "vocab_tree_matcher", manager).await?;
+    let mut args = matching_args("vocab_tree_matcher", database, gpu, use_gpu, gpu_option);
+    args.extend([
+        "--VocabTreeMatching.vocab_tree_path".into(),
+        vocab.into(),
+        "--VocabTreeMatching.match_list_path".into(),
+        query_list.into(),
+        "--VocabTreeMatching.num_images".into(),
+        candidates.to_string().into(),
+    ]);
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+/// Query only the immutable registered source images, not other new images.
+/// The retriever has no output-file option; consume bounded per-query native
+/// log records before ProcessManager truncates its diagnostic capture.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_reshoot_pairs(
+    executable: &Path,
+    database: &Path,
+    old_names: &[String],
+    new_names: &[String],
+    candidates: u32,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<Vec<(String, String)>> {
+    use crate::process::ProcessUpdate;
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+    };
+    let directory = database.parent().unwrap_or(Path::new("."));
+    let old_list = directory.join("retrieval-source.txt");
+    let new_list = directory.join("retrieval-query.txt");
+    tokio::fs::write(&old_list, old_names.join("\n")).await?;
+    tokio::fs::write(&new_list, new_names.join("\n")).await?;
+    let vocab = vocabulary::prepare(executable, manager.child_token()).await?;
+    let old: HashSet<_> = old_names.iter().cloned().collect();
+    let new: HashSet<_> = new_names.iter().cloned().collect();
+    let pairs = Arc::new(Mutex::new((None::<String>, 0u32, Vec::new())));
+    let output = pairs.clone();
+    let collector: ProcessObserver = Arc::new(move |update| {
+        if let ProcessUpdate::Line { line, .. } = &update {
+            let mut state = output.lock().expect("retrieval collector");
+            if let Some((_, rest)) = line.split_once("Querying for image ") {
+                state.0 = rest
+                    .rsplit_once(" [")
+                    .map(|(name, _)| name.to_owned())
+                    .filter(|name| new.contains(name));
+                state.1 = 0;
+            } else if let Some((_, rest)) = line.split_once("image_name=") {
+                if let Some((name, _)) = rest.rsplit_once(", score=") {
+                    if old.contains(name) && state.1 < candidates {
+                        if let Some(query) = state.0.clone() {
+                            state.2.push((name.to_owned(), query));
+                            state.1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(observer) = &observer {
+            observer(update);
+        }
+    });
+    run_colmap(
+        executable,
+        vec![
+            "vocab_tree_retriever".into(),
+            "--database_path".into(),
+            database.into(),
+            "--vocab_tree_path".into(),
+            vocab.into(),
+            "--database_image_list_path".into(),
+            old_list.into(),
+            "--query_image_list_path".into(),
+            new_list.into(),
+            "--num_images".into(),
+            candidates.to_string().into(),
+        ],
+        directory,
+        log,
+        manager,
+        Some(collector),
+    )
+    .await?;
+    let result = std::mem::take(&mut pairs.lock().expect("retrieval collector").2);
+    if result.is_empty() && !new_names.is_empty() && !old_names.is_empty() {
+        return Err(SplatError::Process(
+            "COLMAP retrieval returned no verifiable source candidates".into(),
+        ));
+    }
+    Ok(result)
+}
+
+pub struct ReshootMapperOptions<'a> {
+    pub images: &'a Path,
+    pub input: Option<&'a Path>,
+    pub output: &'a Path,
+    pub image_list: &'a Path,
+    pub fixed_cameras: Option<&'a Path>,
+    pub panorama: bool,
+}
+
+pub async fn map_reshoot(
+    executable: &Path,
+    database: &Path,
+    options: ReshootMapperOptions<'_>,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    tokio::fs::create_dir_all(options.output).await?;
+    let mut args = mapper_args(
+        database,
+        options.images,
+        options.input,
+        options.output,
+        false,
+    );
+    args.extend([
+        "--Mapper.image_list_path".into(),
+        options.image_list.into(),
+        "--Mapper.fix_existing_frames".into(),
+        if options.input.is_some() {
+            "1".into()
+        } else {
+            "0".into()
+        },
+        "--Mapper.ba_refine_principal_point".into(),
+        "0".into(),
+    ]);
+    if let Some(list) = options.fixed_cameras {
+        args.extend(["--Mapper.constant_camera_list_path".into(), list.into()]);
+    }
+    if options.panorama {
+        args.extend([
+            "--Mapper.init_min_tri_angle".into(),
+            "1".into(),
+            "--Mapper.init_max_forward_motion".into(),
+            "1".into(),
+        ]);
+    }
+    super::colmap_ba::append_explicit_ceres_options(&mut args);
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(options.images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "Requires the local real PNG and bundled COLMAP; feature extraction only in an isolated database"]
+    async fn native_reshoot_features_confirm_reused_and_independent_camera_ids() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let source = repo.join(".tmp/focal-diagnosis-20261019/png/images/003A9246.png");
+        let original_hash = crate::video::panorama::fingerprint(&source).unwrap();
+        let dir = tempfile::tempdir_in(repo.join(".cache")).unwrap();
+        let images = dir.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        for name in ["original.png", "same.png", "different.png"] {
+            std::fs::copy(&source, images.join(name)).unwrap();
+        }
+        let executable = repo.join("engines/colmap/bin/colmap.exe");
+        let database = dir.path().join("database.db");
+        let manager = ProcessManager::default();
+        let mut camera_id = None;
+        for (index, name) in ["original.png", "same.png", "different.png"]
+            .iter()
+            .enumerate()
+        {
+            let list = dir.path().join(format!("group-{index}.txt"));
+            std::fs::write(&list, format!("{name}\n")).unwrap();
+            extract_reshoot_group(
+                &executable,
+                &database,
+                ReshootFeatureOptions {
+                    images: &images,
+                    list: &list,
+                    masks: None,
+                    panorama_dimensions: None,
+                    existing_camera_id: if index == 1 { camera_id } else { None },
+                    max_size: 800,
+                    max_features: 1024,
+                },
+                dir.path().join("features.log"),
+                &manager,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let db = rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let assigned: u32 = db
+                .query_row(
+                    "SELECT camera_id FROM images WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let cameras: u32 = db
+                .query_row("SELECT COUNT(*) FROM cameras", [], |row| row.get(0))
+                .unwrap();
+            if index == 0 {
+                camera_id = Some(assigned);
+            }
+            if index == 1 {
+                assert_eq!(Some(assigned), camera_id);
+                assert_eq!(cameras, 1);
+            }
+            if index == 2 {
+                assert_ne!(Some(assigned), camera_id);
+                assert_eq!(cameras, 2);
+            }
+        }
+        assert_eq!(
+            crate::video::panorama::fingerprint(&source).unwrap(),
+            original_hash
+        );
+        eprintln!("Native camera reuse verified: original/same share one camera; different creates a second camera. Original PNG SHA-256 unchanged.");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the local Ballintoy DB and bundled vocabulary; read-only retrieval in an isolated copied database"]
+    async fn native_reshoot_retrieval_queries_only_registered_old_images() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let source = repo.join(".cache/panorama-v1/projects/20261017-191833_ballintoy-erp");
+        let root = tempfile::tempdir_in(repo.join(".cache")).unwrap();
+        let database = root.path().join("database.db");
+        std::fs::copy(source.join("work/colmap/database.db"), &database).unwrap();
+        let images = crate::reconstruction::colmap_model::read_registered_images(
+            &source.join("work/colmap/sparse/0"),
+        )
+        .unwrap();
+        let old: Vec<_> = images.iter().take(5).map(|i| i.name.clone()).collect();
+        let new: Vec<_> = images
+            .iter()
+            .skip(5)
+            .take(2)
+            .map(|i| i.name.clone())
+            .collect();
+        let pairs = retrieve_reshoot_pairs(
+            &repo.join("engines/colmap/bin/colmap.exe"),
+            &database,
+            &old,
+            &new,
+            3,
+            root.path().join("retriever.log"),
+            &ProcessManager::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pairs.len(), 6);
+        assert!(pairs
+            .iter()
+            .all(|(a, b)| old.contains(a) && new.contains(b)));
+    }
 
     #[test]
     fn panorama_camera_uses_model_17_dimensions_without_a_fake_focal_length() {

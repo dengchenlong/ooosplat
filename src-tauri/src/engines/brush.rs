@@ -36,6 +36,8 @@ pub struct BrushGpuLaunchPolicy {
 }
 
 pub struct BrushTrainingOptions<'a> {
+    pub alpha_mode: Option<&'static str>,
+    pub warm: Option<crate::pipeline::reshoot::WarmStartParameters>,
     pub preset: BrushTrainingPreset,
     pub panorama: bool,
     pub log_path: PathBuf,
@@ -226,7 +228,33 @@ pub async fn train(
         }
     }
     let environment = options.gpu_launch_policy.environment();
-    let args = train_args_for_mode(dataset, output_directory, options.preset, options.panorama);
+    let mut args = train_args_for_mode(
+        dataset,
+        output_directory,
+        options.preset,
+        options.panorama && options.warm.is_none(),
+    );
+    if let Some(mode) = options.alpha_mode {
+        args.extend([OsString::from("--alpha-mode"), OsString::from(mode)]);
+    }
+    if let Some(warm) = options.warm {
+        args.splice(
+            0..0,
+            [
+                ("--growth-start-iter", warm.growth_start.to_string()),
+                ("--sh-degree", warm.sh_degree.to_string()),
+                ("--lr-mean", warm.lr_mean.to_string()),
+                ("--lr-mean-end", warm.lr_mean_end.to_string()),
+                ("--lr-coeffs-dc", warm.lr_coeffs_dc.to_string()),
+                ("--lr-opac", warm.lr_opac.to_string()),
+                ("--lr-scale", warm.lr_scale.to_string()),
+                ("--lr-rotation", warm.lr_rotation.to_string()),
+                ("--mean-noise-weight", warm.mean_noise_weight.to_string()),
+            ]
+            .into_iter()
+            .flat_map(|(key, value)| [OsString::from(key), OsString::from(value)]),
+        );
+    }
     let output = manager
         .run_with_environment(
             ProcessSpec {

@@ -11,13 +11,15 @@ interface Props {
   detection?: ProjectionDetection | null;
   projection?: VideoProjection | null;
   historical?: boolean;
+  gpsDetected?: boolean;
+  gpsFallback?: boolean;
   disabled?: boolean;
   onProjectionChange?: (value: VideoProjection) => void;
   onRetry?: () => void;
 }
 
 /** The connected lower half of the media picker; no independent card or preview. */
-export function MediaSourceStatus({ inputType, checking, error, detection, projection, historical, disabled, onProjectionChange, onRetry }: Props) {
+export function MediaSourceStatus({ inputType, checking, error, detection, projection, historical, gpsDetected, gpsFallback, disabled, onProjectionChange, onRetry }: Props) {
   const { t } = useI18n();
   const id = useId();
   if (checking) return <div className="media-source-status checking" role="status" aria-live="polite"><LoaderCircle size={17} className="spin" /><span>{t(inputType === 'video' ? 'source.detectingVideo' : 'source.detectingImages')}</span></div>;
@@ -46,6 +48,7 @@ export function MediaSourceStatus({ inputType, checking, error, detection, proje
       <option value="perspective">{t(images ? 'source.images' : 'panorama.ordinaryDetected')}</option>
       <option value="equirectangular" disabled={!detection?.supportedErp}>{t(images ? 'source.panoramaImages' : 'source.fullPanorama')}</option>
     </select>}
-    {!historical && detection?.unsupported && <p className="media-source-warning">{t(images ? 'source.unsupportedImages' : 'panorama.unsupported')}</p>}
+    {!historical && detection?.unsupported && projection !== 'perspective' && <p className="media-source-warning">{t(images ? 'source.unsupportedImages' : 'panorama.unsupported')}</p>}
+    {!historical && images && gpsDetected && <div className="media-source-copy gps-source-hint" role="status"><strong>{t('source.gpsDetected')}</strong><p>{t(gpsFallback ? 'source.gpsFallback' : 'source.gpsHint')}</p></div>}
   </div>;
 }

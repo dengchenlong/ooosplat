@@ -12,6 +12,7 @@ interface Props {
   quality: Quality;
   plannerEnabled: boolean;
   completed: boolean;
+  active?: boolean;
   acceleration: ColmapAccelerationStatus | null;
   video?: VideoInfo | null;
   imageSequence?: ImageSequenceInfo | null;
@@ -20,9 +21,10 @@ interface Props {
   inheritedFrom?: 'resume' | 'reshoot' | null;
   videoProjection?: import('../types/pipeline').VideoProjection | null;
   inputProjection?: import('../types/pipeline').VideoProjection | null;
+  reshootRecipe?: import('../types/pipeline').ReshootRecipeSummary | null;
 }
 
-export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection }: Props) {
+export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, active = false, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection, reshootRecipe }: Props) {
   const { locale, t, formatNumber, formatDuration } = useI18n();
   const temporary = acceleration?.detectionState === 'temporarilyUnavailable';
   const warning = acceleration?.backend === 'cpu';
@@ -30,6 +32,12 @@ export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality
   const visibleSourcePath = displayPath(sourcePath);
   const visibleProjectsRoot = displayPath(projectsRoot);
   return <div className="project-configuration-detail">
+    {!active && !completed && reshootRecipe && <div className="form-section"><label className="field-label">{t('reshoot.planTitle')}</label>
+      <p>{t(`reshoot.condition.${reshootRecipe.options.condition}`)}</p>
+      {(reshootRecipe.initial.reconstruction !== reshootRecipe.actual.reconstruction || reshootRecipe.initial.training !== reshootRecipe.actual.training) && <p>{t(reshootRecipe.initial.reconstruction === 'full' ? 'reshoot.planFull' : reshootRecipe.initial.training === 'warm' ? 'reshoot.planWarm' : 'reshoot.planCold')} →</p>}
+      <p>{t(reshootRecipe.actual.reconstruction === 'full' ? 'reshoot.planFull' : reshootRecipe.actual.training === 'warm' ? 'reshoot.planWarm' : 'reshoot.planCold')}</p>
+      <label><input type="checkbox" checked={reshootRecipe.options.allowFallback} disabled /> {t('reshoot.allowFallback')}</label>
+    </div>}
     <div className="form-section"><label className="field-label">{t('input.label')}</label>
       <div className="source-input-card readonly"><div className="path-picker media-path readonly" title={visibleSourcePath}><span><strong>{taskBasename(visibleSourcePath)}</strong><small>{visibleSourcePath}</small></span></div><MediaSourceStatus historical inputType={inputType} projection={inputProjection ?? videoProjection} /></div>
     </div>
@@ -37,7 +45,7 @@ export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality
       <div className="path-picker compact readonly" title={visibleProjectsRoot}><FolderOpen size={18} /><span><strong>{taskBasename(visibleProjectsRoot)}</strong><small>{visibleProjectsRoot}</small></span></div>
     </div>
     <div className="form-section">
-      <div className="field-label-row"><label className="field-label">{t('quality.label')}</label>{!completed && inheritedFrom && <span className="locked-setting"><Lock size={12} />{t(inheritedFrom === 'reshoot' ? 'reshoot.inheritedReadonly' : 'project.inheritedReadonly')}</span>}</div>
+      <div className="field-label-row"><label className="field-label">{t('quality.label')}</label>{!active && !completed && inheritedFrom && <span className="locked-setting"><Lock size={12} />{t(inheritedFrom === 'reshoot' ? 'reshoot.inheritedReadonly' : 'project.inheritedReadonly')}</span>}</div>
       <div className="quality-settings locked-quality-settings">
         <div className="quality-list" role="radiogroup" aria-label={t('quality.label')}>{(['fast', 'balanced', 'high'] as const).map(value => <button key={value} type="button" role="radio" disabled aria-checked={quality === value} className={quality === value ? 'quality-option selected' : 'quality-option'}><span className="radio-mark"><span /></span><span><strong>{t(`quality.${value}`)}</strong><small>{t(`quality.${value}Hint`)}</small></span></button>)}</div>
         <button className="planner-switch" type="button" role="switch" aria-checked={plannerEnabled} disabled><span><strong>{t('planner.label')}</strong><small>{t('planner.hint')}</small></span><i aria-hidden="true"><span /></i></button>

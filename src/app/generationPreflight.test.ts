@@ -49,7 +49,13 @@ describe('generation preflight registry', () => {
         for (const value of [undefined, '', 'accepted', 'other']) expect(answerIsValid(questions[0], value)).toBe(false);
         for (const value of ['sequential', 'exhaustive']) expect(answerIsValid(questions[0], value)).toBe(true);
       }
-      expect(collectPreflightQuestions([{ ...draft, kind: 'reshoot' }])).toHaveLength(0);
+      const reshoot = { ...draft, kind: 'reshoot' as const, reshootSource: { projection } as import('../types/pipeline').ReshootSourceInfo };
+      expect(collectPreflightQuestions([reshoot]).map(q => q.kind)).toEqual(['reshootCondition', ...(projection === 'perspective' ? ['reshootCamera'] : []), ...(imageCount > 100 ? ['imageOrder'] : [])]);
+      if (projection === 'perspective') {
+        const camera = collectPreflightQuestions([reshoot])[1];
+        for (const answer of [undefined, '', 'accepted', 'good']) expect(answerIsValid(camera, answer)).toBe(false);
+        for (const answer of ['same', 'different', 'unsure']) expect(answerIsValid(camera, answer)).toBe(true);
+      }
       expect(collectPreflightQuestions([{ ...draft, inputType: 'video' }])).toHaveLength(0);
       expect(preflightSnapshot({ ...draft, quality: 'high' })).not.toBe(preflightSnapshot(draft));
       expect(preflightSnapshot({ ...draft, imageSequence: { ...draft.imageSequence, imageCount: imageCount + 1 } })).not.toBe(preflightSnapshot(draft));

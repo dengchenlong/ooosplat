@@ -6,6 +6,30 @@ use rmcp::{
     ServiceExt,
 };
 
+#[test]
+fn reshoot_requests_are_explicit_and_old_generation_requests_remain_unchanged() {
+    let old: CreateRequest = serde_json::from_value(
+        json!({"input_path":"clip.mp4","quality":"fast","client_request_id":"old"}),
+    )
+    .unwrap();
+    assert!(old.source_project_id.is_none() && old.reshoot_options.is_none());
+    let new: CreateRequest = serde_json::from_value(json!({"input_path":"new-images","quality":"high","client_request_id":"new","source_project_id":Uuid::nil(),"reshoot_options":{"condition":"good","allowFallback":false,"sourceIdentity":"source","inputIdentity":"input","projection":"perspective"}})).unwrap();
+    assert!(!new.reshoot_options.unwrap().allow_fallback);
+    assert!(serde_json::from_value::<CreateRequest>(json!({"input_path":"new-images","quality":"high","client_request_id":"invalid","reshoot_options":{"condition":"good"}})).is_err());
+    let definition = definitions()
+        .into_iter()
+        .find(|t| t.name == "inspect_reshoot_input")
+        .unwrap();
+    assert!(definition.output_schema.is_some());
+    assert!(definition
+        .input_schema
+        .get("required")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .contains(&json!("source_project_id")));
+}
+
 #[tokio::test]
 async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     let temp = tempfile::tempdir().unwrap();
@@ -70,7 +94,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     );
     let client = ().serve(transport).await.unwrap();
     let definitions = client.list_tools(None).await.unwrap();
-    assert_eq!(definitions.tools.len(), 7);
+    assert_eq!(definitions.tools.len(), 8);
     assert!(definitions.tools.iter().all(|t| t.output_schema.is_some()));
     let app_status = client
         .call_tool(CallToolRequestParams::new("get_app_status"))
