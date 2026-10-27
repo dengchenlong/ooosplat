@@ -35,6 +35,7 @@ from . import (
 )
 from .backends import BackendError
 from .mask_io import coverage_of_rows, write_mask_png
+from .mask_postprocess import MaskPostprocessConfig, postprocess_rows
 from .protocol import ProtocolError, decode_message, encode_message
 
 STATE_VERSION = 1
@@ -242,11 +243,17 @@ class SidecarServer:
         prompt = session["prompts"].get(object_id)
         if prompt is None:
             raise RequestError("unknown_object", f"no prompt for objectId: {object_id}")
+        # Validate before touching the filesystem: a bad request must not leave
+        # a half-created masks directory behind.
+        try:
+            postprocess = MaskPostprocessConfig.from_protocol(request.get("maskPostprocess"))
+        except ValueError as exc:
+            raise RequestError("invalid_request", str(exc)) from exc
         masks_dir = Path(_require_str(request, "masksDir"))
         masks_dir.mkdir(parents=True, exist_ok=True)
 
         frames = session["frames"]
-        frames_hash = _frames_hash(session, object_id, prompt)
+        frames_hash = _frames_hash(session, object_id, prompt, postprocess)
         done = _load_state(masks_dir, request["sessionId"], object_id, frames_hash)
         completed: dict[str, dict] = done["completed"]
 
@@ -256,6 +263,16 @@ class SidecarServer:
             if frame_id in completed and (masks_dir / completed[frame_id]["maskPath"]).is_file():
                 continue
             rows = self.backend.segment(session, prompt, frame, index)
+            if postprocess.enabled:
+                # Filter before writing: the mask on disk is what the
+                # back-projection votes on, and coverage must describe the
+                # mask that was actually written (issue #14).
+                rows = postprocess_rows(
+                    rows,
+                    min_area_ratio=postprocess.min_area_ratio,
+                    keep_largest=postprocess.keep_largest,
+                    connectivity=postprocess.connectivity,
+                ).rows
             mask_name = f"{frame_id}.png"
             mask_path = masks_dir / mask_name
             width, height = frame["width"], frame["height"]
@@ -326,10 +343,20 @@ def _canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
-def _frames_hash(session: dict, object_id: str, prompt: dict) -> str:
+def _frames_hash(
+    session: dict, object_id: str, prompt: dict, postprocess: MaskPostprocessConfig
+) -> str:
     public_prompt = {k: v for k, v in prompt.items() if not k.startswith("_")}
     payload = _canonical(
-        {"frames": session["frames"], "objectId": object_id, "prompt": public_prompt}
+        {
+            "frames": session["frames"],
+            "objectId": object_id,
+            "prompt": public_prompt,
+            # The post-process config changes the masks on disk just like the
+            # prompt does, so it belongs to the checkpoint identity: otherwise
+            # toggling `maskPostprocess` would silently replay cached masks.
+            "postprocess": postprocess.to_protocol(),
+        }
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

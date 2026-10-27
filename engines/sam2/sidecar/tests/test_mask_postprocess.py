@@ -281,10 +281,11 @@ class TestPerformance:
         import time
 
         rects = [(100, 100, 400, 400)]
+        # Deterministic, non-touching specks below the main blob (a 20x10 grid).
         for i in range(200):
-            x = (i * 37) % 950
-            y = (i * 53) % 530
-            rects.append((x, y, x + 1, y + 1))
+            x = 2 + (i % 20) * 46
+            y = 450 + (i // 20) * 6
+            rects.append((x, y, x, y))
         rows = rows_from_rects(rects, width=960, height=540)
 
         started = time.perf_counter()
