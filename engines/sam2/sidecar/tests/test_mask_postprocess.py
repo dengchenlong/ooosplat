@@ -28,6 +28,7 @@ from sam2_sidecar.mask_postprocess import (
     DEFAULT_CONNECTIVITY,
     DEFAULT_KEEP_LARGEST,
     DEFAULT_MIN_AREA_RATIO,
+    DEFAULT_NEARBY_RADIUS_RATIO,
     MaskPostprocessConfig,
     postprocess_rows,
 )
@@ -165,7 +166,10 @@ class TestConnectivity:
         assert foreground_pixels(result.rows) == 50
 
     def test_diagonal_touch_splits_with_4_connectivity(self):
-        result = postprocess_rows(self._diagonal_pair(), connectivity=4)
+        # Labelling is what this test pins: under 4-connectivity the diagonal
+        # neighbours are two components. nearby_radius_ratio=0 keeps the strict
+        # "largest only" selection, so only one of them survives.
+        result = postprocess_rows(self._diagonal_pair(), connectivity=4, nearby_radius_ratio=0.0)
         assert result.component_count == 2
         # Equal areas -> the first component in raster order wins the tie.
         assert foreground_pixels(result.rows) == 25
@@ -196,6 +200,82 @@ class TestGrayLevels:
         assert foreground_pixels(result.rows) == 20
 
 
+class TestNearbyParts:
+    """A second body that touches the main blob must survive (P2 frame 213).
+
+    In the barber-chair clip the seat cushion separates from the backrest by a
+    few shadow pixels, so "keep only the largest component" erased a real chair
+    part (coverage 0.436 -> 0.241). The floor reflection it is meant to remove
+    sits >40 px below the chair. Keeping components that are near the main blob
+    separates the two cases without a per-object threshold.
+    """
+
+    def _two_bodies(self, part_y0, part_y1=41):
+        return rows_from_rects(
+            [
+                (10, 10, 29, 29),  # main body: 400 px
+                (10, part_y0, 19, part_y1),  # second body: 100 px
+            ],
+            width=100,
+            height=100,
+        )
+
+    def test_second_body_within_nearby_radius_is_kept(self):
+        # 100x100 frame -> default radius = round(0.02 * 100) = 2 px.
+        # One empty row between the bodies = distance 2 -> kept.
+        rows = self._two_bodies(31, 40)
+        result = postprocess_rows(rows)
+        assert result.component_count == 2
+        assert result.kept_components == 2
+        assert foreground_pixels(result.rows) == 500
+        assert result.rows[31][10] == 255
+        assert result.dropped_pixels == 0
+
+    def test_second_body_beyond_nearby_radius_is_dropped(self):
+        # Same sizes, but two empty rows below the main body (distance 3 >
+        # radius 2): it is a reflection, not a chair part.
+        result = postprocess_rows(self._two_bodies(32, 41))
+        assert result.kept_components == 1
+        assert foreground_pixels(result.rows) == 400
+        assert result.rows[32][10] == 0
+
+    def test_far_large_component_is_dropped(self):
+        result = postprocess_rows(self._two_bodies(50, 59))
+        assert result.kept_components == 1
+        assert foreground_pixels(result.rows) == 400
+
+    def test_chain_of_nearby_parts_is_kept(self):
+        # Two parts each within reach of the previous one, but the last one is
+        # far from the main body: expansion has to be iterative.
+        rows = rows_from_rects(
+            [(10, 10, 29, 29), (10, 31, 19, 40), (10, 42, 19, 51)],
+            width=100,
+            height=100,
+        )
+        result = postprocess_rows(rows)
+        assert result.kept_components == 3
+        assert foreground_pixels(result.rows) == 600
+
+    def test_zero_nearby_radius_restores_strict_largest(self):
+        # Opt-out: radius 0 means "only the largest component", the pre-#14
+        # behaviour, so callers that want it can still get it.
+        result = postprocess_rows(self._two_bodies(31, 40), nearby_radius_ratio=0.0)
+        assert result.kept_components == 1
+        assert foreground_pixels(result.rows) == 400
+
+    def test_nearby_radius_ignored_when_keep_largest_is_false(self):
+        result = postprocess_rows(
+            self._two_bodies(50, 59), keep_largest=False, min_area_ratio=0.005
+        )
+        assert result.kept_components == 2
+        assert foreground_pixels(result.rows) == 500
+
+    @pytest.mark.parametrize("ratio", [-0.1, 1.5, "0.1", None, True])
+    def test_invalid_nearby_radius_rejected(self, ratio):
+        with pytest.raises(ValueError, match="nearbyRadiusRatio"):
+            MaskPostprocessConfig.from_protocol({"nearbyRadiusRatio": ratio})
+
+
 class TestConfig:
     def test_defaults(self):
         cfg = MaskPostprocessConfig.default()
@@ -203,6 +283,7 @@ class TestConfig:
         assert cfg.min_area_ratio == DEFAULT_MIN_AREA_RATIO == 0.005
         assert cfg.keep_largest is DEFAULT_KEEP_LARGEST is True
         assert cfg.connectivity == DEFAULT_CONNECTIVITY == 8
+        assert cfg.nearby_radius_ratio == DEFAULT_NEARBY_RADIUS_RATIO == 0.02
 
     def test_missing_payload_means_defaults(self):
         assert MaskPostprocessConfig.from_protocol(None) == MaskPostprocessConfig.default()
@@ -214,10 +295,15 @@ class TestConfig:
             "minAreaRatio": 0.02,
             "keepLargest": False,
             "connectivity": 4,
+            "nearbyRadiusRatio": 0.01,
         }
         cfg = MaskPostprocessConfig.from_protocol(payload)
         assert cfg == MaskPostprocessConfig(
-            enabled=False, min_area_ratio=0.02, keep_largest=False, connectivity=4
+            enabled=False,
+            min_area_ratio=0.02,
+            keep_largest=False,
+            connectivity=4,
+            nearby_radius_ratio=0.01,
         )
         assert cfg.to_protocol() == payload
 

@@ -272,6 +272,7 @@ class SidecarServer:
                     min_area_ratio=postprocess.min_area_ratio,
                     keep_largest=postprocess.keep_largest,
                     connectivity=postprocess.connectivity,
+                    nearby_radius_ratio=postprocess.nearby_radius_ratio,
                 ).rows
             mask_name = f"{frame_id}.png"
             mask_path = masks_dir / mask_name

@@ -8,7 +8,15 @@ clumps. This module cleans a frame's mask before it is written:
 1. label connected components (4- or 8-neighbour, run-length + union-find, so
    a 1080p frame costs milliseconds);
 2. drop every component smaller than ``min_area_ratio`` of the frame;
-3. optionally keep only the largest surviving component.
+3. keep the largest component plus every component that comes within
+   ``nearbyRadiusRatio`` of it (iteratively, so a chain of parts still joins).
+
+Step 3 is why the filter does not simply keep the biggest blob: a chair's seat
+cushion can separate from its backrest by a few shadow pixels (P2 frame 213 lost
+19 % of the frame that way), while a floor reflection sits dozens of pixels away
+from the object. Proximity separates "another part of the object" from "the same
+object mirrored in the floor" without per-object tuning. Set
+``nearbyRadiusRatio`` to 0 to get the strict largest-component behaviour.
 
 Semantics, pinned down because the corner cases matter:
 
@@ -38,12 +46,17 @@ import numpy as np
 DEFAULT_MIN_AREA_RATIO = 0.005
 DEFAULT_KEEP_LARGEST = True
 DEFAULT_CONNECTIVITY = 8
+#: Components within this fraction of the shorter frame side count as parts of
+#: the main object (2 % of 540 px = 11 px; a floor reflection is farther away).
+DEFAULT_NEARBY_RADIUS_RATIO = 0.02
 VALID_CONNECTIVITY = (4, 8)
 
 #: Pixels strictly above this value count as foreground (masks are 0/255).
 FOREGROUND_THRESHOLD = 127
 
-_CONFIG_KEYS = frozenset({"enabled", "minAreaRatio", "keepLargest", "connectivity"})
+_CONFIG_KEYS = frozenset(
+    {"enabled", "minAreaRatio", "keepLargest", "connectivity", "nearbyRadiusRatio"}
+)
 
 
 class MaskPostprocessConfigError(ValueError):
@@ -62,6 +75,7 @@ class MaskPostprocessConfig:
     min_area_ratio: float = DEFAULT_MIN_AREA_RATIO
     keep_largest: bool = DEFAULT_KEEP_LARGEST
     connectivity: int = DEFAULT_CONNECTIVITY
+    nearby_radius_ratio: float = DEFAULT_NEARBY_RADIUS_RATIO
 
     @classmethod
     def default(cls) -> "MaskPostprocessConfig":
@@ -105,9 +119,15 @@ class MaskPostprocessConfig:
 
         return cls(
             enabled=enabled,
-            min_area_ratio=_validate_ratio(payload.get("minAreaRatio", DEFAULT_MIN_AREA_RATIO)),
+            min_area_ratio=_validate_ratio(
+                payload.get("minAreaRatio", DEFAULT_MIN_AREA_RATIO), "minAreaRatio"
+            ),
             keep_largest=keep_largest,
             connectivity=connectivity,
+            nearby_radius_ratio=_validate_ratio(
+                payload.get("nearbyRadiusRatio", DEFAULT_NEARBY_RADIUS_RATIO),
+                "nearbyRadiusRatio",
+            ),
         )
 
     def to_protocol(self) -> dict:
@@ -116,6 +136,7 @@ class MaskPostprocessConfig:
             "minAreaRatio": self.min_area_ratio,
             "keepLargest": self.keep_largest,
             "connectivity": self.connectivity,
+            "nearbyRadiusRatio": self.nearby_radius_ratio,
         }
 
 
@@ -134,15 +155,15 @@ class MaskPostprocessResult:
         return sum(row.count(255) for row in self.rows)
 
 
-def _validate_ratio(value) -> float:
+def _validate_ratio(value, field: str = "minAreaRatio") -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MaskPostprocessConfigError(
-            "maskPostprocess.minAreaRatio must be a number between 0 and 1"
+            f"maskPostprocess.{field} must be a number between 0 and 1"
         )
     ratio = float(value)
     if not math.isfinite(ratio) or ratio < 0.0 or ratio > 1.0:
         raise MaskPostprocessConfigError(
-            f"maskPostprocess.minAreaRatio must be between 0 and 1 (got {ratio!r})"
+            f"maskPostprocess.{field} must be between 0 and 1 (got {ratio!r})"
         )
     return ratio
 
@@ -153,11 +174,13 @@ def postprocess_rows(
     min_area_ratio: float = DEFAULT_MIN_AREA_RATIO,
     keep_largest: bool = DEFAULT_KEEP_LARGEST,
     connectivity: int = DEFAULT_CONNECTIVITY,
+    nearby_radius_ratio: float = DEFAULT_NEARBY_RADIUS_RATIO,
 ) -> MaskPostprocessResult:
     """Filter one frame's mask rows (see the module docstring for semantics)."""
     if isinstance(connectivity, bool) or connectivity not in VALID_CONNECTIVITY:
         raise ValueError(f"connectivity must be 4 or 8 (got {connectivity!r})")
     ratio = _validate_ratio(min_area_ratio)
+    nearby_ratio = _validate_ratio(nearby_radius_ratio, "nearbyRadiusRatio")
 
     if not rows:
         return MaskPostprocessResult([], 0, 0, 0, 0)
@@ -174,27 +197,22 @@ def postprocess_rows(
         return MaskPostprocessResult(list(rows), 0, 0, 0, 0)
 
     areas, runs_by_root = _label_components(foreground, connectivity)
-    threshold = ratio * width * height
-    qualifying = [root for root, area in areas.items() if area >= threshold]
-    if not qualifying:
-        # Documented fallback: never erase the whole mask just because the
-        # object is small in this frame.
-        qualifying = [max(areas, key=lambda root: (areas[root], -root))]
+    chosen = _select_components(
+        areas,
+        runs_by_root,
+        width=width,
+        height=height,
+        min_area_ratio=ratio,
+        keep_largest=keep_largest,
+        nearby_radius_ratio=nearby_ratio,
+    )
 
-    if keep_largest:
-        chosen = [max(qualifying, key=lambda root: (areas[root], -root))]
-    else:
-        chosen = qualifying
-
-    out = np.zeros((height, width), dtype=np.uint8)
-    kept_pixels = 0
-    for root in chosen:
-        for y, start, end in runs_by_root[root]:
-            out[y, start : end + 1] = 255
-            kept_pixels += end - start + 1
-
+    kept_ids = np.array(sorted(root + 1 for root in chosen), dtype=np.int32)
     total_pixels = sum(areas.values())
-    payload = out.tobytes()
+    kept_mask = np.isin(_raster_ids(runs_by_root, width, height), kept_ids)
+    kept_pixels = int(kept_mask.sum())
+
+    payload = (kept_mask.astype(np.uint8) * 255).tobytes()
     out_rows = [payload[y * width : (y + 1) * width] for y in range(height)]
     return MaskPostprocessResult(
         rows=out_rows,
@@ -203,6 +221,104 @@ def postprocess_rows(
         dropped_components=len(areas) - len(chosen),
         dropped_pixels=total_pixels - kept_pixels,
     )
+
+
+def _raster_ids(
+    runs_by_root: dict[int, list[tuple[int, int, int]]], width: int, height: int
+) -> np.ndarray:
+    """Rasterise the run table into an int32 label image (root ids, 0 = empty)."""
+    ids = np.zeros((height, width), dtype=np.int32)
+    for root, runs in runs_by_root.items():
+        for y, start, end in runs:
+            ids[y, start : end + 1] = root + 1  # 0 means "empty pixel"
+    return ids
+
+
+def _select_components(
+    areas: dict[int, int],
+    runs_by_root: dict[int, list[tuple[int, int, int]]],
+    *,
+    width: int,
+    height: int,
+    min_area_ratio: float,
+    keep_largest: bool,
+    nearby_radius_ratio: float,
+) -> list[int]:
+    """Pick the components that survive the area filter and the largest+nearby rule."""
+    threshold = min_area_ratio * width * height
+    qualifying = [root for root, area in areas.items() if area >= threshold]
+    if not qualifying:
+        # Documented fallback: never erase the whole mask just because the
+        # object is small in this frame.
+        qualifying = [max(areas, key=lambda root: (areas[root], -root))]
+
+    if not keep_largest:
+        return qualifying
+
+    largest = max(qualifying, key=lambda root: (areas[root], -root))
+    radius = _nearby_radius_px(nearby_radius_ratio, width, height)
+    chosen = [largest]
+    pending = set(qualifying) - {largest}
+    if radius <= 0 or not pending:
+        return chosen
+
+    kept = _raster_ids({largest: runs_by_root[largest]}, width, height) > 0
+    while pending:
+        added = [
+            root
+            for root in pending
+            if _touches_within(runs_by_root[root], kept, radius, width, height)
+        ]
+        if not added:
+            break
+        for root in added:
+            for y, start, end in runs_by_root[root]:
+                kept[y, start : end + 1] = True
+        chosen.extend(sorted(added))
+        pending -= set(added)
+    return chosen
+
+
+def _nearby_radius_px(ratio: float, width: int, height: int) -> int:
+    if ratio <= 0.0:
+        return 0
+    return max(1, round(ratio * min(width, height)))
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Square-kernel binary dilation (separable, no scipy)."""
+    if radius <= 0:
+        return np.asarray(mask, dtype=bool)
+    k = 2 * radius + 1
+    padded = np.pad(mask, ((0, 0), (radius, radius)))
+    horizontally = np.asarray(
+        np.lib.stride_tricks.sliding_window_view(padded, k, axis=1).any(axis=-1), dtype=bool
+    )
+    padded = np.pad(horizontally, ((radius, radius), (0, 0)))
+    return np.asarray(
+        np.lib.stride_tricks.sliding_window_view(padded, k, axis=0).any(axis=-1), dtype=bool
+    )
+
+
+def _touches_within(
+    runs: list[tuple[int, int, int]],
+    kept: np.ndarray,
+    radius: int,
+    width: int,
+    height: int,
+) -> bool:
+    """True when any pixel of this component lies within ``radius`` of ``kept``."""
+    y0 = max(0, min(run[0] for run in runs) - radius)
+    y1 = min(height, max(run[0] for run in runs) + radius + 1)
+    x0 = max(0, min(run[1] for run in runs) - radius)
+    x1 = min(width, max(run[2] for run in runs) + radius + 1)
+    window = kept[y0:y1, x0:x1]
+    if not window.any():
+        return False
+    candidate = np.zeros_like(window, dtype=bool)
+    for y, start, end in runs:
+        candidate[y - y0, max(start, x0) - x0 : min(end, x1 - 1) - x0 + 1] = True
+    return bool((_dilate(window, radius) & candidate).any())
 
 
 def _row_runs(row: np.ndarray) -> tuple[list[int], list[int]]:

@@ -28,6 +28,7 @@ from .mask_postprocess import (
     DEFAULT_CONNECTIVITY,
     DEFAULT_KEEP_LARGEST,
     DEFAULT_MIN_AREA_RATIO,
+    DEFAULT_NEARBY_RADIUS_RATIO,
     postprocess_rows,
 )
 
@@ -54,7 +55,7 @@ def main(argv=None) -> int:
     print(
         f"postprocess_masks: {len(pngs)} png(s) {masks_dir} -> {out_dir} "
         f"(minAreaRatio={args.min_area_ratio}, keepLargest={keep_largest}, "
-        f"connectivity={args.connectivity})"
+        f"connectivity={args.connectivity}, nearbyRadiusRatio={args.nearby_radius_ratio})"
     )
 
     filtered_coverage: dict[str, float] = {}
@@ -68,6 +69,7 @@ def main(argv=None) -> int:
                 min_area_ratio=args.min_area_ratio,
                 keep_largest=keep_largest,
                 connectivity=args.connectivity,
+                nearby_radius_ratio=args.nearby_radius_ratio,
             )
         except ValueError as exc:  # pragma: no cover - argparse validates first
             print(f"postprocess_masks: {path.name}: {exc}", file=sys.stderr)
@@ -143,6 +145,13 @@ def _parse_args(argv):
         choices=(4, 8),
         default=DEFAULT_CONNECTIVITY,
         help=f"neighbourhood for connected components (default: {DEFAULT_CONNECTIVITY})",
+    )
+    parser.add_argument(
+        "--nearby-radius-ratio",
+        type=ratio,
+        default=DEFAULT_NEARBY_RADIUS_RATIO,
+        help="keep components within this fraction of the shorter side of the main "
+        f"component, 0 = strict largest only (default: {DEFAULT_NEARBY_RADIUS_RATIO})",
     )
     return parser.parse_args(argv)
 
