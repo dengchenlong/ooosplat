@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   createGenerationDraft,
+  draftGenerationPolicy,
   draftDisplayName,
   createReshootDraft,
   loadTaskWorkspace,
@@ -12,6 +13,21 @@ import {
 } from "./taskWorkspace";
 
 describe("task workspace persistence", () => {
+  it('uses policy v3 for new and restored custom-sampling drafts without changing user choices', () => {
+    const draft = { ...createGenerationDraft(1), frameSamplingRatio: .755, autoRetryEnabled: false };
+    expect(draftGenerationPolicy(draft)).toEqual({version:3,frameSamplingRatio:.755,autoRetryEnabled:false});
+    saveTaskWorkspace([draft], {kind:'draft',id:draft.id}, 2);
+    expect(draftGenerationPolicy(loadTaskWorkspace().drafts[0])).toEqual(draftGenerationPolicy(draft));
+  });
+  it('persists retry consent and manual base sampling independently of legacy optimization', () => {
+    const draft = { ...createGenerationDraft(1, false), autoRetryEnabled: false, frameSamplingRatio: .755 };
+    saveTaskWorkspace([draft], {kind:'draft',id:draft.id}, 2);
+    expect(loadTaskWorkspace().drafts[0]).toMatchObject({autoRetryEnabled:false,frameSamplingRatio:.755,plannerEnabled:false});
+    const stored = JSON.parse(localStorage.getItem(TASK_WORKSPACE_STORAGE_KEY)!);
+    delete stored.drafts[0].autoRetryEnabled; delete stored.drafts[0].frameSamplingRatio;
+    localStorage.setItem(TASK_WORKSPACE_STORAGE_KEY,JSON.stringify(stored));
+    expect(loadTaskWorkspace().drafts[0]).toMatchObject({autoRetryEnabled:true,frameSamplingRatio:null});
+  });
   beforeEach(() => localStorage.clear());
 
   it("hides display ordinals without changing draft identities or recovery order", () => {

@@ -2,6 +2,8 @@ import type { PipelineEvent, PipelineResult, Quality } from './pipeline';
 import { nextOverallPercent } from '../lib/progressState';
 export type TaskStatus = 'created' | 'starting' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export interface SharedTask {
+  generation_policy?: import('./pipeline').GenerationPolicy | null;
+  automatically_retried?: boolean;
   operation?: import('./pipeline').PipelineOperation | null;
   unit?: string | null;
   substage?: string | null;

@@ -30,7 +30,7 @@ function scrubValue(startValue: number, deltaX: number, mode: ScrubMode, fine: b
 }
 
 export function NumberField({
-  label, name, value, onBegin, onChange, onCommit, mode = "linear", min, max, disabled = false,
+  label, name, value, onBegin, onChange, onCommit, onFocusCanvas, mode = "linear", min, max, disabled = false,
 }: {
   label: string;
   name: string;
@@ -38,6 +38,7 @@ export function NumberField({
   onBegin: () => void;
   onChange: (value: number) => void;
   onCommit: () => void;
+  onFocusCanvas?: () => void;
   mode?: ScrubMode;
   min?: number;
   max?: number;
@@ -48,6 +49,7 @@ export function NumberField({
   const [focused, setFocused] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const dragRef = useRef<DragState | null>(null);
+  const confirmRef = useRef(false);
   const minimum = min ?? (mode === "scale" ? TRANSFORM_SCALE_MIN : undefined);
   const maximum = max ?? (mode === "scale" ? TRANSFORM_SCALE_MAX : undefined);
 
@@ -57,7 +59,8 @@ export function NumberField({
 
   const commit = () => {
     const parsed = Number(text);
-    if (!Number.isFinite(parsed) || (minimum != null && parsed < minimum) || (maximum != null && parsed > maximum)) {
+    const valid = Number.isFinite(parsed) && (minimum == null || parsed >= minimum) && (maximum == null || parsed <= maximum);
+    if (!valid) {
       setText(formatValue(value));
       setValidationError(t("panel.invalidRange", {
         min: minimum ?? "-∞",
@@ -69,10 +72,13 @@ export function NumberField({
     }
     setFocused(false);
     onCommit();
+    const confirmed = confirmRef.current;
+    confirmRef.current = false;
+    if (confirmed && valid) onFocusCanvas?.();
   };
 
   const keyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "Enter") event.currentTarget.blur();
+    if (event.key === "Enter") { confirmRef.current = true; event.currentTarget.blur(); }
     if (event.key === "Escape") {
       setText(formatValue(value));
       event.currentTarget.blur();
@@ -108,7 +114,7 @@ export function NumberField({
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     event.currentTarget.classList.remove("dragging");
     dragRef.current = null;
-    if (drag.dragging) onCommit();
+    if (drag.dragging) { onCommit(); onFocusCanvas?.(); }
   };
 
   const longLabel = label.length > 2;
@@ -145,11 +151,12 @@ export function NumberField({
   </div>;
 }
 
-export function TransformPanel({ transform, onBegin, onChange, onCommit, onRotationChange, gizmoMode = "translate", onGizmoModeChange, disabled = false }: {
+export function TransformPanel({ transform, onBegin, onChange, onCommit, onFocusCanvas, onRotationChange, gizmoMode = "translate", onGizmoModeChange, disabled = false }: {
   transform: GaussianTransform;
   onBegin: () => void;
   onChange: (transform: GaussianTransform) => void;
   onCommit: () => void;
+  onFocusCanvas?: () => void;
   onRotationChange?: (axis: 0 | 1 | 2, value: number) => void;
   gizmoMode?: GizmoMode;
   onGizmoModeChange?: (mode: GizmoMode) => void;
@@ -168,6 +175,7 @@ export function TransformPanel({ transform, onBegin, onChange, onCommit, onRotat
       disabled={disabled}
       onBegin={onBegin}
       onCommit={onCommit}
+      onFocusCanvas={onFocusCanvas}
       onChange={(next) => {
         if (group === "rotation" && onRotationChange) { onRotationChange(index, next); return; }
         const vector = [...transform[group]] as [number, number, number];
@@ -184,6 +192,6 @@ export function TransformPanel({ transform, onBegin, onChange, onCommit, onRotat
     </div></section>}
     <section><h4>{t("panel.position")}</h4><div className="transform-fields">{vectorField("position", 0, transform.position[0])}{vectorField("position", 1, transform.position[1])}{vectorField("position", 2, transform.position[2])}</div></section>
     <section><h4>{t("panel.rotation")}</h4><div className="transform-fields">{vectorField("rotation", 0, transform.rotation[0])}{vectorField("rotation", 1, transform.rotation[1])}{vectorField("rotation", 2, transform.rotation[2])}</div><p>{t("panel.angle")}</p></section>
-    <section><h4>{t("panel.scale")}</h4><NumberField label={t("panel.uniform")} name={t("panel.uniformScale")} value={transform.scale} mode="scale" min={TRANSFORM_SCALE_MIN} max={TRANSFORM_SCALE_MAX} disabled={disabled} onBegin={onBegin} onCommit={onCommit} onChange={(scale) => onChange({ ...transform, scale })} /></section>
+    <section><h4>{t("panel.scale")}</h4><NumberField label={t("panel.uniform")} name={t("panel.uniformScale")} value={transform.scale} mode="scale" min={TRANSFORM_SCALE_MIN} max={TRANSFORM_SCALE_MAX} disabled={disabled} onBegin={onBegin} onCommit={onCommit} onFocusCanvas={onFocusCanvas} onChange={(scale) => onChange({ ...transform, scale })} /></section>
   </aside>;
 }

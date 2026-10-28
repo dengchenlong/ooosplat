@@ -260,6 +260,7 @@ impl PipelineRunner {
                 reshoot_base,
                 fixed_cameras,
                 georeference,
+                state.generation_policy.is_some() && state.actual_transparency == Some(true),
             )
             .await?;
         let Some((model, transform)) = outcome else {
@@ -320,6 +321,7 @@ impl PipelineRunner {
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn gps_attempt(
         &self,
         paths: &ProjectPaths,
@@ -328,6 +330,7 @@ impl PipelineRunner {
         base: Option<&Path>,
         fixed: Option<&Path>,
         georeference: bool,
+        allow_two_view_tracks: bool,
     ) -> Result<Option<(PathBuf, Option<Similarity>)>> {
         let cancel = self.process_manager.child_token();
         if cancel.is_cancelled() {
@@ -461,6 +464,9 @@ impl PipelineRunner {
             "--Mapper.ba_refine_principal_point".into(),
             "0".into(),
         ];
+        if allow_two_view_tracks {
+            args.extend(["--Mapper.tri_ignore_two_view_tracks".into(), "0".into()]);
+        }
         if georeference {
             args.extend([
                 "--use_robust_loss_on_prior_position".into(),

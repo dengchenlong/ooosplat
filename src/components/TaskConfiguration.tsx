@@ -3,9 +3,12 @@ import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskBasename } from '../app/taskPresentation';
 import { displayPath } from '../lib/displayPath';
 import { MediaSourceStatus } from './MediaSourceStatus';
+import { FrameSamplingControl } from './FrameSamplingControl';
 import type { ColmapAccelerationStatus, ImageSequenceInfo, InputType, Quality, RuntimeEstimate, VideoInfo } from '../types/pipeline';
 
 interface Props {
+  generationPolicy?: import('../types/pipeline').GenerationPolicy | null;
+  automaticallyRetried?: boolean;
   sourcePath: string;
   projectsRoot: string;
   inputType: InputType;
@@ -24,7 +27,7 @@ interface Props {
   reshootRecipe?: import('../types/pipeline').ReshootRecipeSummary | null;
 }
 
-export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, active = false, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection, reshootRecipe }: Props) {
+export function TaskConfiguration({ generationPolicy, automaticallyRetried, sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, active = false, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection, reshootRecipe }: Props) {
   const { locale, t, formatNumber, formatDuration } = useI18n();
   const temporary = acceleration?.detectionState === 'temporarilyUnavailable';
   const warning = acceleration?.backend === 'cpu';
@@ -47,8 +50,10 @@ export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality
     <div className="form-section">
       <div className="field-label-row"><label className="field-label">{t('quality.label')}</label>{!active && !completed && inheritedFrom && <span className="locked-setting"><Lock size={12} />{t(inheritedFrom === 'reshoot' ? 'reshoot.inheritedReadonly' : 'project.inheritedReadonly')}</span>}</div>
       <div className="quality-settings locked-quality-settings">
+        {generationPolicy && inputType === 'video' && <FrameSamplingControl video={video ?? null} quality={quality} value={generationPolicy.frameSamplingRatio} disabled onChange={() => {}} />}
         <div className="quality-list" role="radiogroup" aria-label={t('quality.label')}>{(['fast', 'balanced', 'high'] as const).map(value => <button key={value} type="button" role="radio" disabled aria-checked={quality === value} className={quality === value ? 'quality-option selected' : 'quality-option'}><span className="radio-mark"><span /></span><span><strong>{t(`quality.${value}`)}</strong><small>{t(`quality.${value}Hint`)}</small></span></button>)}</div>
-        <button className="planner-switch" type="button" role="switch" aria-checked={plannerEnabled} disabled><span><strong>{t('planner.label')}</strong><small>{t('planner.hint')}</small></span><i aria-hidden="true"><span /></i></button>
+        <button className="planner-switch" type="button" role="switch" aria-checked={generationPolicy?.autoRetryEnabled ?? plannerEnabled} disabled><span><strong>{t(generationPolicy ? 'retry.label' : 'planner.label')}</strong><small>{t(generationPolicy ? 'retry.hint' : 'planner.hint')}</small></span><i aria-hidden="true"><span /></i></button>
+        {completed && automaticallyRetried && <p className="field-note">{t('retry.used')}</p>}
       </div>
     </div>
     <div className={`acceleration-status ${temporary ? 'warning' : acceleration?.backend === 'gpu' ? 'gpu' : warning ? 'warning' : 'cpu'}`} aria-live="polite">

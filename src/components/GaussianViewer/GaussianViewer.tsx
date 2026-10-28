@@ -134,6 +134,9 @@ import { PreviewEditPersistence } from "./PreviewEditPersistence";
 import { ModelTransformGizmo } from "./ModelTransformGizmo";
 import { modelPivotFromPly, rotateAroundModelCenter, type ModelPivot } from "./ModelTransformMath";
 import { readGizmoMode, saveGizmoMode, type GizmoMode } from "./GizmoPreferences";
+import { readRoamSpeed, saveRoamSpeed } from "./RoamPreferences";
+import { RoamSpeedControl } from "./RoamSpeedControl";
+import { PreviewEditFocus } from "./PreviewEditFocus";
 import { PlyExportDialog, type PlyExportDialogState } from "./PlyExportDialog";
 import { createModelExport, type ModelExportOperation } from "../../lib/modelExport";
 import type { ModelFormat } from "../../lib/modelExportTypes";
@@ -153,6 +156,7 @@ type AnimationStatus = {
 type VideoExportPhase = "idle" | "preparing" | "rendering" | "finalizing" | "saving" | "completed" | "error";
 
 interface SplatSceneApi {
+  focusCanvas: () => boolean;
   replay: () => void;
   selectRectangle: (rectangle: SelectionRectangle, selectionMode: RectangleSelectionMode) => Promise<Uint8Array>;
   invertSelection: () => Promise<Uint8Array>;
@@ -219,6 +223,7 @@ interface SplatSceneProps {
   selectionMask: Uint8Array;
   editorMasksReady: boolean;
   gizmoMode: GizmoMode;
+  roamSpeed: number;
   interactionBlocked: boolean;
   onGizmoDragging: (dragging: boolean, cancelled?: boolean) => void;
   onOrthographicViewChange: (view: GaussianOrthographicView | null, orthographic: boolean) => void;
@@ -226,7 +231,7 @@ interface SplatSceneProps {
   onAnimationStatus: (status: AnimationStatus) => void;
 }
 
-const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ projectId, assetUrl, fileSize, readToken, referenceView, transform, mode, tool, crop, deletedMask, selectionMask, editorMasksReady, gizmoMode, interactionBlocked, onGizmoDragging, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
+const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ projectId, assetUrl, fileSize, readToken, referenceView, transform, mode, tool, crop, deletedMask, selectionMask, editorMasksReady, gizmoMode, roamSpeed, interactionBlocked, onGizmoDragging, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
   const { t } = useI18n();
   const app = useApp();
   const cameraRef = useRef<PcEntity>(null);
@@ -255,16 +260,20 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const animationEffectActiveRef = useRef(false);
   const robustLocalBoundsRef = useRef<BoundingBox | null>(null);
   const gizmoRef = useRef<ModelTransformGizmo | null>(null);
+  const gizmoDraggingRef = useRef(false);
+  const roamSpeedRef = useRef(roamSpeed);
+  roamSpeedRef.current = roamSpeed;
+  useEffect(() => { controlsRef.current?.setRoamSpeed(roamSpeed); }, [roamSpeed]);
   const sceneReadyRef = useRef(false);
   const gizmoStateRef = useRef({ mode, tool, gizmoMode, interactionBlocked });
   gizmoStateRef.current = { mode, tool, gizmoMode, interactionBlocked };
   const configureGizmo = useCallback(() => {
     const state = gizmoStateRef.current;
-    controlsRef.current?.setRoamingEnabled(sceneReadyRef.current && !appDestroyedRef.current
-      && !contextLostRef.current && !exportingRef.current && !state.interactionBlocked && state.mode === "adjust");
-    gizmoRef.current?.configure(state.gizmoMode, sceneReadyRef.current && !appDestroyedRef.current
-      && !contextLostRef.current && !exportingRef.current && !state.interactionBlocked
-      && state.mode === "adjust" && state.tool === "transform");
+    const available = sceneReadyRef.current && !appDestroyedRef.current && !contextLostRef.current
+      && !exportingRef.current && !state.interactionBlocked;
+    if (controlsRef.current) controlsRef.current.enabled = available && !gizmoDraggingRef.current;
+    controlsRef.current?.setRoamingEnabled(available && !gizmoDraggingRef.current && state.mode === "adjust");
+    gizmoRef.current?.configure(state.gizmoMode, available && state.mode === "adjust" && state.tool === "transform");
   }, []);
   useEffect(configureGizmo, [configureGizmo, gizmoMode, interactionBlocked, mode, tool]);
   const editorStateRef = useRef({ crop, mode, tool, deletedMask, selectionMask });
@@ -609,6 +618,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     };
     const controls = new ViewerControls(app.graphicsDevice.canvas, cameraRef.current, onOrthographicViewChange, t("viewer.cameraUnavailable"), persistView, () => { requestPreviewRender(app); });
     controls.enabled = false;
+    controls.setRoamSpeed(roamSpeedRef.current);
     persistViewRef.current = persistView;
     window.addEventListener("pagehide", persistView);
     controls.setRectangleSelectionMode(modeRef.current === "adjust" && editorStateRef.current.tool === "rectangle");
@@ -671,6 +681,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
         if (cancel && currentEditor()) onGizmoDragging(false, true);
       },
       dragging: active => {
+        gizmoDraggingRef.current = active;
         controls.enabled = !active && sceneReadyRef.current && !gizmoStateRef.current.interactionBlocked
           && !exportingRef.current && !contextLostRef.current && !appDestroyedRef.current;
         if (currentEditor()) onGizmoDragging(active);
@@ -957,7 +968,13 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const modelPivot = useCallback(() => robustLocalBoundsRef.current ? modelPivotFromPly(robustLocalBoundsRef.current.center) : null, []);
   const finishGizmo = useCallback((cancel = false) => gizmoRef.current?.finish(cancel), []);
   const stopNavigation = useCallback(() => controlsRef.current?.stopNavigation(), []);
-  useImperativeHandle(ref, () => ({ replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, locateView, stopNavigation, initializeCrop }), [alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, locateView, modelPivot, replay, saveView, selectRectangle, snapshotView, stopNavigation]);
+  const focusCanvas = useCallback(() => {
+    const state = gizmoStateRef.current;
+    if (state.mode !== "adjust" || state.interactionBlocked || gizmoDraggingRef.current
+      || !sceneReadyRef.current || appDestroyedRef.current || contextLostRef.current || exportingRef.current) return false;
+    return controlsRef.current?.focus() ?? false;
+  }, []);
+  useImperativeHandle(ref, () => ({ focusCanvas, replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, locateView, stopNavigation, initializeCrop }), [focusCanvas, alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, locateView, modelPivot, replay, saveView, selectRectangle, snapshotView, stopNavigation]);
 
   return <>
     <PreviewCamera ref={cameraRef} />
@@ -1030,6 +1047,11 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     setOrthographicView(view); setOrthographicProjection(orthographic);
   }, []);
   const [selectionDrag, setSelectionDrag] = useState<null | { pointerId: number; startX: number; startY: number; x: number; y: number; selectionMode: RectangleSelectionMode }>(null);
+  const [selectionBusy, setSelectionBusy] = useState(false);
+  const [roamSpeed, setRoamSpeed] = useState(readRoamSpeed);
+  const editFocusRef = useRef<PreviewEditFocus | null>(null);
+  const gizmoFocusRef = useRef<(() => void) | null>(null);
+  const rectangleFocusRef = useRef<(() => void) | null>(null);
   const [viewport, setViewport] = useState<ViewportStatus>(INITIAL_VIEWPORT);
   const [rendererRevision, setRendererRevision] = useState(0);
   const [loadedMaskKey, setLoadedMaskKey] = useState<string | null>(null);
@@ -1072,12 +1094,24 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   const onAnimationStatus = useCallback((status: AnimationStatus) => setAnimationStatus(status), []);
   const gaussianExporting = !["closed", "completed", "error"].includes(gaussianExportDialog.phase);
   const operationBusy = savingEdits || navigationSaving || pendingNavigation !== null || htmlBusy || htmlConfirm || cropFreezing || gaussianExporting || !["idle", "completed", "error"].includes(videoPhase);
-  const busy = operationBusy || gizmoDragging;
-  const interactionBlocked = operationBusy || viewport.phase !== "ready" || cropFreezeError !== null;
+  const busy = operationBusy || gizmoDragging || selectionBusy;
+  const interactionBlocked = operationBusy || selectionBusy || viewport.phase !== "ready" || cropFreezeError !== null;
+  const focusAllowedRef = useRef(false);
+  focusAllowedRef.current = mode === "adjust" && !interactionBlocked && !gizmoDragging && selectionDrag === null;
+  useEffect(() => {
+    const focus = new PreviewEditFocus(() => sceneApiRef.current?.focusCanvas() ?? false, () => focusAllowedRef.current);
+    editFocusRef.current = focus;
+    return () => { focus.destroy(); if (editFocusRef.current === focus) editFocusRef.current = null; };
+  }, [store.descriptor?.projectId, rendererRevision]);
+  useEffect(() => { editFocusRef.current?.flush(); }, [mode, interactionBlocked, gizmoDragging, selectionDrag, viewport.phase]);
+  const beginFocusReturn = useCallback(() => editFocusRef.current?.begin() ?? (() => {}), []);
+  const returnCanvasFocus = useCallback(() => { beginFocusReturn()(); }, [beginFocusReturn]);
   const onGizmoDragging = useCallback((dragging: boolean, cancelled = false) => {
+    if (dragging) gizmoFocusRef.current = beginFocusReturn();
+    else { gizmoFocusRef.current?.(); gizmoFocusRef.current = null; }
     setGizmoDragging(dragging);
     if (cancelled) void persistenceRef.current?.flush().catch(() => undefined);
-  }, []);
+  }, [beginFocusReturn]);
 
   useEffect(() => {
     const projectId = store.descriptor?.projectId;
@@ -1085,6 +1119,11 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     const persistence = new PreviewEditPersistence(projectId);
     persistenceRef.current = persistence;
     setGaussianExportResult(null);
+    setSelectionBusy(false);
+    setSelectionDrag(null);
+    selectionQueue.current = Promise.resolve();
+    rectangleFocusRef.current = null;
+    gizmoFocusRef.current = null;
     setGaussianExportDialog({ phase: "closed" });
     setPendingNavigation(null);
     setSaveNotice(null);
@@ -1207,9 +1246,10 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   };
   const saveEdits = async (retry = false) => {
     if (busy || exportBusyRef.current || viewport.phase !== "ready") return;
+    const focus = beginFocusReturn();
     exportBusyRef.current = true;
     setSavingEdits(true); setSaveNotice(null);
-    try { await flushEdits(retry); }
+    try { await flushEdits(retry); focus(); }
     catch (error) { useGaussianTransformStore.getState().setSaveState("error", error instanceof Error ? error.message : String(error)); }
     finally { exportBusyRef.current = false; setSavingEdits(false); }
   };
@@ -1369,6 +1409,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     }
   };
   const retry = () => {
+    setSelectionBusy(false);
+    setSelectionDrag(null);
+    selectionQueue.current = Promise.resolve();
     setViewport(INITIAL_VIEWPORT);
     setRendererRevision((value) => value + 1);
   };
@@ -1376,6 +1419,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     void saveEdits(true);
   };
   const runHistory = (direction: "undo" | "redo") => {
+    const focus = beginFocusReturn();
     if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
     const previousTool = useGaussianTransformStore.getState().tool;
     useGaussianTransformStore.getState()[direction]();
@@ -1384,6 +1428,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       setOrthographicView("side");
       requestAnimationFrame(() => sceneApiRef.current?.alignView("side"));
     }
+    focus();
   };
   const requestNavigation = async (target: "preview" | "exit", retry = false) => {
     if (exportBusyRef.current) return;
@@ -1436,6 +1481,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
 
   const switchTool = async (tool: GaussianEditorTool) => {
     if (busy || tool === store.tool) return;
+    const focus = beginFocusReturn();
     sceneApiRef.current?.finishGizmo();
     if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
     useGaussianTransformStore.getState().commitTransaction();
@@ -1452,6 +1498,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         useGaussianTransformStore.getState().commitCropFreeze(crop, deletedMask);
         sceneApiRef.current.deactivateCrop();
         activateTool(tool);
+        focus();
       } catch (error) {
         setCropFreezeError(error instanceof Error ? error.message : String(error));
       } finally {
@@ -1460,18 +1507,22 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       return;
     }
     activateTool(tool);
+    focus();
   };
 
   const alignView = (view: GaussianOrthographicView) => {
     setOrthographicView(view);
     sceneApiRef.current?.alignView(view);
+    returnCanvasFocus();
   };
 
   const changeGizmoMode = (next: GizmoMode) => {
+    const focus = beginFocusReturn();
     sceneApiRef.current?.finishGizmo();
     if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
     useGaussianTransformStore.getState().commitTransaction();
     setGizmoMode(next); saveGizmoMode(next);
+    focus();
   };
   const changeRotation = (axis: 0 | 1 | 2, value: number) => {
     const current = useGaussianTransformStore.getState();
@@ -1484,6 +1535,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
 
   const invertSelection = useCallback(() => {
     if (busy || pendingNavigation || navigationSaving || exportBusyRef.current || viewport.phase !== "ready") return;
+    const focus = beginFocusReturn();
     if (store.tool === "sphere" || store.tool === "box") {
       const current = useGaussianTransformStore.getState();
       const crop = current.editing.crop;
@@ -1491,18 +1543,24 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       current.beginCropTransaction();
       current.setCropLive({ ...crop, inverted: !crop.inverted });
       current.commitCropTransaction();
+      focus();
       return;
     }
     const api = sceneApiRef.current;
     const projectId = store.descriptor?.projectId;
     if (!api || store.tool !== "rectangle") return;
+    const owner = editFocusRef.current;
+    const samePreview = () => editFocusRef.current === owner && useGaussianTransformStore.getState().descriptor?.projectId === projectId;
+    setSelectionBusy(true);
     selectionQueue.current = selectionQueue.current.catch(() => undefined).then(async () => {
-      if (useGaussianTransformStore.getState().descriptor?.projectId !== projectId) return;
+      if (!samePreview()) return;
       const mask = await api.invertSelection();
       const current = useGaussianTransformStore.getState();
-      if (current.descriptor?.projectId === projectId && current.tool === "rectangle") current.setSelectionMask(mask);
-    }).catch((error: unknown) => setViewport((current) => ({ ...current, error: error instanceof Error ? error.message : String(error) })));
-  }, [busy, navigationSaving, pendingNavigation, viewport.phase, store.tool, store.descriptor?.projectId]);
+      if (samePreview() && current.tool === "rectangle") current.setSelectionMask(mask);
+      focus();
+    }).catch((error: unknown) => { if (samePreview()) setViewport((current) => ({ ...current, error: error instanceof Error ? error.message : String(error) })); })
+      .finally(() => { if (samePreview()) setSelectionBusy(false); });
+  }, [beginFocusReturn, busy, navigationSaving, pendingNavigation, viewport.phase, store.tool, store.descriptor?.projectId]);
 
   useEffect(() => {
     const keyDown = (event: KeyboardEvent) => {
@@ -1514,16 +1572,17 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       }
       const editingField = document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement;
       if (store.tool === "rectangle" && !editingField && event.key === "Escape") {
-        event.preventDefault(); useGaussianTransformStore.getState().clearSelection(); return;
+        event.preventDefault(); useGaussianTransformStore.getState().clearSelection(); returnCanvasFocus(); return;
       }
       if (store.tool === "rectangle" && !editingField && (event.key === "Delete" || event.key === "Backspace")) {
-        event.preventDefault(); useGaussianTransformStore.getState().deleteSelection(); return;
+        event.preventDefault(); useGaussianTransformStore.getState().deleteSelection(); returnCanvasFocus(); return;
       }
-      if (!event.ctrlKey && !event.metaKey) return;
+      if (editingField || !event.ctrlKey && !event.metaKey) return;
       const key = event.key.toLowerCase();
       const isUndo = key === "z" && !event.shiftKey;
       const isRedo = (key === "z" && event.shiftKey) || key === "y";
       if (!isUndo && !isRedo) return;
+      const focus = beginFocusReturn();
       event.preventDefault();
       if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
       const previousTool = useGaussianTransformStore.getState().tool;
@@ -1534,15 +1593,17 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         setOrthographicView("side");
         requestAnimationFrame(() => sceneApiRef.current?.alignView("side"));
       }
+      focus();
     };
     window.addEventListener("keydown", keyDown);
     return () => window.removeEventListener("keydown", keyDown);
-  }, [busy, invertSelection, mode, store.descriptor?.projectId, store.tool, viewport.phase]);
+  }, [beginFocusReturn, returnCanvasFocus, busy, invertSelection, mode, store.descriptor?.projectId, store.tool, viewport.phase]);
 
   const rectanglePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (mode !== "adjust" || store.tool !== "rectangle" || event.button !== 0 || busy || viewport.phase !== "ready") return;
     if ((event.target as Element).closest("button,input,aside")) return;
     sceneApiRef.current?.stopNavigation();
+    rectangleFocusRef.current = beginFocusReturn();
     event.preventDefault(); event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     setSelectionDrag({ pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, selectionMode: event.ctrlKey ? "remove" : event.shiftKey ? "add" : "replace" });
@@ -1558,6 +1619,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     event.preventDefault(); event.stopPropagation();
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     setSelectionDrag(null);
+    const focus = rectangleFocusRef.current;
+    rectangleFocusRef.current = null;
+    if (event.type === "pointercancel" || event.type === "lostpointercapture") { focus?.(); return; }
     const canvas = event.currentTarget.querySelector("canvas");
     if (!(canvas instanceof HTMLCanvasElement) || !sceneApiRef.current) return;
     const bounds = canvas.getBoundingClientRect();
@@ -1570,14 +1634,20 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     const padY = clicking ? 4 / Math.max(bounds.height, 1) : 0;
     const rectangle = { minX: Math.max(-1, Math.min(x1, x2) - padX), minY: Math.max(-1, Math.min(y1, y2) - padY), maxX: Math.min(1, Math.max(x1, x2) + padX), maxY: Math.min(1, Math.max(y1, y2) + padY) };
     const projectId = store.descriptor?.projectId;
+    const owner = editFocusRef.current;
+    const samePreview = () => editFocusRef.current === owner && useGaussianTransformStore.getState().descriptor?.projectId === projectId;
+    setSelectionBusy(true);
     selectionQueue.current = selectionQueue.current
       .catch(() => undefined)
       .then(async () => {
+        if (!samePreview()) return;
         const mask = await api.selectRectangle(rectangle, drag.selectionMode);
         const current = useGaussianTransformStore.getState();
-        if (current.descriptor?.projectId === projectId && current.tool === "rectangle") current.setSelectionMask(mask);
+        if (samePreview() && current.tool === "rectangle") current.setSelectionMask(mask);
+        focus?.();
       })
-      .catch((error: unknown) => setViewport((current) => ({ ...current, error: error instanceof Error ? error.message : String(error) })));
+      .catch((error: unknown) => { if (samePreview()) setViewport((current) => ({ ...current, error: error instanceof Error ? error.message : String(error) })); })
+      .finally(() => { if (samePreview()) setSelectionBusy(false); });
   };
 
   if (!store.descriptor) return null;
@@ -1670,7 +1740,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
           {store.tool !== "transform" && <button type="button" title={`${t("viewer.invertSelectionTitle")} · ${invertShortcutLabel}`} aria-keyshortcuts="Control+I Meta+I" aria-pressed={store.tool === "rectangle" ? undefined : Boolean(store.editing.crop?.inverted)} disabled={busy || viewport.phase !== "ready" || (store.tool !== "rectangle" && store.editing.crop === null)} onClick={invertSelection}><InvertSelectionIcon size={14} />{t("viewer.invertSelection")}</button>}
           <button type="button" title={t("viewer.undoTitle")} disabled={store.history.length === 0 || busy} onClick={() => runHistory("undo")}><Undo2 size={14} />{t("viewer.undo")}</button>
           <button type="button" title={t("viewer.redoTitle")} disabled={store.future.length === 0 || busy} onClick={() => runHistory("redo")}><Redo2 size={14} />{t("viewer.redo")}</button>
-          <button type="button" title={t("viewer.resetAllTitle")} disabled={busy || (store.history.length === 0 && store.editing.crop === null && store.editing.deletedCount === 0 && store.transform.scale === 1 && store.transform.position.every((value) => value === 0) && store.transform.rotation.every((value) => value === 0))} onClick={() => { store.resetAll(); setGaussianExportResult(null); }}><RotateCcw size={14} />{t("viewer.resetAll")}</button>
+          <button type="button" title={t("viewer.resetAllTitle")} disabled={busy || (store.history.length === 0 && store.editing.crop === null && store.editing.deletedCount === 0 && store.transform.scale === 1 && store.transform.position.every((value) => value === 0) && store.transform.rotation.every((value) => value === 0))} onClick={() => { store.resetAll(); setGaussianExportResult(null); returnCanvasFocus(); }}><RotateCcw size={14} />{t("viewer.resetAll")}</button>
           <button type="button" disabled={busy || viewport.phase !== "ready"} onClick={() => void saveEdits()}>{savingEdits ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />} {savingEdits ? t("viewer.saving") : t("viewer.saveEdits")}</button>
         </> : <>
           <button type="button" disabled={busy || viewport.phase !== "ready"} onClick={() => sceneApiRef.current?.replay()}><Play size={14} />{t("viewer.replay")}</button>
@@ -1684,7 +1754,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     <div className="preview-editor">
       <div ref={viewportElementRef} inert={operationBusy} className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
         <Application key={`${store.descriptor.projectId}-${rendererRevision}`} autoRender={false} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
-          <SplatScene ref={sceneApiRef} projectId={store.descriptor.projectId} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} readToken={store.descriptor.readToken} referenceView={store.descriptor.referenceView} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} editorMasksReady={!store.descriptor.editMaskAssetUrl || loadedMaskKey === `${store.descriptor.projectId}:${store.descriptor.editMaskAssetUrl}`} gizmoMode={gizmoMode} interactionBlocked={interactionBlocked || selectionDrag !== null} onGizmoDragging={onGizmoDragging} onOrthographicViewChange={onViewDirectionChange} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
+          <SplatScene ref={sceneApiRef} projectId={store.descriptor.projectId} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} readToken={store.descriptor.readToken} referenceView={store.descriptor.referenceView} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} editorMasksReady={!store.descriptor.editMaskAssetUrl || loadedMaskKey === `${store.descriptor.projectId}:${store.descriptor.editMaskAssetUrl}`} gizmoMode={gizmoMode} roamSpeed={roamSpeed} interactionBlocked={interactionBlocked || selectionDrag !== null} onGizmoDragging={onGizmoDragging} onOrthographicViewChange={onViewDirectionChange} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
         </Application>
         {mode === "preview" && <div ref={captureGuideRef} className={`portrait-capture-guide orientation-${orientation}`} style={guideSize} aria-hidden="true">
           <div className="portrait-frame-label"><span>{gaussianVideoDimensions(orientation).width} × {gaussianVideoDimensions(orientation).height}</span><span>30 FPS</span></div>
@@ -1696,8 +1766,8 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         {cropFreezing && <div className="viewport-overlay"><LoaderCircle className="spin" size={22} /><strong>{t("viewer.freezing")}</strong><span>{t("viewer.wait")}</span></div>}
         {cropFreezeError && !cropFreezing && <div className="viewport-overlay error"><strong>{t("viewer.freezeFailed")}</strong><p>{cropFreezeError}</p><div className="viewport-error-actions"><button type="button" onClick={() => setCropFreezeError(null)}>{t("viewer.backToEdit")}</button></div></div>}
         {selectionDrag && <div className={`rectangle-selection-box mode-${selectionDrag.selectionMode}`} style={selectionRectStyle} aria-hidden="true" />}
-        {mode === "adjust" && store.tool === "transform" && <TransformPanel transform={store.transform} onBegin={store.beginTransaction} onChange={store.setTransformLive} onCommit={store.commitTransaction} onRotationChange={changeRotation} gizmoMode={gizmoMode} onGizmoModeChange={changeGizmoMode} disabled={busy || viewport.phase !== "ready"} />}
-        {mode === "adjust" && (store.tool === "sphere" || store.tool === "box") && <SelectionPanel crop={store.editing.crop} kind={store.tool} onBegin={store.beginCropTransaction} onChange={store.setCropLive} onCommit={store.commitCropTransaction} onEnable={() => { const tool = useGaussianTransformStore.getState().tool; if (tool === "sphere" || tool === "box") enableCrop(tool); }} />}
+        {mode === "adjust" && store.tool === "transform" && <TransformPanel transform={store.transform} onBegin={store.beginTransaction} onChange={store.setTransformLive} onCommit={store.commitTransaction} onFocusCanvas={returnCanvasFocus} onRotationChange={changeRotation} gizmoMode={gizmoMode} onGizmoModeChange={changeGizmoMode} disabled={busy || viewport.phase !== "ready"} />}
+        {mode === "adjust" && (store.tool === "sphere" || store.tool === "box") && <SelectionPanel crop={store.editing.crop} kind={store.tool} onBegin={store.beginCropTransaction} onChange={store.setCropLive} onCommit={store.commitCropTransaction} onFocusCanvas={returnCanvasFocus} onEnable={() => { const tool = useGaussianTransformStore.getState().tool; if (tool === "sphere" || tool === "box") enableCrop(tool); }} />}
         {mode === "preview" && <div className="animation-hud">
           <span className={`animation-pulse phase-${animationStatus.phase}`} />
           <b>{t(phaseLabelKeys[animationStatus.phase])}</b>
@@ -1712,6 +1782,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       </div>
     </div>
     <footer className="preview-statusbar">
+      <div className="preview-status-items">
       <span><b>{t("viewer.splats")}</b>{formatNumber(store.descriptor.splatCount)}</span>
       {mode === "adjust" && store.selectedCount > 0 && <span className="selection-count"><b>{t("viewer.selected")}</b>{formatNumber(store.selectedCount)}</span>}
       {mode === "adjust" && store.editing.deletedCount > 0 && <span><b>{t("viewer.deleted")}</b>{formatNumber(store.editing.deletedCount)}</span>}
@@ -1726,6 +1797,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       {mode === "preview" && <span><b>{t("viewer.videoEncoding")}</b>{videoCapability.checking ? t("viewer.checking") : videoCapability.supported ? t("viewer.h264Ready") : t("common.unavailable")}</span>}
       {videoResult && mode === "preview" && <button className="statusbar-file-action" type="button" title={videoResult.path} onClick={() => void revealFile(videoResult.path)}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{videoResult.path.split(/[\\/]/).at(-1)} · {formatBytes(videoResult.fileSize, locale)}</button>}
       {htmlResult && <button className="statusbar-file-action" type="button" title={htmlResult.path} onClick={() => void revealFile(htmlResult.path).catch((error: unknown) => setHtmlError(String(error)))}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{htmlResult.path.split(/[\\/]/).at(-1)} · {formatBytes(htmlResult.fileSize, locale)}</button>}
+      </div>
+      {mode === "adjust" && <RoamSpeedControl value={roamSpeed} disabled={busy || interactionBlocked || selectionDrag !== null || orthographicProjection}
+        onChange={setRoamSpeed} onCommit={saveRoamSpeed} onFocusCanvas={returnCanvasFocus} />}
     </footer>
     {store.saveError && mode === "adjust" && <div className="preview-save-error"><span>{store.saveError}</span><button type="button" onClick={retrySave}>{t("viewer.retrySave")}</button></div>}
     {saveNotice && <div className={`preview-video-message ${saveNotice === "viewFailed" ? "warning" : ""}`} role="status">{t(saveNotice === "viewFailed" ? "viewer.viewSaveFailed" : "viewer.editsSaved")}</div>}

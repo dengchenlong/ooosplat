@@ -255,6 +255,18 @@ pub async fn train(
             .flat_map(|(key, value)| [OsString::from(key), OsString::from(value)]),
         );
     }
+    let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let counts = last_splat_count.clone();
+    let observer: ProcessObserver = std::sync::Arc::new(move |update| {
+        if let crate::process::ProcessUpdate::Line { line, .. } = &update {
+            if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
+                *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
+            }
+        }
+        if let Some(observer) = &observer {
+            observer(update);
+        }
+    });
     let output = manager
         .run_with_environment(
             ProcessSpec {
@@ -262,12 +274,17 @@ pub async fn train(
                 args,
                 working_directory: Some(output_directory.to_path_buf()),
                 log_path: Some(options.log_path),
-                observer,
+                observer: Some(observer),
             },
             &environment,
         )
         .await?;
-    resolve_train_output(&output, candidate, alternate)
+    resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
+        if let SplatError::EngineProcess(failure) = &mut error {
+            failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
+        }
+        error
+    })
 }
 
 fn resolve_train_output(

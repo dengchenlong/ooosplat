@@ -501,8 +501,10 @@ mod tests {
         assert_eq!((info.splat_count, sh), (1, 3));
         let result = std::fs::read(output).unwrap();
         let values: Vec<_> = result[header..]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b) as f64)
             .collect();
         let point = transform.point([1., 2., 3.]);
         for i in 0..3 {

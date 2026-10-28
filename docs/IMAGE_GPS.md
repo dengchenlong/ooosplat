@@ -58,3 +58,9 @@ cargo +1.99.0 test --manifest-path src-tauri/Cargo.toml --offline --lib native_p
 ### 未完成验收 / Not yet accepted
 
 真实带 GPS 的全景图片、跨设备／镜头补拍、视频来源项目加图片 GPS 补拍、漂移数据集的有／无GPS系统对照，以及 macOS／Linux 原生能力和桌面预览人工检查仍待验收。没有这些素材或平台实测，不能声称全景接缝、跨设备效果、地理精度或所有平台已验证；数学单测及合成 ERP 不替代这些检查。
+
+### CI 兼容修复 / CI compatibility fix (2026-10-26)
+
+提交 `6519351` 的 Windows、Ubuntu、macOS Actions 均已通过前端与 Rust 测试，但在 Rust 1.99.1 Clippy 的 `chunks_exact_to_as_chunks` 检查处失败。本地此前的 Clippy 1.97 未检出这条检查；使用本地1.99.0已复现相同错误。
+
+将 Gaussian 初始化回归测试中的 `chunks_exact(4)` 改为 `as_chunks::<4>().0.iter()`，直接读取固定长度数组。只改变测试代码，不改训练／导出行为、不忽略警告、不降低 CI 检查。修复后本地1.99.0全目标 Clippy（`-D warnings`）、格式检查及13项 GPS 单测通过，3项原生手动测试未重跑。本机开发客户端占用引擎DLL，单测仅通过进程级 `TAURI_CONFIG` 临时跳过资源复制；正式打包配置未变。三平台完整远端构建仍需推送后验证。

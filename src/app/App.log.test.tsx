@@ -213,8 +213,8 @@ describe("App live log", () => {
     expect(qualityList).not.toBeNull();
     expect(plannerSwitch?.getAttribute("aria-checked")).toBe("true");
     expect(plannerSwitch?.disabled).toBe(true);
-    expect(plannerSwitch?.textContent).toContain("自动优化（实验性）");
-    expect(plannerSwitch?.textContent).toContain("开启后，将优化重建与训练参数并自动补救，通常可缩短生成时长，提升（尤其是图片素材）细节表现");
+    expect(plannerSwitch?.textContent).toContain("自动重试");
+    expect(plannerSwitch?.textContent).toContain("若任务失败，允许自动依据当前设备性能，降低画质或改用更耗时的方案。");
   });
 
   it("keeps the outer task pane fixed while following fewer than 500 log lines", async () => {

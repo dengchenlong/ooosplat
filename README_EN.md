@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-blue?style=flat" alt="Release: v0.7.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><img src="https://img.shields.io/badge/release-v0.7.1-blue?style=flat" alt="Release: v0.7.1"></a>
   <a href="#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and B
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
-> 0.7.0 adds panorama video and image generation, external model import, multi-format export, horizontal WASD navigation, Auto locate view, and image-order confirmation, with improvements to progress reporting, camera controls, and PNG focal-length reading.
+> 0.7.1 updates generation defaults, automatic retries, and Detailed splat budgets, adds stepped frame sampling and movement-speed controls, and improves reshoots, image GPS assistance, exports, and error diagnostics.
 
 The features below describe the current `main` source tree; consult each release's notes for installer contents.
 
@@ -56,17 +56,20 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **Panorama media**: Supports stitched, monoscopic, full 360°×180°, 2:1 ERP MP4 and image folders. Media types are detected automatically; ambiguous inputs require an inline choice.
 - **Image-order confirmation**: For ordinary or panorama folders with more than 100 images, confirm capture order before generation. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
 - **Image GPS**: Detect embedded location metadata and assist matching and reconstruction on the validated Windows x64 path. Reliable observations provide estimated north orientation and metric scale; otherwise the original workflow is used. [Scope and validation](docs/IMAGE_GPS.md)
-- **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically and can enable incremental high-resolution reshoots for eligible single-camera projects.
-- **Three quality presets**: Fast, Balanced, and Detailed are available. Auto Optimize selects suitable extraction, resolution, and training settings for the source and available VRAM.
+- **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically; eligible projects can be reshot after compatibility checks. External files remain read-only.
+- **Three quality presets**: Reconstruction optimizations and frame backfill are standard. Adjust video sampling in discrete steps, with at most 20% extra frames for manually sampled runs. Detailed preserves source training resolution and budgets ordinary-media splats from effective pixels and reconstruction tracks (coefficient 0.5). Panoramas retain a separate budget.
+- **Automatic retry**: Enabled by default; permits a lower splat ceiling after GPU OOM or a reshoot-plan fallback. Completed details mark retries that actually ran.
 - **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
 - **Multi-task workspace**: Group tasks into New Tasks, Completed, and Unfinished. Keep multiple drafts, reorder them, and automatically run the next task. Only one generation task runs at a time; tasks can be cancelled or resumed.
 - **Reshoots**: Choose reconstruction mode and whether to reuse the original model, with the normal training recipe. Supports mixed-size ordinary inputs and full ERP reshoots in a separate derived project.
-- **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Use WASD for horizontal navigation or Auto locate view to return to the first training view.
-- **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML.
+- **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Static views stop redrawing; interactions run at up to 60 FPS. Use horizontal WASD at 0.1×–5.0× speed or return to the first training view.
+- **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML. Out-of-range SPZ coordinates can be adjusted on the export copy after confirmation.
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
 - **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
 
 Each panorama batch needs at least two same-sized images; a 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas, private originals, and mixed ordinary/panorama reshoots are unsupported. Panorama caches have no fixed 20 GiB cap; reserve enough disk space. The per-image decode limit remains 512 MiB. See the [video](docs/PANORAMA_VIDEO_V1.md), [image](docs/PANORAMA_IMAGES_V1.md), and [reshoot notes](docs/RESHOOT_V2.md) for verification limits.
+
+Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated memory, but actual RAM, disk space, and format constraints still apply. Removing these gates does not guarantee large-model exports will succeed. See [export notes and verification](docs/model-export-verification.md).
 
 ### Gaussian Editing Shortcuts
 
@@ -75,7 +78,7 @@ Each panorama batch needs at least two same-sized images; a 2:1 ratio alone does
 - In rectangle, sphere, or box selection, choose Invert selection or press `Ctrl + I` (`⌘ + I` on macOS) to switch which points are selected or retained.
 - Sphere and box selection enter an orthographic view automatically. Switch between side, front, and top views, then adjust the volume in the viewport or through numeric fields.
 - Use “Scene gizmo” in the Transform panel to switch between Move and Rotate; click the selected button again to turn the gizmo off. Left-drag an axis or ring to edit the model; drag empty space to orbit the camera. Both rings and numeric rotation pivot around the model center. Releasing commits one edit; `Esc` cancels the current gizmo drag. The gizmo mode is saved locally.
-- After clicking the canvas or Auto locate view, use `WASD` to move on the horizontal plane and `Shift` for 3× speed. Speed follows zoom; perspective views only.
+- Use `WASD` to move on the horizontal plane and `Shift` for 3× speed. Completed edits return canvas focus; the bottom-right slider adjusts speed from 0.1× to 5.0× and remembers this device's preference. Speed follows zoom; perspective views only.
 - Use `Ctrl + Z` to undo and `Ctrl + Shift + Z` or `Ctrl + Y` to redo. Transform, crop, and deletion changes share one history; camera movement and temporary highlights are not recorded.
 
 ## Processing Pipeline
@@ -83,12 +86,12 @@ Each panorama batch needs at least two same-sized images; a 2:1 ratio alone does
 ```text
 Input video or image sequence
   │
-  ├─ Video: inspect with FFprobe and extract at the preset target FPS and working resolution; emit RGBA frames and masks for transparent media
+  ├─ Video: inspect with FFprobe and extract at the preset target FPS or manual ratio and working resolution; emit RGBA frames and masks for transparent media
   ├─ Images: scan headers and naturally sort filenames, copy source media, prefer hard links for internal reuse, and create Alpha masks when needed
-  ├─ COLMAP: auto-select CPU/CUDA for features; sequential matching for video, exhaustive by default for images, with an ordered option above 100 images; preset loop detection with Auto Optimize
-  ├─ COLMAP: incremental reconstruction and registration validation; Auto Optimize can attempt bridge-frame recovery
+  ├─ COLMAP: auto-select CPU/CUDA for features; sequential video matching, exhaustive images by default, ordered matching above 100 images, and preset loop detection
+  ├─ COLMAP: incremental reconstruction and registration validation, with bridge-frame recovery; two-view triangulation only for actual transparent images
   ├─ Panoramas: retain full ERP images for spherical reconstruction, then convert registered images to six-face training data
-  ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed adapts its profile to VRAM
+  ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed plans training at source resolution
   └─ Validate the PLY and atomically publish final.ply
 ```
 
@@ -139,10 +142,10 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
-After downloading the `OOOSplat-0.7.0-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
+After downloading the `OOOSplat-0.7.1-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
 
 ```bash
-sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.7.1-x64-linux.deb
 ```
 
 The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
@@ -151,7 +154,7 @@ The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned
 
 Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
 
-1. On Windows, run `OOOSplat-0.7.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.7.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.7.0-x64-linux.deb`.
+1. On Windows, run `OOOSplat-0.7.1-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.7.1-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.7.1-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Select a draft under “Task List → New Tasks,” or choose Add, then select a video or image folder. Wait for detection; choose ordinary or panorama processing in the media box if the type is uncertain.
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -160,7 +163,7 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 7. Follow the selected task's stages, progress, and logs on the left. Click any task on the right to switch details. Generated projects appear under Completed or Unfinished; completed projects offer Preview.
 8. Edit the model in “Preview → Adjust.” Transforms, crops, and deletions are saved automatically in the project; each project's view is stored locally on this device. “Save edits” confirms that the current edits and view have been saved. Choose standard PLY, compressed PLY, SPZ, or SOG directly from “Export,” with no second format confirmation. Both Adjust and Animation support model export.
 9. Switch to Animation, choose Portrait or Landscape, and use Export → Export video for a 30 FPS, 23-second MP4 at 1080×1920 or 1920×1080 respectively. Both Adjust and Animation can export offline HTML. Exports use the current edits, can be cancelled, and provide access to the output folder on completion.
-10. To add detail, choose Reshoot on a completed project. Select the new media and type, optionally adjust quality/Auto Optimize, then answer the model-condition question. Ordinary inputs also ask whether capture settings are the same; there is no separate plan confirmation. Enabling Auto Optimize also allows a slower fallback if needed. New and old views must overlap and show the same scene.
+10. To add detail, choose Reshoot on a completed project. Select the new media and type, optionally adjust quality/Automatic retry, then answer the model-condition question. Ordinary inputs also ask whether capture settings are the same; there is no separate plan confirmation. Enabling Automatic retry allows a slower fallback if needed. New and old views must overlap and show the same scene.
 
 Usage notes:
 
@@ -168,30 +171,34 @@ Usage notes:
 - Use the percentage button in the lower-right corner to reduce, reset, or increase the interface scale.
 - Drafts are saved locally and their media is rechecked after restart. Running-task parameters cannot be changed, but other drafts remain editable. A second task cannot run concurrently.
 - Drag new tasks to reorder them. Auto-run next task is off by default and never skips an unready task. Image-order questions pause startup; cancelling disables the queue.
-- New reshoots default to the source quality/Auto Optimize settings, editable before launch. Ordinary batches can differ in resolution, aspect ratio, device, and lens; full ERP batches can differ in size across batches. Original media cannot be submitted again. Missing trusted image/reconstruction snapshots prevent launch.
+- New reshoots inherit source quality and default Automatic retry to enabled, editable before launch. Ordinary batches can differ in resolution, aspect ratio, device, and lens; full ERP batches can differ in size across batches. Original media cannot be submitted again. Missing trusted image/reconstruction snapshots prevent launch.
 - Reusing the original model initializes from the unedited generated PLY and trains on old and new views with the normal full recipe, without shortened steps or reduced learning rates. Original intrinsics are reused only after confirmation and compatible single-camera dimensions/orientation checks. This is not an optimizer resume or a guarantee that only new regions change; deletion/crop edits are not inherited. Existing tasks keep their saved settings. See the [reshoot validation notes](docs/RESHOOT_V2.md).
 - Task pages keep the latest 500 log entries; complete engine logs remain in the project's `logs/` directory. The training runtime monitor is hidden by default and can be enabled under Settings → Interface.
 - Delete moves the complete project, including source copies and intermediate files, to the Recycle Bin. OOOSplat does not fall back to permanent deletion if that operation fails.
 
 ## Quality Presets
 
-With Auto Optimize enabled, sequential matching for video and confirmed ordered images uses the preset's offline loop-detection rules; disabling it turns loop detection off. Valid loops are not guaranteed. New reshoots match old/new views separately and use window 10 plus the preset's loop policy among new ordered views. Bridge matching is unchanged. See the [parameter configuration guide](docs/pipeline-optimization-config.en.md).
+Sequential video and confirmed ordered-image matching use preset loop detection by default; valid loops are not guaranteed. Reshoots match old/new views separately, with window 10 and the preset loop policy among new ordered views. Backfill is independent of Automatic retry.
 
-“Auto Optimize (Experimental)” is enabled by default. Ordinary video is scaled once during extraction to the selected working resolution while preserving aspect ratio and never upscaling lower-resolution media. Actual sampling never exceeds the source FPS or total frame count. Ordinary image sequences keep every valid image at its original input resolution, while COLMAP and Brush still apply the selected preset's processing limits.
+For new manually sampled runs, initial registration below 80% with a valid initial model can trigger one targeted bridge attempt in unregistered intervals. It adds at most 20% of the actual initial frame count, capped by available source frames: 360 initial frames permit at most 72 extra; 100% sampling adds none. The 30-frame minimum still applies, or every available frame for shorter sources. Default sampling retains the candidate budgets below. Interrupted older runs retain their saved rules. The 1.2× ceiling controls frame counts, not time or success probability. See [bridge rules and validation](docs/MANUAL_BRIDGE_V3.md).
 
-The table below describes ordinary inputs. Panoramas use dedicated recipes: with Auto Optimize off, Fast / Balanced / Detailed cap splats at 1 / 2 / 3 million. With it on, quality and VRAM budgets determine the cap, up to 10 million. Caps guarantee neither final counts nor sufficient memory. See [panorama training parameters and measurements](docs/PANORAMA_IMAGES_V1.md#全景训练配方-v1).
+Previous optimization behavior is now standard. Fast/Balanced retain working-resolution limits; Detailed uses source training resolution without upscaling. Images keep every valid input; video sampling uses discrete steps above the quality presets, including the exact source-FPS-derived default. See [generation defaults](docs/GENERATION_POLICY.md) and the [legacy configuration guide](docs/pipeline-optimization-config.en.md).
 
-| Preset | Initial / bridge-frame target | Video working long edge | COLMAP long edge / maximum features | Brush training |
+The table below describes ordinary inputs. Ordinary Detailed budgets splats from registered training views' effective pixels and mean reconstruction track length, with coefficient 0.5. Fully transparent pixels are excluded; initialization points are never silently removed. See the [Detailed budget formula and scope](docs/FINE_SPLAT_BUDGET.md).
+
+Panoramas use dedicated training recipes and point budgets. Detailed retains native ERP and derives faces at `floor(ERP width / 4)` without upscaling. Point budgets use the original spherical model and are not multiplied by six. Caps guarantee neither achieved counts, quality, nor sufficient memory.
+
+| Preset | Default initial / bridge-candidate target | Video working long edge | COLMAP long edge / maximum features | Brush training |
 | --- | ---: | ---: | ---: | --- |
 | Fast | 6 / 9 FPS | Up to 1,600 | 1,200 / 4,096 | 8,000 iterations, maximum resolution 1,600 |
 | Balanced | 8 / 12 FPS | Up to 1,920 | 1,600 / 8,192 | 15,000 iterations, maximum resolution 1,920 |
-| Detailed | 12 / 15 FPS | Up to 3,200, 3,840, or native resolution according to VRAM | 3,200 / 16,384 | 30,000 iterations, with maximum resolution and Splat limit selected from VRAM |
+| Detailed | 12 / 15 FPS | Source resolution | 3,200 / 16,384 | 30,000 iterations, source training resolution, effective-pixel/track budget (coefficient 0.5) |
 
 Short videos target a minimum of 30 selected frames when the source provides enough frames. Initial and candidate sampling rates can therefore exceed the table's targets, but never exceed the source FPS or frame count.
 
-Detailed starts from one of three VRAM profiles. Below 8 GB, or when VRAM cannot be read, the video and Brush long edges are capped at 3,200. From 8 GB inclusive to below 12 GB, they are capped at 3,840. At 12 GB or more, video stays at its native long edge and Brush uses that native long edge. All three Detailed profiles cap the COLMAP image long edge at 3,200. Bridge-frame recovery is attempted only when the initial video reconstruction has insufficient coverage and unused candidate frames remain. A failed attempt safely returns to the initial reconstruction, and the mechanism does not apply to image sequences. Detailed performs at most one automatic retry with a lower training profile after an explicit out-of-memory failure.
+Detailed training resolution no longer uses VRAM tiers. With Automatic retry enabled, all three presets may retry once after explicit GPU OOM, at 80% of the failed process's last trustworthy splat count, without lowering resolution. Missing counts, no actual reduction, or budgets below initialization fail directly. Backend compatibility fallbacks and frame backfill remain enabled independently.
 
-For ordinary inputs with Auto Optimize disabled, Fast, Balanced, and Detailed return to the legacy 30%, 50%, and 100% source-frame retention strategy. Video uses the legacy maximum long edge of 1,920, Brush resolutions return to 1,200, 1,600, and 2,000, and no additional Splat-count limit is applied.
+Interrupted tasks retain frozen settings. Manually retrying a failed task uses the new policy and archives incompatible work caches, preserving source files, published models and edits.
 
 ## Project and File Locations
 
@@ -245,12 +252,12 @@ What is sent:
 | Field | Description |
 | --- | --- |
 | Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
-| App version, OS, CPU architecture | For example `0.7.0` / `windows` / `x86_64` |
+| App version, OS, CPU architecture | For example `0.7.1` / `windows` / `x86_64` |
 | Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`, `planner_evaluation`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
 | Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
 | Stage and total durations | Milliseconds |
 | Frame count and video duration in basic generation events | Bucketed values; Planner evaluation also includes actual media and reconstruction counts |
-| Auto Optimize effectiveness metrics | Anonymous media dimensions and counts, plan, registered images and 3D points, bridge recovery, Brush configuration, Splat count, PLY size, and stage timings. Generation, resume, and reshoot all record them, including runs with Auto Optimize off |
+| Auto Optimize effectiveness metrics | Anonymous media dimensions and counts, plan, registered images and 3D points, bridge recovery, Brush configuration, Splat count, PLY size, and stage timings. Generation, resume, and reshoot all record them, preserving existing field semantics rather than substituting retry consent for planner status |
 | Planner GPU information | Vendor enumeration and detected total VRAM, without full adapter names or device serials. Unavailable values remain empty or unknown |
 | Failing stage and error code | Enumerated values such as `colmap_mapper_failed`; no raw error text |
 
@@ -377,7 +384,7 @@ npm run package:windows
 The NSIS installer is written to:
 
 ```text
-dist-artifacts\OOOSplat-0.7.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.7.1-x64-windows.exe
 ```
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.
@@ -426,26 +433,28 @@ On Windows and Ubuntu, OOOSplat enables COLMAP GPU acceleration when the pinned 
 
 COLMAP and Brush are separate stages. COLMAP requires a compatible NVIDIA CUDA environment for GPU acceleration. Brush uses Vulkan on Windows and Linux and Metal on Apple Silicon macOS. Common configurations are handled as follows; rows without an explicit platform refer to Windows:
 
-| Platform and GPU configuration | COLMAP | Brush training | Detailed Auto Optimize VRAM profile |
-|---|---|---|---|
-| Windows: one NVIDIA discrete GPU | Uses CUDA when the driver and Compute Capability requirements are met | Explicitly selects the first discrete GPU and runs through Vulkan | Uses that NVIDIA GPU's total VRAM to select Low, Standard, or Large |
-| Intel integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU instead of the Intel integrated GPU | Uses NVIDIA total VRAM |
-| AMD integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU and bypasses the AMD Switchable Graphics implicit layer for the Brush child process only | Uses NVIDIA total VRAM |
-| AMD only, or Intel integrated GPU + AMD discrete GPU | Falls back to CPU | Vulkan automatically selects an AMD GPU; the AMD graphics layer is not disabled | Currently uses the conservative Low profile |
-| Intel integrated or discrete GPU only | Falls back to CPU | Vulkan automatically selects an Intel GPU | Currently uses the conservative Low profile |
-| Multiple NVIDIA GPUs | Selects the compatible GPU with the highest Compute Capability, then the lower NVIDIA index on a tie | Does not force a Brush device index because Vulkan and CUDA indices cannot be mapped reliably; Vulkan selects automatically | Uses the total VRAM of the GPU selected for COLMAP |
-| AMD discrete GPU + NVIDIA discrete GPU | Uses a compatible NVIDIA GPU for COLMAP | Currently enters the single-NVIDIA preference path, but cross-vendor Vulkan ordering cannot be guaranteed; also set `brush_app.exe` to High performance in Windows Graphics settings and verify the actual adapter in the task log | Uses NVIDIA total VRAM |
-| Old NVIDIA driver, unsupported NVIDIA model, or failed detection | Falls back to CPU | Brush still attempts to select an available GPU through Vulkan but does not force NVIDIA | Currently uses the conservative Low profile |
-| No usable GPU graphics backend | Uses CPU for COLMAP | Brush may not start; CPU-only software graphics has not been validated end to end | Not applicable |
-| macOS: Apple Silicon M series, including Pro, Max, and Ultra | Currently uses the CPU; CUDA is not enabled | Automatically uses the M-series Metal GPU and unified memory | Currently stays on the conservative Low profile instead of scaling from unified-memory capacity |
-| Ubuntu Alpha: compatible NVIDIA GPU | Uses CUDA when the runtime, driver, and Compute Capability checks pass, otherwise CPU | Vulkan selects automatically without Windows-specific adapter overrides | Uses compatible NVIDIA total VRAM to select Low, Standard, or Large |
-| Ubuntu Alpha: AMD, Intel, or no detectable compatible NVIDIA GPU | Uses CPU | Vulkan selects an available GPU automatically | Uses the conservative Low profile |
+| Platform and GPU configuration | COLMAP | Brush training |
+|---|---|---|
+| Windows: one NVIDIA discrete GPU | Uses CUDA when the driver and Compute Capability requirements are met | Explicitly selects the first discrete GPU and runs through Vulkan |
+| Intel integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU instead of the Intel integrated GPU |
+| AMD integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU and bypasses the AMD Switchable Graphics implicit layer for the Brush child process only |
+| AMD only, or Intel integrated GPU + AMD discrete GPU | Falls back to CPU | Vulkan automatically selects an AMD GPU; the AMD graphics layer is not disabled |
+| Intel integrated or discrete GPU only | Falls back to CPU | Vulkan automatically selects an Intel GPU |
+| Multiple NVIDIA GPUs | Selects the compatible GPU with the highest Compute Capability, then the lower NVIDIA index on a tie | Does not force a Brush device index because Vulkan and CUDA indices cannot be mapped reliably; Vulkan selects automatically |
+| AMD discrete GPU + NVIDIA discrete GPU | Uses a compatible NVIDIA GPU for COLMAP | Currently enters the single-NVIDIA preference path, but cross-vendor Vulkan ordering cannot be guaranteed; also set `brush_app.exe` to High performance in Windows Graphics settings and verify the actual adapter in the task log |
+| Old NVIDIA driver, unsupported NVIDIA model, or failed detection | Falls back to CPU | Brush still attempts to select an available GPU through Vulkan but does not force NVIDIA |
+| No usable GPU graphics backend | Uses CPU for COLMAP | Brush may not start; CPU-only software graphics has not been validated end to end |
+| macOS: Apple Silicon M series, including Pro, Max, and Ultra | Currently uses the CPU; CUDA is not enabled | Automatically uses the M-series Metal GPU and unified memory |
+| Ubuntu Alpha: compatible NVIDIA GPU | Uses CUDA when the runtime, driver, and Compute Capability checks pass, otherwise CPU | Vulkan selects automatically without Windows-specific adapter overrides |
+| Ubuntu Alpha: AMD, Intel, or no detectable compatible NVIDIA GPU | Uses CPU | Vulkan selects an available GPU automatically |
+
+Under the new policy, Detailed uses source training resolution rather than VRAM-based Low, Standard, or Large tiers. Ordinary and panorama budgets follow their respective rules in Quality Presets above. Being able to start training does not guarantee sufficient resources for every resolution or point count.
 
 Forced adapter selection and the AMD implicit-layer workaround are passed only to the individual `brush_app.exe` child process. OOOSplat does not modify the system environment, driver configuration, or other applications, and it does not switch Brush to D3D12. AMD-only systems do not receive the AMD implicit-layer workaround.
 
-If the Brush log reports `Device Lost`, OOOSplat distinguishes it from an out-of-memory failure and shows guidance, but it does not automatically lower quality and retry. Connect the computer to power, close other GPU-heavy applications, and set `brush_app.exe` to High performance under Windows Settings → System → Display → Graphics. Detailed quality lowers its profile and retries at most once only after an explicit out-of-memory failure.
+If the Brush log reports `Device Lost`, OOOSplat distinguishes it from GPU OOM and does not apply an OOM retry. Connect the computer to power, close other GPU-heavy applications, and set `brush_app.exe` to High performance under Windows Settings → System → Display → Graphics. A single lower-point-cap retry requires explicit GPU OOM, Automatic retry enabled, and trustworthy counts, as described above.
 
-M-series CPUs and GPUs share unified memory, but the current Planner does not treat unified memory as dedicated VRAM. Consequently, even an M-series Pro, Max, or Ultra with substantial memory currently uses the Detailed Low profile. This is a conservative compatibility policy; it does not mean Metal training can access only a small portion of unified memory.
+M-series CPUs and GPUs share unified memory; the new policy does not downgrade Detailed to Low for that reason. Native-resolution training may still exceed available resources. Consult the validation records for macOS and Linux end-to-end hardware coverage of the new policy.
 
 ### Why does OOOSplat warn about a low registration rate?
 
@@ -459,7 +468,7 @@ Each project keeps source copies, input images, COLMAP data, and Brush intermedi
 
 Yes. Select “Preview” on a completed project in the task list to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, inversion, undo, and redo. Edits are saved automatically in the project; “Save edits” confirms that the current edits and view have been saved without creating a model file. Choosing a model format directly from “Export” creates or safely replaces the edited model, while the original `final.ply` remains unchanged. Reopening restores the edits and the view saved on this device; yellow selections and undo history do not persist between sessions. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, watermarked portrait/landscape MP4 export, and offline HTML export. External standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT files can be imported from “Completed → Import”; LCC/LCC2, Streamed SOG, 2DGS, and ordinary point-cloud PLY files are not supported.
 
-`WASD` moves on the horizontal plane at 15% of the current visible height per second; `Shift` gives 3× speed. Auto locate view returns from any view to the first training camera, using the earliest registered panorama's front face for panorama projects. It is disabled without a reliable training camera. Opening a preview still restores the saved view first. See the [navigation notes](docs/PREVIEW_NAVIGATION.md).
+`WASD` moves on the horizontal plane, by default at 15% of the current visible height per second. The bottom-right slider applies a 0.1×–5.0× multiplier; `Shift` gives a further 3× speed. Auto locate view returns from any view to the first training camera, using the earliest registered panorama's front face for panorama projects. It is disabled without a reliable training camera. Opening a preview still restores the saved view first. See the [navigation notes](docs/PREVIEW_NAVIGATION.md).
 
 ### Can I preview very large PLY files?
 

@@ -8,6 +8,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use crate::planner::plan_bridge_backfill;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -43,7 +45,7 @@ use crate::{
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
-        bridge_trigger_ratio, plan_bridge_backfill, read_registered_source_indices,
+        bridge_trigger_ratio, plan_bridge_backfill_cancellable, read_registered_source_indices,
         write_bridge_pair_list, BridgeBackfillStatus,
     },
     presets::{
@@ -136,6 +138,8 @@ pub enum ReshootInputType {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootInputInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -486,6 +490,8 @@ struct ActiveProjectContext {
 
 #[derive(Debug, Clone)]
 pub enum RunnerUpdate {
+    /// Telemetry-only boundary: a new attempt must not borrow the previous GPU.
+    BrushPreparation,
     Configuration(serde_json::Value),
     Project(Box<crate::project::ProjectMetadata>),
     LogOpened {
@@ -499,6 +505,8 @@ pub enum RunnerUpdate {
 }
 
 pub struct PipelineRunner {
+    failed_retry_policy: Option<super::generation_policy::GenerationPolicy>,
+    generation_policy: std::sync::RwLock<Option<super::generation_policy::GenerationPolicy>>,
     reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
     image_matching_strategy: crate::project::ImageMatchingStrategy,
     video_projection: crate::video::panorama::VideoProjection,
@@ -540,7 +548,7 @@ fn image_matching_policy(
 
 impl PipelineRunner {
     pub fn new(engines: EnginePaths, emit: impl Fn(PipelineEvent) + Send + Sync + 'static) -> Self {
-        Self::new_with_planner(engines, true, emit)
+        Self::new_with_planner(engines, true, emit).with_generation_policy(Some(Default::default()))
     }
 
     pub fn new_with_planner(
@@ -550,6 +558,8 @@ impl PipelineRunner {
     ) -> Self {
         Self {
             reshoot_options: None,
+            failed_retry_policy: None,
+            generation_policy: std::sync::RwLock::new(None),
             video_projection: crate::video::panorama::VideoProjection::Auto,
             image_matching_strategy: crate::project::ImageMatchingStrategy::default(),
             engines,
@@ -575,6 +585,47 @@ impl PipelineRunner {
             planner_enabled,
             effectiveness: None,
         }
+    }
+
+    pub fn with_generation_policy(
+        mut self,
+        policy: Option<super::generation_policy::GenerationPolicy>,
+    ) -> Self {
+        self.planner_enabled = policy.is_some() || self.planner_enabled;
+        *self
+            .generation_policy
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner()) = policy;
+        self
+    }
+
+    fn policy(&self) -> Option<super::generation_policy::GenerationPolicy> {
+        *self
+            .generation_policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn with_failed_retry_policy(
+        mut self,
+        policy: Option<super::generation_policy::GenerationPolicy>,
+    ) -> Self {
+        self.failed_retry_policy = policy;
+        self
+    }
+
+    fn resolution_plan(
+        &self,
+        quality: Quality,
+        memory: Option<u64>,
+        width: u32,
+        height: u32,
+        video: bool,
+    ) -> crate::presets::PlannerResolutionPlan {
+        self.policy().map_or_else(
+            || resolve_planner_resolution_plan(quality, memory, width, height, video),
+            |p| p.resolution(quality, memory, width, height, video),
+        )
     }
 
     pub fn with_input_boundary(mut self, path: Option<PathBuf>) -> Self {
@@ -678,8 +729,12 @@ impl PipelineRunner {
                 .unwrap_or(selected_count)
         };
         let has_candidates = is_planned_video && !is_reshoot;
+        let source_candidates = plan
+            .and_then(|plan| plan.bridge_source_frames)
+            .or_else(|| frames.and_then(|frames| frames.bridge_source_frames));
         let candidate_count = if has_candidates {
-            plan.map(|plan| plan.candidate_frames.len() as u64)
+            source_candidates
+                .or_else(|| plan.map(FramePlan::candidate_count))
                 .or_else(|| frames.map(|frames| frames.candidate_frames.len() as u64))
                 .filter(|count| *count > 0)
                 .unwrap_or(initial_selected_count)
@@ -698,7 +753,9 @@ impl PipelineRunner {
             source_height,
             source_item_count,
             configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
-            configured_candidate_fps: has_candidates.then_some(preset.rescue_max_fps).flatten(),
+            configured_candidate_fps: (has_candidates && source_candidates.is_none())
+                .then_some(preset.rescue_max_fps)
+                .flatten(),
             effective_target_fps: effective_fps(initial_selected_count),
             effective_candidate_fps: (!is_reshoot)
                 .then(|| effective_fps(candidate_count))
@@ -722,6 +779,58 @@ impl PipelineRunner {
             minimum_frame_target_unreachable: is_planned_video
                 && source_item_count < crate::video::minimum_selected_frames(),
         });
+    }
+
+    pub(super) fn record_input_plan(
+        &self,
+        quality: Quality,
+        video: &VideoInfo,
+        plan: &FramePlan,
+        is_reshoot: bool,
+    ) {
+        let mut state = PipelineStateFile::created(quality);
+        state.planner_enabled = self.planner_enabled;
+        state.video = Some(video.clone());
+        state.frames = Some(FrameState::from(plan));
+        if is_reshoot {
+            state.reshoot = Some(Default::default());
+        }
+        self.record_frame_metrics(&state, plan.estimated_frames, Some(plan));
+    }
+
+    /// Restore known source facts before a resumed run performs fallible cache checks.
+    /// A reshoot's frame checkpoint contains old + new images, not its source count.
+    fn restore_source_metrics(&self, state: &PipelineStateFile) {
+        let selected = if let Some(reshoot) = &state.reshoot {
+            reshoot
+                .supplemental_frames_complete
+                .then_some(reshoot.reshoot_frame_count)
+        } else {
+            state
+                .frames
+                .as_ref()
+                .map(|frames| frames.extracted_frames.unwrap_or(frames.estimated_frames))
+        };
+        if let Some(selected) = selected.filter(|count| *count > 0) {
+            self.record_frame_metrics(state, selected, None);
+        } else if let Some(images) = &state.image_sequence {
+            if let Some(tracker) = &self.effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    images.width,
+                    images.height,
+                    images.image_count,
+                ));
+            }
+        } else if let Some(video) = &state.video {
+            let plan = if let Some(policy) = state.generation_policy {
+                policy.frame_plan(video, state.preset)
+            } else if state.planner_enabled {
+                QualityV2FrameSelection.create_plan(video, &state.preset.preset())
+            } else {
+                UniformRatioFrameSelection.create_plan(video, &state.preset.preset())
+            };
+            self.record_frame_metrics(state, plan.estimated_frames, Some(&plan));
+        }
     }
 
     pub(crate) fn record_reconstruction_metrics(
@@ -766,6 +875,19 @@ impl PipelineRunner {
     pub(crate) fn record_brush_metrics(&self, state: &PipelineStateFile) {
         if let Some(tracker) = &self.effectiveness {
             tracker.restore_brush(
+                state.brush_training.initial_resolved,
+                state.brush_training.resolved,
+                state.brush_training.oom_retry_used,
+            );
+        }
+    }
+
+    pub(super) fn prepare_brush_observation(&self, state: &PipelineStateFile) {
+        if let Some(observer) = &self.lifecycle {
+            observer(RunnerUpdate::BrushPreparation);
+        }
+        if let Some(tracker) = &self.effectiveness {
+            tracker.prepare_brush(
                 state.brush_training.initial_resolved,
                 state.brush_training.resolved,
                 state.brush_training.oom_retry_used,
@@ -894,7 +1016,7 @@ impl PipelineRunner {
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
-        let video = match probed_video {
+        let mut video = match probed_video {
             Some(video) => video,
             None => {
                 probe_video(
@@ -922,11 +1044,14 @@ impl PipelineRunner {
 
         self.events
             .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
-        let mut plan = if planner_enabled {
+        let mut plan = if let Some(policy) = self.policy() {
+            policy.frame_plan(&video, quality)
+        } else if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
+        self.record_input_plan(quality, &video, &plan, self.reshoot_options.is_some());
         // A 2:1 target is set only by the persisted panorama branch. Keep real
         // decoder PTS and indices, including a separate rescue candidate pool.
         if panorama {
@@ -952,6 +1077,9 @@ impl PipelineRunner {
             )
             .await?;
             self.events.panorama_phase.store(1, Ordering::Relaxed);
+            if let Some(total) = plan.bridge_source_frames {
+                video.total_frames = total;
+            }
             self.events
                 .stage(PipelineStage::ExtractingFrames, 0.0, "正在提取全景画面");
             tokio::fs::write(
@@ -970,8 +1098,8 @@ impl PipelineRunner {
                 "预计提取 {} 帧（目标 {:.2} FPS，候选池 {} 帧 / 最高约 {:.2} FPS）",
                 plan.estimated_frames,
                 plan.sampling_fps,
-                plan.candidate_frames.len(),
-                plan.candidate_frames.len() as f64 / video.duration.max(f64::EPSILON)
+                plan.candidate_count(),
+                plan.candidate_count() as f64 / video.duration.max(f64::EPSILON)
             ),
         );
 
@@ -1076,6 +1204,13 @@ impl PipelineRunner {
         .await
         .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let image_sequence = scan.info.clone();
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                image_sequence.width,
+                image_sequence.height,
+                image_sequence.image_count,
+            ));
+        }
         self.events.stage(
             PipelineStage::ProbingVideo,
             1.0,
@@ -1202,8 +1337,16 @@ impl PipelineRunner {
         );
         let cancellation = self.process_manager.child_token();
         let events = self.events.clone();
+        let effectiveness = self.effectiveness.clone();
         crate::presets::spawn_pipeline_blocking(move || {
             let scan = crate::video::image_projection::analyze(&source)?;
+            if let Some(tracker) = &effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    scan.info.width,
+                    scan.info.height,
+                    scan.info.image_count,
+                ));
+            }
             let plan = crate::video::create_image_plan(&scan.info, &quality.preset());
             events.stage(
                 PipelineStage::PlanningFrames,
@@ -1336,6 +1479,7 @@ impl PipelineRunner {
             state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
         }
         state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+        state.generation_policy = self.policy();
         state.planner_enabled = self.planner_enabled;
         state.resolution_policy_version = self
             .planner_enabled
@@ -1576,6 +1720,7 @@ impl PipelineRunner {
             };
         let compatible = u64::from(width) == source.width && u64::from(height) == source.height;
         Ok(ReshootInputInfo {
+            video: None,
             source_identity: None,
             projection_detection: None,
             image_sequence: None,
@@ -1756,7 +1901,13 @@ impl PipelineRunner {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| project.clone()),
         );
-        let state = project_manager.read_state(&paths.state).await?;
+        let mut state = project_manager.read_state(&paths.state).await?;
+        if let Some(policy) = self.failed_retry_policy {
+            self.prepare_failed_retry(&project_manager, &paths, &mut state, policy)
+                .await?;
+        }
+        self.archive_retry_cache(&project_manager, &paths, &mut state)
+            .await?;
         if state.preset != metadata.quality {
             return Err(SplatError::Process(
                 "项目档位与检查点不一致，无法安全继续".into(),
@@ -1764,6 +1915,217 @@ impl PipelineRunner {
         }
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
+    }
+
+    async fn actual_transparency(
+        &self,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        candidate: bool,
+    ) -> Result<bool> {
+        if let Some(value) = state.actual_transparency {
+            return Ok(value);
+        }
+        if !candidate {
+            state.actual_transparency = Some(false);
+            return Ok(false);
+        }
+        let frames = paths.frames.clone();
+        let cancel = self.process_manager.child_token();
+        let value = crate::presets::spawn_pipeline_blocking(move || -> Result<bool> {
+            for file in crate::video::list_images(&frames)? {
+                if cancel.is_cancelled() {
+                    return Err(SplatError::Cancelled);
+                }
+                let mut reader = image::ImageReader::open(&file)?.with_guessed_format()?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(crate::video::panorama::MAX_DECODE_BYTES);
+                reader.limits(limits);
+                let decoder = reader
+                    .into_decoder()
+                    .map_err(|e| SplatError::Process(e.to_string()))?;
+                use image::ImageDecoder;
+                if decoder.color_type().has_alpha() {
+                    let image = image::DynamicImage::from_decoder(decoder)
+                        .map_err(|e| SplatError::Process(e.to_string()))?;
+                    if crate::video::image_sequence::has_native_transparency(&image) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
+        state.actual_transparency = Some(value);
+        Ok(value)
+    }
+
+    async fn prepare_failed_retry(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        policy: super::generation_policy::GenerationPolicy,
+    ) -> Result<()> {
+        // Finish any interrupted archive before deciding compatibility again.
+        self.archive_retry_cache(manager, paths, state).await?;
+        let legacy = state.generation_policy.is_none();
+        let current_config = crate::presets::pipeline_optimization_config();
+        let current_quality = &current_config
+            .qualities
+            .get(state.preset)
+            .automatic_optimization_on;
+        let schedule_changed = state.configuration.as_ref().is_some_and(|old| {
+            let old = &old.qualities.get(state.preset).automatic_optimization_on;
+            old.initial_fps != current_quality.initial_fps
+                || old.rescue_max_fps != current_quality.rescue_max_fps
+        });
+        let new_resolution = state.video.as_ref().map(|v| {
+            let (w, h) = oriented_video_dimensions(v);
+            policy.resolution(state.preset, None, w, h, true)
+        });
+        let panorama_pixels_changed = legacy
+            && state.preset == Quality::High
+            && state.panorama.as_ref().is_some_and(|p| {
+                let width = state
+                    .video
+                    .as_ref()
+                    .map(|v| v.width)
+                    .or_else(|| state.image_sequence.as_ref().map(|i| i.width));
+                width.is_none_or(|w| p.sfm_width != w || p.face_size != w / 4)
+            });
+        let video_pixels_changed = if state.panorama.is_some() {
+            panorama_pixels_changed
+        } else {
+            match (state.resolution_plan, new_resolution) {
+                (Some(old), Some(new)) => {
+                    (old.working_width, old.working_height)
+                        != (new.working_width, new.working_height)
+                }
+                _ => legacy,
+            }
+        };
+        let reshoot_plan_changed = state
+            .reshoot
+            .as_ref()
+            .and_then(|r| r.recipe.as_ref())
+            .is_some_and(|r| r.actual != r.initial);
+        let manual_bridge_changed = policy.frame_sampling_ratio.is_some()
+            && state
+                .generation_policy
+                .is_some_and(|old| (old.version >= 3) != (policy.version >= 3));
+        let frames_changed = (state.input_type == ProjectInputType::Video
+            && (!state.planner_enabled
+                || state.generation_policy.and_then(|p| p.frame_sampling_ratio)
+                    != policy.frame_sampling_ratio
+                || schedule_changed
+                || manual_bridge_changed
+                || video_pixels_changed))
+            || (legacy && state.reshoot.is_some())
+            || reshoot_plan_changed
+            || panorama_pixels_changed;
+        let features_changed = frames_changed
+            || (legacy && !state.planner_enabled)
+            || state.configuration.as_ref().is_some_and(|old| {
+                old.qualities
+                    .get(state.preset)
+                    .automatic_optimization_on
+                    .sfm_max_features
+                    != current_quality.sfm_max_features
+            })
+            || matches!((state.resolution_plan,new_resolution),(Some(old),Some(new)) if old.sfm_max_image_size!=new.sfm_max_image_size);
+        let triangulation_changed = legacy
+            && state.frames.as_ref().is_some_and(|f| f.has_alpha)
+            && (state.input_type == ProjectInputType::Video
+                || !state.preset.preset().sfm_allow_two_view_tracks);
+        state.retry_cache_pending.push("brush".into());
+        if features_changed {
+            state.retry_cache_pending.push("colmap".into());
+            state.features_complete = false;
+            state.matching_complete = false;
+        }
+        if frames_changed {
+            state.actual_transparency = None;
+            state.retry_cache_pending.extend(
+                ["frames", "colmap_frames", "masks", "panorama-training"].map(str::to_owned),
+            );
+            state.frames = None;
+            state.panorama = None;
+            state.bridge_backfill = Default::default();
+            if let Some(checkpoint) = &mut state.reshoot {
+                let recipe = checkpoint.recipe.take();
+                *checkpoint = Default::default();
+                checkpoint.recipe = recipe;
+            }
+        }
+        if features_changed || triangulation_changed {
+            state.reconstruction_complete = false;
+            if state.gps.is_some() {
+                state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
+            }
+        }
+        state.brush_complete = false;
+        state.brush_training = Default::default();
+        state.resolution_plan = None;
+        state.resolution_policy_version = Some(PLANNER_RESOLUTION_POLICY_VERSION);
+        state.generation_policy = Some(policy.validate()?);
+        state.configuration = Some((*current_config).clone());
+        state.planner_enabled = true;
+        if let Some(recipe) = state.reshoot.as_mut().and_then(|r| r.recipe.as_mut()) {
+            recipe.options.allow_fallback = policy.auto_retry_enabled;
+            recipe.normal_parameters_version = Some(1);
+            recipe.warm_parameters = None;
+            recipe.actual = recipe.initial;
+            recipe.reconstruction_fallbacks = 0;
+            recipe.training_fallbacks = 0;
+            if frames_changed {
+                recipe.source_names.clear();
+                recipe.new_names.clear();
+                recipe.panorama_frames.clear();
+                recipe.camera_assignment = None;
+            }
+        }
+        // A durable reuse barrier precedes all renames, including failed renames.
+        manager.write_state(&paths.state, state).await?;
+        self.archive_retry_cache(manager, paths, state).await
+    }
+
+    async fn archive_retry_cache(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+    ) -> Result<()> {
+        if state.retry_cache_pending.is_empty() {
+            return Ok(());
+        }
+        let archive = paths
+            .work
+            .join("cache-archive")
+            .join(format!("generation-policy-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&archive).await?;
+        while let Some(name) = state.retry_cache_pending.last().cloned() {
+            if ![
+                "brush",
+                "colmap",
+                "frames",
+                "colmap_frames",
+                "masks",
+                "panorama-training",
+            ]
+            .contains(&name.as_str())
+            {
+                return Err(SplatError::Process("Invalid retry cache entry".into()));
+            }
+            let source = paths.work.join(&name);
+            if source.exists() {
+                tokio::fs::rename(source, archive.join(&name)).await?;
+            }
+            state.retry_cache_pending.pop();
+            manager.write_state(&paths.state, state).await?;
+        }
+        Ok(())
     }
 
     async fn execute_project(
@@ -1774,12 +2136,24 @@ impl PipelineRunner {
         state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
+        self.restore_source_metrics(&state);
+        if state.brush_complete {
+            self.record_brush_metrics(&state);
+        }
+        if let Some(policy) = state.generation_policy {
+            policy.validate()?;
+        }
         if let Some(observer) = &self.lifecycle {
             observer(RunnerUpdate::Project(Box::new(metadata.clone())));
             observer(RunnerUpdate::Configuration(
                 crate::tasks::checkpoint_snapshot(&state),
             ));
         }
+        // A resumed legacy snapshot must not inherit the new runner defaults.
+        *self
+            .generation_policy
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = state.generation_policy;
         let lifecycle = self.lifecycle.clone();
         let project_manager = project_manager.with_checkpoint_observer(Arc::new(move |state| {
             if let Some(observer) = &lifecycle {
@@ -2410,14 +2784,14 @@ impl PipelineRunner {
                     report.points_3d,
                 )
             });
-            if !state.brush_training.oom_retry_used {
+            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
                 state
                     .brush_training
                     .initial_resolved
                     .get_or_insert(resolved_brush);
             }
             state.brush_training.resolved = Some(resolved_brush);
-            self.record_brush_metrics(&state);
+            self.prepare_brush_observation(&state);
             project_manager.write_state(&paths.state, &state).await?;
             self.events.send(
                 PipelineStage::TrainingSplats,
@@ -2596,13 +2970,15 @@ impl PipelineRunner {
             if crate::video::panorama::resolve(state.video_projection, &detection)? {
                 let input = metadata.source_path.clone();
                 let info = video.clone();
+                let native = state.generation_policy.is_some();
                 let cancellation = self.process_manager.child_token();
                 let config = crate::presets::spawn_pipeline_blocking(move || {
-                    crate::video::panorama::PanoramaCheckpoint::new_cancellable(
+                    crate::video::panorama::PanoramaCheckpoint::new_for_policy(
                         &input,
                         quality,
                         &info,
                         &cancellation,
+                        native,
                     )
                 })
                 .await
@@ -2643,6 +3019,7 @@ impl PipelineRunner {
             let source = metadata.source_path.clone();
             let cancellation = self.process_manager.child_token();
             let requested = state.video_projection;
+            let native = state.generation_policy.is_some();
             let config = crate::presets::spawn_pipeline_blocking(move || {
                 let scan = crate::video::image_projection::analyze(&source)?;
                 if requested == crate::video::panorama::VideoProjection::Auto && !scan.detection.confirmed_erp {
@@ -2651,7 +3028,7 @@ impl PipelineRunner {
                     }
                     return Ok(None);
                 }
-                crate::video::image_projection::checkpoint(&source, quality, &cancellation).map(Some)
+                crate::video::image_projection::checkpoint_for_policy(&source, quality, &cancellation, native).map(Some)
             }).await.map_err(|e| SplatError::Process(e.to_string()))??;
             if let Some(config) = config {
                 if state.panorama.as_ref() != Some(&config) {
@@ -2722,7 +3099,7 @@ impl PipelineRunner {
             )
             .await?;
             let (source_width, source_height) = oriented_video_dimensions(&video);
-            let resolution = resolve_planner_resolution_plan(
+            let resolution = self.resolution_plan(
                 quality,
                 acceleration.usable_gpu_total_memory_mb(),
                 source_width,
@@ -2808,7 +3185,7 @@ impl PipelineRunner {
                     && uses_current_resolution_policy
                     && state.resolution_plan.is_none()
                 {
-                    state.resolution_plan = Some(resolve_planner_resolution_plan(
+                    state.resolution_plan = Some(self.resolution_plan(
                         quality,
                         acceleration.usable_gpu_total_memory_mb(),
                         prepared.working_width,
@@ -2845,21 +3222,26 @@ impl PipelineRunner {
         let sparse = paths.colmap.join("sparse");
         let colmap_log = paths.logs.join("colmap.log");
         let preset = quality.preset();
-        let sfm_max_image_size =
-            state
-                .panorama
-                .as_ref()
-                .map(|p| p.sfm_width)
-                .unwrap_or_else(|| {
-                    state
-                        .resolution_plan
-                        .map(|plan| plan.sfm_max_image_size)
-                        .unwrap_or(if state.planner_enabled {
-                            preset.planned_sfm_max_image_size
-                        } else {
-                            preset.sfm_max_image_size
-                        })
-                });
+        let sfm_max_image_size = state
+            .panorama
+            .as_ref()
+            .map(|p| {
+                if state.generation_policy.is_some() && quality == Quality::High {
+                    p.sfm_width.min(4096)
+                } else {
+                    p.sfm_width
+                }
+            })
+            .unwrap_or_else(|| {
+                state
+                    .resolution_plan
+                    .map(|plan| plan.sfm_max_image_size)
+                    .unwrap_or(if state.planner_enabled {
+                        preset.planned_sfm_max_image_size
+                    } else {
+                        preset.sfm_max_image_size
+                    })
+            });
         if let Some(config) = &state.panorama {
             tokio::fs::create_dir_all(&paths.colmap).await?;
             tokio::fs::write(
@@ -3055,25 +3437,23 @@ impl PipelineRunner {
             );
         }
 
-        let allow_two_view_tracks = should_allow_two_view_tracks(
-            state.planner_enabled,
-            preset.sfm_allow_two_view_tracks,
-            prepared.has_alpha,
-        );
+        let allow_two_view_tracks = if state.generation_policy.is_some() {
+            self.actual_transparency(paths, &mut state, prepared.has_alpha)
+                .await?
+        } else {
+            should_allow_two_view_tracks(
+                state.planner_enabled,
+                preset.sfm_allow_two_view_tracks,
+                prepared.has_alpha,
+            )
+        };
         if state.reconstruction_complete {
             self.events
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
         } else {
             reset_directory(&sparse).await?;
-            self.events.stage(
-                PipelineStage::Reconstructing,
-                0.0,
-                if allow_two_view_tracks {
-                    "正在增量重建相机轨迹（High：允许两视图三角化）"
-                } else {
-                    "正在增量重建相机轨迹"
-                },
-            );
+            self.events
+                .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
             colmap::map(
                 &self.engines.colmap,
                 &database,
@@ -3347,6 +3727,15 @@ impl PipelineRunner {
                 );
                 self.events.panorama_phase.store(1, Ordering::Relaxed);
             }
+            let is_panorama = state.panorama.is_some();
+            self.prepare_fine_splat_budget(
+                &mut state,
+                quality,
+                &model,
+                &dataset.join("images"),
+                is_panorama,
+            )
+            .await?;
             let source_long_edge = prepared
                 .video
                 .as_ref()
@@ -3366,6 +3755,34 @@ impl PipelineRunner {
             };
             let mut resolved_brush = if let Some(saved) = state.brush_training.resolved {
                 saved
+            } else if let Some(policy) = state.generation_policy {
+                if let Some(config) = &state.panorama {
+                    policy.panorama_training(
+                        quality,
+                        detected_total_memory_mb,
+                        config.face_size,
+                        report.points_3d,
+                        report.points_3d,
+                    )?
+                } else {
+                    let resolution = state.resolution_plan.unwrap_or_else(|| {
+                        policy.resolution(
+                            quality,
+                            detected_total_memory_mb,
+                            prepared.working_width,
+                            prepared.working_height,
+                            false,
+                        )
+                    });
+                    policy.training(
+                        quality,
+                        detected_total_memory_mb,
+                        &resolution,
+                        report.points_3d,
+                        report.points_3d,
+                        state.brush_training.fine_splat_budget.as_ref(),
+                    )?
+                }
             } else if let Some(config) = &state.panorama {
                 resolve_panorama_training_preset(
                     quality,
@@ -3400,14 +3817,14 @@ impl PipelineRunner {
                 resolved_brush.preset.max_resolution =
                     resolved_brush.preset.max_resolution.min(config.face_size);
             }
-            if !state.brush_training.oom_retry_used {
+            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
                 state
                     .brush_training
                     .initial_resolved
                     .get_or_insert(resolved_brush);
             }
             state.brush_training.resolved = Some(resolved_brush);
-            self.record_brush_metrics(&state);
+            self.prepare_brush_observation(&state);
             project_manager.write_state(&paths.state, &state).await?;
             let runtime_samples = catalog::runtime_samples().await;
             let estimated_brush_duration_ms = match (&prepared.video, &prepared.image_sequence) {
@@ -3530,6 +3947,42 @@ impl PipelineRunner {
         })
     }
 
+    async fn prepare_fine_splat_budget(
+        &self,
+        state: &mut PipelineStateFile,
+        quality: Quality,
+        model: &Path,
+        images: &Path,
+        panorama: bool,
+    ) -> Result<()> {
+        if quality != Quality::High
+            || panorama
+            || state.generation_policy.is_none_or(|p| p.version < 2)
+            || state.brush_training.resolved.is_some()
+            || state.brush_training.fine_splat_budget.is_some()
+        {
+            return Ok(());
+        }
+        let model = model.to_owned();
+        let images = images.to_owned();
+        let cancel = self.process_manager.child_token();
+        let budget = crate::presets::spawn_pipeline_blocking(move || {
+            super::splat_budget::calculate(&model, &images, &cancel)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
+        self.events.send(
+            PipelineStage::TrainingSplats, Some(PipelineEngine::System), EventKind::Log,
+            EventLevel::Info, None, false,
+            format!("[SplatBudget] version={} k={} effectivePixels={} registeredImages={} meanTrackLength={:.6} maxSplats={}",
+                budget.version, budget.coefficient, budget.effective_pixels, budget.registered_images,
+                budget.mean_track_length, budget.requested_max_splats),
+            None, None, None,
+        );
+        state.brush_training.fine_splat_budget = Some(budget);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn train_brush_with_oom_retry(
         &self,
@@ -3543,6 +3996,26 @@ impl PipelineRunner {
         resolved: ResolvedBrushTrainingPreset,
         _estimated_duration_ms: u64,
     ) -> Result<PathBuf> {
+        let mut resolved = resolved;
+        if state.generation_policy.is_some() && state.brush_training.oom_retry_used {
+            if let Some(count) = state.brush_training.oom_retry_source_count {
+                let cap = count
+                    .checked_mul(4)
+                    .map(|n| n / 5)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|cap| *cap > 0 && u64::from(*cap) >= initial_sfm_points)
+                    .ok_or_else(|| {
+                        SplatError::Process(
+                            "Initialization exceeds the saved OOM retry budget".into(),
+                        )
+                    })?;
+                resolved.preset.max_splats =
+                    Some(resolved.preset.max_splats.map_or(cap, |old| old.min(cap)));
+                state.brush_training.resolved = Some(resolved);
+                project_manager.write_state(&paths.state, state).await?;
+            }
+        }
+        self.prepare_brush_observation(state);
         self.log_brush_profile("BrushProfile", &resolved, EventLevel::Info);
         let warm = state
             .reshoot
@@ -3572,6 +4045,12 @@ impl PipelineRunner {
         } else {
             paths.logs.join("brush.log")
         };
+        let (first_observer, first_started) = track_process_start(self.process_observer(
+            PipelineStage::TrainingSplats,
+            PipelineEngine::Brush,
+            Some(resolved.preset.total_steps as u64),
+            ObserverMode::Brush,
+        ));
         let first = brush::train(
             &self.engines.brush,
             dataset,
@@ -3585,33 +4064,49 @@ impl PipelineRunner {
                 gpu_launch_policy: &gpu_launch_policy,
             },
             &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::TrainingSplats,
-                PipelineEngine::Brush,
-                Some(resolved.preset.total_steps as u64),
-                ObserverMode::Brush,
-            )),
+            Some(first_observer),
         )
         .await;
+        if state.brush_training.oom_retry_used && first_started.load(Ordering::Relaxed) {
+            state.brush_training.oom_retry_started = true;
+            project_manager.write_state(&paths.state, state).await?;
+        }
 
         match first {
             Ok(candidate) => Ok(candidate),
             Err(error)
                 if error.is_brush_oom()
-                    && (quality == Quality::High || resolved.panorama.is_some())
-                    && state.planner_enabled
+                    && state.generation_policy.map_or(
+                        state.planner_enabled
+                            && (quality == Quality::High || resolved.panorama.is_some()),
+                        |p| p.auto_retry_enabled,
+                    )
                     && !state.brush_training.oom_retry_used =>
             {
-                let Some(mut downgraded) = brush_oom_fallback(
-                    quality,
-                    state.planner_enabled,
-                    state.brush_training.oom_retry_used,
-                    resolved,
-                    initial_sfm_points,
-                ) else {
+                let fallback = if let Some(policy) = state.generation_policy {
+                    let count = match &error {
+                        SplatError::EngineProcess(f) => f.last_splat_count,
+                        _ => None,
+                    };
+                    policy.oom_retry(
+                        resolved,
+                        state.brush_training.oom_retry_used,
+                        count,
+                        initial_sfm_points,
+                    )
+                } else {
+                    brush_oom_fallback(
+                        quality,
+                        state.planner_enabled,
+                        state.brush_training.oom_retry_used,
+                        resolved,
+                        initial_sfm_points,
+                    )
+                };
+                let Some(mut downgraded) = fallback else {
                     return Err(error);
                 };
-                if warm.is_some() {
+                if warm.is_some() && state.generation_policy.is_none() {
                     downgraded.preset.total_steps = resolved.preset.total_steps;
                     downgraded.preset.densification = resolved.preset.densification;
                     downgraded.preset.max_splats = Some(
@@ -3623,10 +4118,11 @@ impl PipelineRunner {
                     );
                 }
                 state.brush_training.oom_retry_used = true;
+                state.brush_training.oom_retry_source_count = match &error {
+                    SplatError::EngineProcess(f) => f.last_splat_count,
+                    _ => None,
+                };
                 state.brush_training.resolved = Some(downgraded);
-                if let Some(tracker) = &self.effectiveness {
-                    tracker.record_brush(downgraded, true);
-                }
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::TrainingSplats,
@@ -3636,16 +4132,25 @@ impl PipelineRunner {
                     None,
                     true,
                     format!(
-                        "[BrushRetry] reason=OutOfMemory from={} to={}，复用现有 SfM 和训练数据重试一次",
+                        "[BrushRetry] reason=OutOfMemory from={} to={} lastReportedSplats={:?} maxSplats={:?}，复用现有 SfM 和训练数据重试一次",
                         resolved.profile.label(),
-                        downgraded.profile.label()
+                        downgraded.profile.label(),
+                        state.brush_training.oom_retry_source_count,
+                        downgraded.preset.max_splats,
                     ),
                     None,
                     None,
                     None,
                 );
                 self.log_brush_profile("BrushRetryProfile", &downgraded, EventLevel::Warning);
-                brush::train(
+                self.prepare_brush_observation(state);
+                let (retry_observer, retry_started) = track_process_start(self.process_observer(
+                    PipelineStage::TrainingSplats,
+                    PipelineEngine::Brush,
+                    Some(downgraded.preset.total_steps as u64),
+                    ObserverMode::Brush,
+                ));
+                let retried = brush::train(
                     &self.engines.brush,
                     dataset,
                     &paths.brush,
@@ -3658,15 +4163,14 @@ impl PipelineRunner {
                         gpu_launch_policy: &gpu_launch_policy,
                     },
                     &self.process_manager,
-                    Some(self.process_observer(
-                        PipelineStage::TrainingSplats,
-                        PipelineEngine::Brush,
-                        Some(downgraded.preset.total_steps as u64),
-                        ObserverMode::Brush,
-                    )),
+                    Some(retry_observer),
                 )
-                .await
-                .map_err(|retry_error| retry_error.with_previous_attempt(error))
+                .await;
+                if retry_started.load(Ordering::Relaxed) {
+                    state.brush_training.oom_retry_started = true;
+                    project_manager.write_state(&paths.state, state).await?;
+                }
+                retried.map_err(|retry_error| retry_error.with_previous_attempt(error))
             }
             Err(error) => Err(error),
         }
@@ -3815,11 +4319,19 @@ impl PipelineRunner {
                     return Ok((initial_model, initial_report));
                 }
             };
-            let plan = plan_bridge_backfill(
-                &prepared.plan,
-                &registered,
-                initial_report.registered_images,
-            );
+            let frame_plan = prepared.plan.clone();
+            let registered_images = initial_report.registered_images;
+            let cancellation = self.process_manager.child_token();
+            let plan = crate::presets::spawn_pipeline_blocking(move || {
+                plan_bridge_backfill_cancellable(
+                    &frame_plan,
+                    &registered,
+                    registered_images,
+                    &cancellation,
+                )
+            })
+            .await
+            .map_err(|e| SplatError::Process(e.to_string()))??;
             state.bridge_backfill.plan = Some(plan.clone());
             state.bridge_backfill.initial_model = Some(relative_model_path(paths, &initial_model));
             if plan.selected_frame_indices.is_empty() {
@@ -3850,18 +4362,17 @@ impl PipelineRunner {
             plan
         };
 
-        let additional = bridge_plan
-            .selected_frame_indices
-            .iter()
-            .filter_map(|index| {
-                prepared
-                    .plan
-                    .candidate_frames
-                    .iter()
-                    .find(|frame| frame.source_frame_index == *index)
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
+        validate_manual_bridge_plan(&prepared.plan, &bridge_plan)?;
+        let work = paths.work.clone();
+        let panorama = state.panorama.is_some();
+        let plan = prepared.plan.clone();
+        let indices = bridge_plan.selected_frame_indices.clone();
+        let fps = prepared.video.as_ref().map(|v| v.fps);
+        let additional = crate::presets::spawn_pipeline_blocking(move || {
+            resolve_bridge_frames(&work, panorama, &plan, &indices, fps)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
         if additional.len() != bridge_plan.selected_frame_indices.len() {
             state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
             project_manager.write_state(&paths.state, state).await?;
@@ -4183,6 +4694,15 @@ impl PipelineRunner {
         .await?;
 
         let bridge_sparse = paths.colmap.join("sparse-bridge");
+        let bridge_two_view = if state.generation_policy.is_some() {
+            if state.actual_transparency != Some(true) {
+                state.actual_transparency = None;
+            }
+            self.actual_transparency(paths, state, prepared.has_alpha)
+                .await?
+        } else {
+            false
+        };
         reset_directory(&bridge_sparse).await?;
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
@@ -4199,6 +4719,7 @@ impl PipelineRunner {
             input_model,
             &bridge_sparse,
             state.planner_enabled,
+            bridge_two_view,
             colmap_log.with_file_name("colmap-bridge-mapper.log"),
             &self.process_manager,
             Some(self.process_observer(
@@ -4235,6 +4756,8 @@ impl PipelineRunner {
         let process_active = Arc::new(AtomicBool::new(false));
         let cancellation = self.process_manager.child_token();
         let operation = Arc::new(std::sync::Mutex::new(None));
+        let acceleration = self.current_acceleration.clone();
+        let effectiveness = self.effectiveness.clone();
         Arc::new(move |update| {
             let mut scoped = events.clone();
             if matches!(update, ProcessUpdate::Started { .. }) {
@@ -4260,6 +4783,11 @@ impl PipelineRunner {
                     matching_notice_elapsed.store(0, Ordering::Relaxed);
                     process_active.store(true, Ordering::Relaxed);
                     tracker.snapshot.process_id = process_id;
+                    if mode == ObserverMode::Brush {
+                        if let Some(metrics) = &effectiveness {
+                            metrics.brush_started();
+                        }
+                    }
                     if mode != ObserverMode::Brush {
                         tracker.snapshot.phase = "running".into();
                     }
@@ -4328,6 +4856,15 @@ impl PipelineRunner {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let actual = tracker.line(&line, Instant::now(), brush);
+                        if brush {
+                            if let Some(acceleration) = acceleration
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .as_ref()
+                            {
+                                tracker.enrich_device(acceleration);
+                            }
+                        }
                         events.runtime(stage, engine, tracker.refresh(Instant::now()));
                         actual
                     };
@@ -4622,6 +5159,20 @@ fn brush_oom_fallback(
     ((quality == Quality::High || resolved.panorama.is_some()) && planner_enabled && !retry_used)
         .then(|| resolved.downgrade_after_oom(initial_sfm_points))
         .flatten()
+}
+
+fn track_process_start(observer: ProcessObserver) -> (ProcessObserver, Arc<AtomicBool>) {
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = started.clone();
+    (
+        Arc::new(move |update| {
+            if matches!(update, ProcessUpdate::Started { .. }) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            observer(update);
+        }),
+        started,
+    )
 }
 
 fn should_allow_two_view_tracks(
@@ -5145,6 +5696,7 @@ async fn prepared_frames_from_checkpoint(
         estimated_frames: frames.estimated_frames,
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         minimum_frame_override_applied: frames.minimum_frame_override_applied,
     };
@@ -5628,11 +6180,80 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.sampling_fps = prepared.plan.sampling_fps;
         frames.selected_frames = prepared.plan.selected_frames.clone();
         frames.candidate_frames = prepared.plan.candidate_frames.clone();
+        frames.bridge_source_frames = prepared.plan.bridge_source_frames;
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
         frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
         frames.colmap_input_version = Some(COLMAP_INPUT_VERSION);
     }
+}
+
+fn validate_manual_bridge_plan(
+    plan: &FramePlan,
+    bridge: &crate::planner::bridge_backfill::BridgeBackfillPlan,
+) -> Result<()> {
+    if let Some(total) = plan.bridge_source_frames {
+        let initial = bridge.initial_input_images;
+        let budget = (initial / 5).min(total.saturating_sub(initial));
+        if initial > total
+            || bridge.available_budget != budget
+            || plan.rescue_max_frames != initial.saturating_add(budget)
+            || bridge.selected_frame_indices.len() as u64 > budget
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .any(|index| *index >= total)
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .collect::<HashSet<_>>()
+                .len()
+                != bridge.selected_frame_indices.len()
+        {
+            return Err(SplatError::Process(
+                "Invalid manual bridge checkpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bridge_frames(
+    work: &Path,
+    panorama: bool,
+    plan: &FramePlan,
+    indices: &[u64],
+    fps: Option<f64>,
+) -> Result<Vec<crate::video::PlannedFrame>> {
+    if let Some(total) = plan.bridge_source_frames {
+        if indices.iter().any(|index| *index >= total) {
+            return Err(SplatError::Process(
+                "Bridge frame index is out of range".into(),
+            ));
+        }
+        if panorama {
+            return crate::video::panorama::bridge_source_frames(work, total, indices);
+        }
+        let fps = fps
+            .filter(|fps| fps.is_finite() && *fps > 0.)
+            .ok_or_else(|| SplatError::Process("Invalid bridge source frame rate".into()))?;
+        return Ok(indices
+            .iter()
+            .map(|index| crate::video::PlannedFrame {
+                source_frame_index: *index,
+                timestamp_seconds: *index as f64 / fps,
+            })
+            .collect());
+    }
+    Ok(indices
+        .iter()
+        .filter_map(|index| {
+            plan.candidate_frames
+                .iter()
+                .find(|frame| frame.source_frame_index == *index)
+                .cloned()
+        })
+        .collect())
 }
 
 fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
@@ -5693,6 +6314,599 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fine_budget_snapshot_resumes_without_rescanning_and_other_paths_are_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let missing = root.path().join("missing");
+        for (quality, version, panorama) in [
+            (Quality::Fast, 2, false),
+            (Quality::Balanced, 2, false),
+            (Quality::High, 1, false),
+            (Quality::High, 2, true),
+        ] {
+            let mut state = PipelineStateFile::created(quality);
+            state.generation_policy = Some(super::super::generation_policy::GenerationPolicy {
+                version,
+                ..Default::default()
+            });
+            runner
+                .prepare_fine_splat_budget(&mut state, quality, &missing, &missing, panorama)
+                .await
+                .unwrap();
+            assert!(state.brush_training.fine_splat_budget.is_none());
+        }
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        assert!(runner
+            .prepare_fine_splat_budget(&mut state, Quality::High, &missing, &missing, false)
+            .await
+            .is_err());
+        let budget = super::super::splat_budget::FineSplatBudget {
+            version: 1,
+            coefficient: 0.5,
+            registered_images: 90,
+            effective_pixels: 364_993_345,
+            sparse_points: 66_218,
+            tracked_points: 66_218,
+            observations: 191_175,
+            mean_track_length: 191_175. / 66_218.,
+            requested_max_splats: 2_220_679,
+        };
+        state.brush_training.fine_splat_budget = Some(budget);
+        let mut resumed: PipelineStateFile =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        runner
+            .prepare_fine_splat_budget(&mut resumed, Quality::High, &missing, &missing, false)
+            .await
+            .unwrap();
+        let mut restored = resumed.brush_training.fine_splat_budget.unwrap();
+        assert!((restored.mean_track_length - budget.mean_track_length).abs() < 1e-12);
+        // JSON float parsing may differ by one ULP; integer evidence and the
+        // recomputed ceiling, rather than exact float bits, must remain equal.
+        restored.mean_track_length = budget.mean_track_length;
+        assert_eq!(restored, budget);
+        let resolution =
+            resumed
+                .generation_policy
+                .unwrap()
+                .resolution(Quality::High, None, 2560, 3840, false);
+        let training = resumed
+            .generation_policy
+            .unwrap()
+            .training(
+                Quality::High,
+                None,
+                &resolution,
+                66_218,
+                3_000_000,
+                resumed.brush_training.fine_splat_budget.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(training.configured_max_splats, Some(2_220_679));
+        assert_eq!(training.preset.max_splats, Some(3_000_000));
+    }
+
+    #[tokio::test]
+    async fn manual_bridge_upgrade_archives_incompatible_cache_with_a_durable_barrier() {
+        for manual in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+            for dir in [
+                &paths.frames,
+                &paths.colmap_frames,
+                &paths.masks,
+                &paths.colmap,
+                &paths.brush,
+            ] {
+                tokio::fs::create_dir_all(dir).await.unwrap();
+                tokio::fs::write(dir.join("sentinel"), b"old")
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(paths.project.join("final.ply"), b"published")
+                .await
+                .unwrap();
+            tokio::fs::write(paths.project.join("edit.ply"), b"edited")
+                .await
+                .unwrap();
+            let manager = ProjectManager::with_root(root.path().into());
+            let runner =
+                PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+            let old = super::super::generation_policy::GenerationPolicy {
+                version: 2,
+                frame_sampling_ratio: manual.then_some(0.9),
+                ..Default::default()
+            };
+            let new = super::super::generation_policy::GenerationPolicy { version: 3, ..old };
+            let video = VideoInfo {
+                duration: 60.,
+                fps: 30.,
+                total_frames: 1800,
+                width: 1920,
+                height: 1080,
+                codec: "h264".into(),
+                rotation: 0,
+                pixel_format: "yuv420p".into(),
+                has_alpha: false,
+            };
+            let mut state = PipelineStateFile::created(Quality::Fast);
+            state.generation_policy = Some(old);
+            state.planner_enabled = true;
+            state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+            state.resolution_plan = Some(old.resolution(Quality::Fast, None, 1920, 1080, true));
+            state.frames = Some(FrameState::from(&old.frame_plan(&video, Quality::Fast)));
+            state.video = Some(video);
+            state.features_complete = true;
+            state.matching_complete = true;
+            state.reconstruction_complete = true;
+            if manual {
+                tokio::fs::write(paths.work.join("cache-archive"), b"blocked")
+                    .await
+                    .unwrap();
+                assert!(runner
+                    .prepare_failed_retry(&manager, &paths, &mut state, new)
+                    .await
+                    .is_err());
+                state = manager.read_state(&paths.state).await.unwrap();
+                assert!(!state.reconstruction_complete);
+                assert!(state
+                    .retry_cache_pending
+                    .iter()
+                    .any(|path| path == "colmap"));
+                assert!(paths.colmap.join("sentinel").exists());
+                tokio::fs::remove_file(paths.work.join("cache-archive"))
+                    .await
+                    .unwrap();
+            }
+            runner
+                .prepare_failed_retry(&manager, &paths, &mut state, new)
+                .await
+                .unwrap();
+            assert_eq!(paths.colmap.join("sentinel").exists(), !manual);
+            assert_eq!(paths.frames.join("sentinel").exists(), !manual);
+            assert_eq!(state.reconstruction_complete, !manual);
+            assert!(state.retry_cache_pending.is_empty());
+            assert_eq!(
+                std::fs::read(paths.project.join("final.ply")).unwrap(),
+                b"published"
+            );
+            assert_eq!(
+                std::fs::read(paths.project.join("edit.ply")).unwrap(),
+                b"edited"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_bridge_checkpoint_freezes_original_budget_across_partial_extraction() {
+        let mut plan = FramePlan {
+            estimated_frames: 10,
+            selected_frames: (0..100)
+                .step_by(10)
+                .map(|index| PlannedFrame {
+                    source_frame_index: index,
+                    timestamp_seconds: index as f64 / 30.,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        plan.use_manual_bridge_budget(1000);
+        let bridge = plan_bridge_backfill(&plan, &[0, 90].into_iter().collect(), 2);
+        validate_manual_bridge_plan(&plan, &bridge).unwrap();
+        let added = resolve_bridge_frames(
+            Path::new("unused"),
+            false,
+            &plan,
+            &bridge.selected_frame_indices,
+            Some(30.),
+        )
+        .unwrap();
+        assert_eq!(added.len(), 2);
+        assert!(
+            resolve_bridge_frames(Path::new("unused"), false, &plan, &[1000], Some(30.)).is_err()
+        );
+        let mut saved = FrameState::from(&plan);
+        saved.selected_frames.extend(added);
+        saved.extracted_frames = Some(12);
+        let saved: FrameState =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(saved.initial_extracted_frames, 10);
+        let resumed = FramePlan {
+            selected_frames: saved.selected_frames,
+            bridge_source_frames: saved.bridge_source_frames,
+            rescue_max_frames: saved.rescue_max_frames,
+            ..Default::default()
+        };
+        validate_manual_bridge_plan(&resumed, &bridge).unwrap();
+        assert_eq!(resumed.rescue_max_frames, 12);
+        let mut invalid = bridge.clone();
+        invalid.available_budget = 3;
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        invalid = bridge.clone();
+        invalid.selected_frame_indices[1] = invalid.selected_frame_indices[0];
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        let old: FrameState =
+            serde_json::from_str(r#"{"retentionRatio":0.5,"samplingFps":15,"estimatedFrames":10}"#)
+                .unwrap();
+        assert_eq!(old.bridge_source_frames, None);
+    }
+
+    #[test]
+    fn manual_bridge_metrics_distinguish_source_candidates_from_extracted_frames() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let video = VideoInfo {
+            duration: 60.,
+            fps: 30.,
+            total_frames: 1800,
+            width: 4096,
+            height: 2048,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        let policy = super::super::generation_policy::GenerationPolicy {
+            frame_sampling_ratio: Some(0.2),
+            ..Default::default()
+        };
+        let plan = policy.frame_plan(&video, Quality::High);
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.video = Some(video);
+        state.generation_policy = Some(policy);
+        state.frames = Some(FrameState::from(&plan));
+        runner.record_frame_metrics(&state, 360, Some(&plan));
+        let metrics = tracker.snapshot().frame_plan.unwrap();
+        assert_eq!(metrics.initial_selected_count, 360);
+        assert_eq!(metrics.candidate_count, 1800);
+        assert_eq!(metrics.configured_candidate_fps, None);
+        assert_eq!(plan.rescue_max_frames, 432);
+    }
+
+    #[tokio::test]
+    #[ignore = "Runs bundled FFmpeg/FFprobe on isolated synthetic video; no SfM or training"]
+    async fn native_manual_bridge_v3_extraction_and_rollback() {
+        use crate::process::ProcessSpec;
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let engines = EnginePaths::from_root(workspace.join("engines"));
+        assert!(engines.ffmpeg.is_file() && engines.ffprobe.is_file());
+        let root = workspace
+            .join(".cache/manual-bridge-v3")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let mut records = Vec::new();
+        for (name, panorama, alpha) in [
+            ("ordinary", false, false),
+            ("ordinary-alpha", false, true),
+            ("panorama-vfr", true, false),
+            ("panorama-vfr-alpha", true, true),
+        ] {
+            let work = root.join(name);
+            std::fs::create_dir_all(&work).unwrap();
+            let input = work.join("source.mov");
+            let mut filter = String::from("format=rgba");
+            if alpha {
+                filter.push_str(",colorchannelmixer=aa=0.5");
+            }
+            if panorama {
+                filter.push_str(",setpts=PTS+5/TB+0.2*floor(N/15)/TB");
+            }
+            let manager = ProcessManager::new();
+            let result = manager
+                .run(ProcessSpec {
+                    executable: engines.ffmpeg.clone(),
+                    args: vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-f".into(),
+                        "lavfi".into(),
+                        "-i".into(),
+                        "testsrc=size=128x64:rate=30:duration=4".into(),
+                        "-vf".into(),
+                        filter.into(),
+                        "-fps_mode".into(),
+                        "vfr".into(),
+                        "-c:v".into(),
+                        "qtrle".into(),
+                        "-pix_fmt".into(),
+                        "argb".into(),
+                        "-threads".into(),
+                        "1".into(),
+                        "-y".into(),
+                        input.as_os_str().to_owned(),
+                    ],
+                    working_directory: Some(work.clone()),
+                    log_path: Some(work.join("generate.log")),
+                    observer: None,
+                })
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.failure_detail());
+            let source_before = std::fs::read(&input).unwrap();
+            let mut video = probe_video(&engines.ffprobe, &input, None, &manager)
+                .await
+                .unwrap();
+            // Opaque case explicitly exercises the RGB/JPEG extraction path;
+            // Alpha cases exercise aligned RGBA, COLMAP images, and masks.
+            video.has_alpha = alpha;
+            let policy = super::super::generation_policy::GenerationPolicy {
+                frame_sampling_ratio: Some(if panorama { 0.3 } else { 0.5 }),
+                ..Default::default()
+            };
+            let runner =
+                PipelineRunner::new(engines.clone(), |_| {}).with_generation_policy(Some(policy));
+            let frames = work.join("frames");
+            let colmap = work.join("colmap_frames");
+            let masks = work.join("masks");
+            let prepared = runner
+                .prepare_frames(
+                    &input,
+                    Quality::Fast,
+                    &frames,
+                    &colmap,
+                    &masks,
+                    None,
+                    true,
+                    Some(video),
+                    panorama.then_some((128, 64)),
+                    panorama,
+                )
+                .await
+                .unwrap();
+            let base: Vec<_> = prepared
+                .plan
+                .selected_frames
+                .iter()
+                .map(|frame| {
+                    let file = frames.join(format!(
+                        "frame_{:010}.{}",
+                        frame.source_frame_index,
+                        if alpha { "png" } else { "jpg" }
+                    ));
+                    (file.clone(), std::fs::read(file).unwrap())
+                })
+                .collect();
+            let registered = [
+                prepared
+                    .plan
+                    .selected_frames
+                    .first()
+                    .unwrap()
+                    .source_frame_index,
+                prepared
+                    .plan
+                    .selected_frames
+                    .last()
+                    .unwrap()
+                    .source_frame_index,
+            ]
+            .into_iter()
+            .collect();
+            let bridge = plan_bridge_backfill(&prepared.plan, &registered, 2);
+            validate_manual_bridge_plan(&prepared.plan, &bridge).unwrap();
+            let added = resolve_bridge_frames(
+                &work,
+                panorama,
+                &prepared.plan,
+                &bridge.selected_frame_indices,
+                prepared.video.as_ref().map(|v| v.fps),
+            )
+            .unwrap();
+            assert!(!added.is_empty());
+            assert!(added.len() as u64 <= prepared.extracted_frames / 5);
+            if panorama {
+                let times: Vec<crate::video::panorama::FrameTime> = serde_json::from_slice(
+                    &std::fs::read(work.join("panorama-frame-times.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(times[0].timestamp_seconds >= 5.);
+                assert!(times
+                    .windows(2)
+                    .any(|p| p[1].timestamp_seconds - p[0].timestamp_seconds > 0.1));
+                for frame in &added {
+                    assert_eq!(
+                        frame.timestamp_seconds,
+                        times[frame.source_frame_index as usize].timestamp_seconds
+                    );
+                }
+            }
+            let cancelled = ProcessManager::new();
+            cancelled.cancel();
+            assert!(extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                None,
+                &cancelled,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            let output = extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                Some(work.join("bridge.log")),
+                &manager,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                output.frame_count,
+                prepared.extracted_frames + added.len() as u64
+            );
+            for (file, bytes) in &base {
+                assert_eq!(&std::fs::read(file).unwrap(), bytes);
+            }
+            let count = output.frame_count;
+            remove_bridge_outputs(&frames, &colmap, &masks, &added, alpha).await;
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), source_before);
+            records.push(
+                serde_json::json!({"case":name,"initial":prepared.extracted_frames,
+                "budget":prepared.plan.rescue_max_frames,"added":added.len(),"combined":count,
+                "sourceUnchanged":true,"cancelAndRollbackProtected":true}),
+            );
+        }
+        std::fs::write(
+            root.join("result.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+        eprintln!("Native manual bridge evidence: {}", root.display());
+    }
+
+    #[tokio::test]
+    async fn new_policy_retry_archives_only_incompatible_work_and_preserves_results() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        for dir in [
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+        ] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+            tokio::fs::write(dir.join("sentinel"), b"old-cache")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(paths.project.join("final.ply"), b"published")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.project.join("edit.ply"), b"edited")
+            .await
+            .unwrap();
+        let manager = ProjectManager::with_root(root.path().into());
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        state.brush_complete = true;
+        runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .unwrap();
+        assert!(state.generation_policy.is_some());
+        assert!(!state.features_complete && !state.matching_complete && !state.brush_complete);
+        assert!(!paths.colmap.join("sentinel").exists());
+        assert_eq!(
+            tokio::fs::read(paths.project.join("final.ply"))
+                .await
+                .unwrap(),
+            b"published"
+        );
+        assert_eq!(
+            tokio::fs::read(paths.project.join("edit.ply"))
+                .await
+                .unwrap(),
+            b"edited"
+        );
+        assert!(state.retry_cache_pending.is_empty());
+        // Same-policy retry keeps compatible SfM and clears only training.
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"compatible")
+            .await
+            .unwrap();
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            state.features_complete && state.matching_complete && state.reconstruction_complete
+        );
+        assert_eq!(
+            tokio::fs::read(paths.colmap.join("database.db"))
+                .await
+                .unwrap(),
+            b"compatible"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retry_archive_is_a_durable_barrier_and_alpha_requires_nonopaque_pixels() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.work.join("cache-archive"), b"blocked-directory")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"old")
+            .await
+            .unwrap();
+        let manager = ProjectManager::with_root(root.path().into());
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        assert!(runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .is_err());
+        let saved = manager.read_state(&paths.state).await.unwrap();
+        assert!(
+            !saved.features_complete
+                && !saved.reconstruction_complete
+                && !saved.retry_cache_pending.is_empty()
+        );
+        assert_eq!(
+            tokio::fs::read(paths.colmap.join("database.db"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        let mut image = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        image.save(paths.frames.join("frame.png")).unwrap();
+        state.actual_transparency = None;
+        assert!(!runner
+            .actual_transparency(&paths, &mut state, true)
+            .await
+            .unwrap());
+        image.get_pixel_mut(1, 1).0[3] = 254;
+        image.save(paths.frames.join("frame.png")).unwrap();
+        state.actual_transparency = None;
+        assert!(runner
+            .actual_transparency(&paths, &mut state, true)
+            .await
+            .unwrap());
+    }
 
     #[test]
     fn image_matching_dispatch_preserves_video_and_quality_loop_policy() {
@@ -6204,6 +7418,56 @@ mod tests {
         assert!(snapshot.bridge.is_none());
         assert!(snapshot.brush.is_none());
         assert!(snapshot.final_result.is_none());
+    }
+
+    #[test]
+    fn restored_source_metrics_use_raw_input_and_only_the_new_reshoot_batch() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let mut state = PipelineStateFile::created_for(Quality::High, ProjectInputType::Images);
+        state.image_sequence = Some(ImageSequenceInfo {
+            width: 8192,
+            height: 4096,
+            image_count: 12,
+            has_alpha: false,
+            requires_large_sequence_confirmation: false,
+        });
+        state.frames = Some(FrameState {
+            extracted_frames: Some(112),
+            initial_extracted_frames: 112,
+            ..Default::default()
+        });
+        state.reshoot = Some(ReshootState {
+            source_image_count: 100,
+            reshoot_frame_count: 12,
+            supplemental_frames_complete: true,
+            ..Default::default()
+        });
+        runner.restore_source_metrics(&state);
+        let source = tracker.snapshot().frame_plan.unwrap();
+        assert_eq!((source.source_width, source.source_height), (8192, 4096));
+        assert_eq!(source.source_item_count, 12);
+        assert_eq!(source.initial_selected_count, 12);
+        assert_eq!(source.candidate_count, 12);
+        // Before preparation, confirmed source dimensions/counts are still available.
+        state.reshoot.as_mut().unwrap().supplemental_frames_complete = false;
+        runner.restore_source_metrics(&state);
+        assert_eq!(
+            tracker
+                .snapshot()
+                .frame_plan
+                .unwrap()
+                .initial_selected_count,
+            12
+        );
+        // Old snapshots missing source data cannot borrow combined training counts.
+        let empty = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(empty.clone());
+        state.image_sequence = None;
+        runner.restore_source_metrics(&state);
+        assert!(empty.snapshot().frame_plan.is_none());
     }
 
     #[tokio::test]

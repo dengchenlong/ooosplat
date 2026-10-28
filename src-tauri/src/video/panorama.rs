@@ -245,12 +245,27 @@ impl PanoramaCheckpoint {
         video: &VideoInfo,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
+        Self::new_for_policy(source, quality, video, cancel, false)
+    }
+    pub fn new_for_policy(
+        source: &Path,
+        quality: Quality,
+        video: &VideoInfo,
+        cancel: &tokio_util::sync::CancellationToken,
+        native: bool,
+    ) -> Result<Self> {
         let (cap, face) = match quality {
             Quality::Fast => (2048, 512),
             Quality::Balanced => (3072, 768),
+            Quality::High if native => (video.width, video.width / 4),
             Quality::High => (4096, 1024),
         };
-        let width = video.width.min(cap) / 4 * 4;
+        let width = if native && quality == Quality::High {
+            video.width
+        } else {
+            video.width.min(cap) / 4 * 4
+        };
+        validate_training_cache_size(1, width as u64, u64::from(width / 2), face.min(width / 4))?;
         Ok(Self {
             version: CONVERSION_VERSION,
             source_sha256: fingerprint_cancellable(source, cancel)?,
@@ -363,17 +378,7 @@ pub async fn actual_frame_plan(
 }
 
 fn apply_frame_times(plan: &mut FramePlan, times: &[FrameTime]) -> Result<Vec<FrameTime>> {
-    if times.is_empty()
-        || times.len() >= 1_000_000
-        || times.iter().any(|t| !t.timestamp_seconds.is_finite())
-        || times
-            .windows(2)
-            .any(|p| p[1].timestamp_seconds < p[0].timestamp_seconds)
-    {
-        return Err(process_error(
-            "全景视频帧时间戳不可用、非单调或超出首版 100 万帧限制",
-        ));
-    }
+    validate_frame_times(times)?;
     if plan.selected_frames.is_empty() {
         let count = plan.estimated_frames.min(times.len() as u64).max(1) as usize;
         plan.selected_frames = (0..count)
@@ -394,6 +399,13 @@ fn apply_frame_times(plan: &mut FramePlan, times: &[FrameTime]) -> Result<Vec<Fr
             .timestamp_seconds;
     }
     plan.estimated_frames = plan.selected_frames.len() as u64;
+    if plan.bridge_source_frames.is_some() {
+        plan.use_manual_bridge_budget(times.len() as u64);
+        plan.retention_ratio = plan.selected_frames.len() as f64 / times.len() as f64;
+        // Already probed once for generation. Retain the bounded time index so
+        // a later bridge can choose any source index without another ffprobe.
+        return Ok(times.to_vec());
+    }
     let wanted: std::collections::HashSet<_> = plan
         .selected_frames
         .iter()
@@ -405,6 +417,53 @@ fn apply_frame_times(plan: &mut FramePlan, times: &[FrameTime]) -> Result<Vec<Fr
         .filter(|f| wanted.contains(&f.source_frame_index))
         .cloned()
         .collect())
+}
+
+fn validate_frame_times(times: &[FrameTime]) -> Result<()> {
+    if times.is_empty()
+        || times.len() >= 1_000_000
+        || times
+            .iter()
+            .enumerate()
+            .any(|(i, t)| t.source_frame_index != i as u64 || !t.timestamp_seconds.is_finite())
+        || times
+            .windows(2)
+            .any(|p| p[1].timestamp_seconds < p[0].timestamp_seconds)
+    {
+        return Err(process_error(
+            "全景视频帧时间戳不可用、非单调或超出首版 100 万帧限制",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn bridge_source_frames(
+    work: &Path,
+    total: u64,
+    indices: &[u64],
+) -> Result<Vec<PlannedFrame>> {
+    let times: Vec<FrameTime> = serde_json::from_reader(BufReader::new(File::open(
+        work.join("panorama-frame-times.json"),
+    )?))?;
+    validate_frame_times(&times)?;
+    if times.len() as u64 != total {
+        return Err(process_error(
+            "Panorama bridge source time index is inconsistent",
+        ));
+    }
+    indices
+        .iter()
+        .map(|index| {
+            let time = usize::try_from(*index)
+                .ok()
+                .and_then(|index| times.get(index))
+                .ok_or_else(|| process_error("Panorama bridge frame index is out of range"))?;
+            Ok(PlannedFrame {
+                source_frame_index: *index,
+                timestamp_seconds: time.timestamp_seconds,
+            })
+        })
+        .collect()
 }
 
 type V3 = [f64; 3];
@@ -676,11 +735,28 @@ pub fn prepare_reshoot_training_cache(
     cancel: &tokio_util::sync::CancellationToken,
     progress: impl Fn(TrainingCacheUpdate),
 ) -> Result<PathBuf> {
+    prepare_reshoot_training_cache_for_policy(
+        frames, model, root, records, quality, false, cancel, progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_reshoot_training_cache_for_policy(
+    frames: &Path,
+    model: &Path,
+    root: &Path,
+    records: &[crate::pipeline::reshoot::PanoramaFrameRecord],
+    quality: Quality,
+    native: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: impl Fn(TrainingCacheUpdate),
+) -> Result<PathBuf> {
     let cameras = crate::reconstruction::colmap_model::read_cameras(model)?;
     let poses = read_poses(model)?;
     let cap = match quality {
         Quality::Fast => 512,
         Quality::Balanced => 768,
+        Quality::High if native => u32::MAX,
         Quality::High => 1024,
     };
     let images = root.join("images");
@@ -954,7 +1030,7 @@ pub fn prepare_training_cache(
 ) -> Result<PathBuf> {
     if config.version != CONVERSION_VERSION
         || config.face_size == 0
-        || config.face_size > 1024
+        || config.face_size > config.sfm_width / 4
         || config.field_of_view_degrees != FOV_DEGREES
     {
         return Err(process_error(
@@ -1405,6 +1481,51 @@ mod tests {
         eprintln!("Native-resolution diagnostic dataset: {}", root.display());
     }
     #[test]
+    fn manual_bridge_retains_full_vfr_index_for_late_source_candidates() {
+        let work = tempfile::tempdir().unwrap();
+        let times: Vec<_> = (0..20)
+            .map(|index| FrameTime {
+                source_frame_index: index,
+                pts: 10000 + index as i64 * index as i64,
+                timestamp_seconds: 10. + (index * index) as f64 / 1000.,
+            })
+            .collect();
+        let mut plan = FramePlan {
+            selected_frames: (0..20)
+                .step_by(2)
+                .map(|index| PlannedFrame {
+                    source_frame_index: index,
+                    timestamp_seconds: 0.,
+                })
+                .collect(),
+            candidate_frames: Vec::new(),
+            bridge_source_frames: Some(20),
+            ..Default::default()
+        };
+        let mapped = apply_frame_times(&mut plan, &times).unwrap();
+        assert_eq!(mapped.len(), 20);
+        assert_eq!(plan.rescue_max_frames, 12);
+        fs::write(
+            work.path().join("panorama-frame-times.json"),
+            serde_json::to_vec(&mapped).unwrap(),
+        )
+        .unwrap();
+        let added = bridge_source_frames(work.path(), 20, &[9, 11]).unwrap();
+        assert_eq!(added[0].timestamp_seconds, 10.081);
+        assert_eq!(added[1].timestamp_seconds, 10.121);
+        assert!(bridge_source_frames(work.path(), 19, &[9]).is_err());
+        assert!(bridge_source_frames(work.path(), 20, &[20]).is_err());
+        let mut corrupt = mapped;
+        corrupt[9].source_frame_index = 8;
+        fs::write(
+            work.path().join("panorama-frame-times.json"),
+            serde_json::to_vec(&corrupt).unwrap(),
+        )
+        .unwrap();
+        assert!(bridge_source_frames(work.path(), 20, &[9]).is_err());
+    }
+
+    #[test]
     fn vfr_and_nonzero_start_keep_actual_pts_for_initial_and_bridge_frames() {
         let times: Vec<_> = [(1000, 10.), (1001, 10.01), (1040, 10.4), (1150, 11.5)]
             .into_iter()
@@ -1831,6 +1952,23 @@ mod tests {
             (Quality::High, 4096, 1024),
         ] {
             let config = PanoramaCheckpoint::new(&source, q, &info).unwrap();
+            let native = PanoramaCheckpoint::new_for_policy(
+                &source,
+                q,
+                &info,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+            )
+            .unwrap();
+            if q == Quality::High {
+                assert_eq!(
+                    (native.sfm_width, native.sfm_height, native.face_size),
+                    (7680, 3840, 1920)
+                );
+                assert_eq!(native.field_of_view_degrees, 92.);
+            } else {
+                assert_eq!(native, config);
+            }
             assert_eq!(config.sfm_width, w);
             assert_eq!(config.face_size, face);
             assert_eq!(config.sfm_height, w / 2);

@@ -1,5 +1,7 @@
 # 自动优化参数配置
 
+> 当前新任务采用[默认生成与自动重试策略](GENERATION_POLICY.md)。下文显存分档、关闭优化配置和旧 OOM 降级字段仍用于兼容历史快照；新精细档使用原分辨率，普通素材采用[有效像素预算（k=0.5）](FINE_SPLAT_BUDGET.md)，全景保留稀疏点数×40。自动重试只授权减点或补拍方案回退。快速／均衡沿用现有优化配方。
+
 OOOSplat 的重建与训练档位集中定义在 [`config/pipeline-optimization.json`](../config/pipeline-optimization.json)。Rust 代码只负责执行和校验流程，档位参数、显存阈值、Bridge 阈值、Caspar 数据量阈值及 High 的 OOM 降级目标均从该文件读取。
 
 默认配置在编译时嵌入程序，确保正式包和 CI 可复现。开发者也可以在启动进程前设置 `OOOSPLAT_PIPELINE_CONFIG`，指向一份外部 JSON；程序每次启动只读取一次。外部文件不存在、JSON 格式错误、出现未知字段或参数不安全时，会输出原因并回退到内置默认配置，不会使用半份配置。

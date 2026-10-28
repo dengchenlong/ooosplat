@@ -1,5 +1,7 @@
 # Auto Optimize parameter configuration
 
+> New runs use the [generation defaults and retry policy](GENERATION_POLICY.md). Legacy VRAM tiers, optimization-off recipes and profile downgrades below remain for historical snapshot compatibility. New Detailed runs use source resolution and the [effective-pixel budget (k=0.5)](FINE_SPLAT_BUDGET.md) for ordinary media; panoramas retain 40× sparse points. Automatic retry authorizes point reductions or reshoot-plan fallbacks only. Fast/Balanced retain their optimized recipes.
+
 Reconstruction and training presets are defined in [`config/pipeline-optimization.json`](../config/pipeline-optimization.json). The configuration is embedded at build time. Developers can set `OOOSPLAT_PIPELINE_CONFIG` to an external JSON file before starting the app; restart after changes. Missing, malformed, unknown, or unsafe settings are rejected as a whole, with a message explaining the fallback to embedded defaults. `schemaVersion` remains `1`.
 
 ```powershell

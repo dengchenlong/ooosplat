@@ -439,6 +439,24 @@ impl PipelineRunner {
         let probe = self
             .probe_reshoot_input_v2(project, input, input_type, quality)
             .await?;
+        if let Some(images) = &probe.image_sequence {
+            if let Some(tracker) = &self.effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    images.width,
+                    images.height,
+                    images.image_count,
+                ));
+            }
+        } else if let Some(video) = &probe.video {
+            let plan = if let Some(policy) = self.policy() {
+                policy.frame_plan(video, quality)
+            } else if self.planner_enabled {
+                QualityV2FrameSelection.create_plan(video, &quality.preset())
+            } else {
+                UniformRatioFrameSelection.create_plan(video, &quality.preset())
+            };
+            self.record_input_plan(quality, video, &plan, true);
+        }
         if source.source_identity != options.source_identity
             || probe.source_identity.as_deref() != Some(options.input_identity.as_str())
             || source.projection != options.projection
@@ -499,9 +517,22 @@ impl PipelineRunner {
         input_type: ReshootInputType,
         quality: Quality,
     ) -> Result<ReshootInputInfo> {
+        self.probe_reshoot_input_v2_cached(project, input, input_type, quality, None)
+            .await
+    }
+
+    pub async fn probe_reshoot_input_v2_cached(
+        &self,
+        project: uuid::Uuid,
+        input: &Path,
+        input_type: ReshootInputType,
+        quality: Quality,
+        cached: Option<crate::commands::VideoAnalysis>,
+    ) -> Result<ReshootInputInfo> {
         let source = self.inspect_reshoot_source_v2(project).await?;
         let identity = panorama::source_identity(input)?;
         let samples = catalog::runtime_samples().await;
+        let mut analyzed_video = None;
         let (count, duration, width, height, estimated, alpha, detection, sequence, estimate) =
             if input_type == ReshootInputType::Images {
                 let scan = if source.projection == VideoProjection::Equirectangular {
@@ -529,22 +560,32 @@ impl PipelineRunner {
                     estimate,
                 )
             } else {
-                let (video, json) = crate::engines::ffprobe::probe_video_metadata(
-                    &self.engines.ffprobe,
-                    input,
-                    None,
-                    &self.process_manager,
-                )
-                .await?;
-                let mut detection = panorama::detect_metadata(
-                    &json,
-                    &video,
-                    input
-                        .extension()
-                        .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
-                );
+                let (video, mut detection) = if let Some(cached) =
+                    cached.filter(|c| c.projection_detection.source_identity == identity)
+                {
+                    (cached.video, cached.projection_detection)
+                } else {
+                    let (video, json) = crate::engines::ffprobe::probe_video_metadata(
+                        &self.engines.ffprobe,
+                        input,
+                        None,
+                        &self.process_manager,
+                    )
+                    .await?;
+                    let detection = panorama::detect_metadata(
+                        &json,
+                        &video,
+                        input
+                            .extension()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
+                    );
+                    (video, detection)
+                };
                 detection.source_identity = identity.clone();
-                let plan = if self.planner_enabled {
+                analyzed_video = Some(video.clone());
+                let plan = if let Some(policy) = self.policy() {
+                    policy.frame_plan(&video, quality)
+                } else if self.planner_enabled {
                     QualityV2FrameSelection.create_plan(&video, &quality.preset())
                 } else {
                     UniformRatioFrameSelection.create_plan(&video, &quality.preset())
@@ -568,6 +609,7 @@ impl PipelineRunner {
             !detection.confirmed_erp
         };
         Ok(ReshootInputInfo {
+            video: analyzed_video,
             source_identity: Some(identity),
             projection_detection: Some(detection),
             image_sequence: sequence,
@@ -606,6 +648,24 @@ impl PipelineRunner {
         let probe = self
             .probe_reshoot_input_v2(project, input, input_type, quality)
             .await?;
+        if let Some(images) = &probe.image_sequence {
+            if let Some(tracker) = &self.effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    images.width,
+                    images.height,
+                    images.image_count,
+                ));
+            }
+        } else if let Some(video) = &probe.video {
+            let plan = if let Some(policy) = self.policy() {
+                policy.frame_plan(video, quality)
+            } else if self.planner_enabled {
+                QualityV2FrameSelection.create_plan(video, &quality.preset())
+            } else {
+                UniformRatioFrameSelection.create_plan(video, &quality.preset())
+            };
+            self.record_input_plan(quality, video, &plan, true);
+        }
         if !probe.compatible {
             return Err(invalid(
                 probe
@@ -653,12 +713,19 @@ impl PipelineRunner {
         });
         manager.write_metadata(&paths.metadata, &metadata).await?;
         let mut state = manager.read_state(&paths.state).await?;
+        state.video = probe.video.clone();
+        state.image_sequence = probe.image_sequence.clone();
+        state.generation_policy = self.policy();
         state.planner_enabled = self.planner_enabled;
         if metadata.input_type == ProjectInputType::Images {
             state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
         }
         state.video_projection = options.projection;
         state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+        let mut options = options;
+        if let Some(policy) = state.generation_policy {
+            options.allow_fallback = policy.auto_retry_enabled;
+        }
         let plan = ReshootPlan::resolve(options.condition, true, info.warm_available);
         state.reshoot = Some(ReshootState {
             recipe: Some(ReshootRecipe {
@@ -1032,10 +1099,11 @@ impl PipelineRunner {
                     "正在准备补拍画面",
                     None,
                 );
-                let config = crate::video::image_projection::checkpoint(
+                let config = crate::video::image_projection::checkpoint_for_policy(
                     &metadata.source_path,
                     metadata.quality,
                     &cancel,
+                    state.generation_policy.is_some(),
                 )?;
                 crate::video::image_projection::prepare(
                     &metadata.source_path,
@@ -1119,11 +1187,12 @@ impl PipelineRunner {
                 )
                 .await?;
                 let config = if is_panorama {
-                    Some(panorama::PanoramaCheckpoint::new_cancellable(
+                    Some(panorama::PanoramaCheckpoint::new_for_policy(
                         &metadata.source_path,
                         metadata.quality,
                         &video,
                         &cancel,
+                        state.generation_policy.is_some(),
                     )?)
                 } else {
                     None
@@ -1134,7 +1203,7 @@ impl PipelineRunner {
                     .or_else(|| {
                         (recipe.uses_normal_parameters() && state.planner_enabled).then(|| {
                             let (w, h) = oriented_video_dimensions(&video);
-                            let plan = resolve_planner_resolution_plan(
+                            let plan = self.resolution_plan(
                                 metadata.quality,
                                 acceleration.usable_gpu_total_memory_mb(),
                                 w,
@@ -1280,6 +1349,7 @@ impl PipelineRunner {
                 "复用已完成的补拍缓存：补拍画面",
             );
         }
+        self.record_frame_metrics(&state, checkpoint.reshoot_frame_count, None);
         if recipe.uses_normal_parameters() && recipe.camera_assignment.is_none() {
             let headers = recipe
                 .new_names
@@ -1346,7 +1416,7 @@ impl PipelineRunner {
                     largest = (header.width, header.height);
                 }
             }
-            state.resolution_plan = Some(resolve_planner_resolution_plan(
+            state.resolution_plan = Some(self.resolution_plan(
                 metadata.quality,
                 acceleration.usable_gpu_total_memory_mb(),
                 largest.0,
@@ -1356,6 +1426,12 @@ impl PipelineRunner {
             save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
         }
         let sfm = metadata.quality.preset();
+        if state.generation_policy.is_some() {
+            let candidate_alpha =
+                checkpoint.has_alpha || state.frames.as_ref().is_some_and(|f| f.has_alpha);
+            self.actual_transparency(paths, &mut state, candidate_alpha)
+                .await?;
+        }
         if !checkpoint.supplemental_features_complete {
             self.events.stage(
                 PipelineStage::ExtractingFeatures,
@@ -1476,6 +1552,8 @@ impl PipelineRunner {
                     &self.engines.colmap,
                     &database,
                     colmap::ReshootMapperOptions {
+                        allow_two_view_tracks: state.generation_policy.is_some()
+                            && state.actual_transparency == Some(true),
                         images: &paths.colmap_frames,
                         input: (recipe.actual.reconstruction == ReconstructionMode::Incremental)
                             .then_some(base.as_path()),
@@ -1579,6 +1657,12 @@ impl PipelineRunner {
             model
         };
         let report = ReconstructionValidator::validate(&paths.frames, &model)?;
+        self.record_reconstruction_metrics(
+            &report,
+            acceleration,
+            state.generation_policy.is_some() && state.actual_transparency == Some(true),
+            true,
+        );
         reshoot_log(
             &self.events,
             PipelineStage::Reconstructing,
@@ -1603,15 +1687,17 @@ impl PipelineRunner {
             let model = model.clone();
             let records = recipe.panorama_frames.clone();
             let quality = metadata.quality;
+            let native = state.generation_policy.is_some();
             let cancel = cancel.clone();
             let events = self.events.clone();
             crate::presets::spawn_pipeline_blocking(move || {
-                panorama::prepare_reshoot_training_cache(
+                panorama::prepare_reshoot_training_cache_for_policy(
                     &frames,
                     &model,
                     &root,
                     &records,
                     quality,
+                    native,
                     &cancel,
                     |update| match update {
                         panorama::TrainingCacheUpdate::Faces {
@@ -1662,6 +1748,7 @@ impl PipelineRunner {
             .store(u64::from(is_panorama), Ordering::Relaxed);
         let mut previous_training_failure = None;
         let candidate = loop {
+            self.prepare_brush_observation(&state);
             let mut attempt = paths.clone();
             let name = format!(
                 "attempt-{}-{}",
@@ -1698,10 +1785,25 @@ impl PipelineRunner {
                 .map(|i| i.width.max(i.height))
                 .max()
                 .unwrap_or(1);
-            let face_size = match metadata.quality {
-                Quality::Fast => 512,
-                Quality::Balanced => 768,
-                Quality::High => 1024,
+            let face_size = if state.generation_policy.is_some()
+                && metadata.quality == Quality::High
+                && is_panorama
+            {
+                // Faces live in per-source subdirectories. Their validated
+                // training cameras, not a shallow image listing, define size.
+                read_cameras(&dataset.join("sparse/0"))?
+                    .iter()
+                    .map(|c| c.width.max(c.height))
+                    .max()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| invalid("Invalid panorama training camera dimensions"))?
+            } else {
+                match metadata.quality {
+                    Quality::Fast => 512,
+                    Quality::Balanced => 768,
+                    Quality::High => 1024,
+                }
             };
             let mut initial_points = report.points_3d;
             let mut initial_sh = 3;
@@ -1770,7 +1872,10 @@ impl PipelineRunner {
                 let (info, sh, _) = validate_ply(&init, &cancel).await?;
                 initial_points = info.splat_count;
                 initial_sh = sh;
-                if is_panorama && initial_points > crate::presets::MAX_PANORAMA_SPLATS as u64 {
+                if is_panorama
+                    && !(state.generation_policy.is_some() && metadata.quality == Quality::High)
+                    && initial_points > crate::presets::MAX_PANORAMA_SPLATS as u64
+                {
                     return Err(invalid(
                         "初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。",
                     ));
@@ -1782,6 +1887,14 @@ impl PipelineRunner {
                 }
                 recipe.warm_parameters = None;
             }
+            self.prepare_fine_splat_budget(
+                &mut state,
+                metadata.quality,
+                &model,
+                &dataset.join("images"),
+                is_panorama,
+            )
+            .await?;
             // Resolve after validating initialization, using the normal budget
             // protection. Existing jobs retain their saved warm-start recipe.
             let budget_points = if recipe.uses_normal_parameters() {
@@ -1791,6 +1904,33 @@ impl PipelineRunner {
             };
             let mut resolved = if let Some(saved) = state.brush_training.resolved {
                 saved
+            } else if let Some(generation) = state.generation_policy {
+                let memory = if is_panorama {
+                    policy.known_training_memory_mb(acceleration)
+                } else {
+                    acceleration.usable_gpu_total_memory_mb()
+                };
+                if is_panorama {
+                    generation.panorama_training(
+                        metadata.quality,
+                        memory,
+                        face_size,
+                        report.points_3d,
+                        initial_points,
+                    )?
+                } else {
+                    let resolution = state.resolution_plan.unwrap_or_else(|| {
+                        generation.resolution(metadata.quality, memory, max_edge, max_edge, false)
+                    });
+                    generation.training(
+                        metadata.quality,
+                        memory,
+                        &resolution,
+                        report.points_3d,
+                        initial_points,
+                        state.brush_training.fine_splat_budget.as_ref(),
+                    )?
+                }
             } else {
                 normal_training_preset(
                     metadata.quality,
@@ -1833,7 +1973,20 @@ impl PipelineRunner {
                             .is_some_and(|cap| initial_points > cap as u64);
                 }
             }
+            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
+                state
+                    .brush_training
+                    .initial_resolved
+                    .get_or_insert(resolved);
+            }
             state.brush_training.resolved = Some(resolved);
+            if let Some(tracker) = &self.effectiveness {
+                tracker.prepare_brush(
+                    state.brush_training.initial_resolved,
+                    Some(resolved),
+                    state.brush_training.oom_retry_used,
+                );
+            }
             save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
             self.events
                 .stage(PipelineStage::TrainingSplats, 0., "正在生成高斯泼溅");
@@ -2138,6 +2291,9 @@ impl PipelineRunner {
         state.stage = PipelineStage::Completed;
         manager.write_state(&paths.state, state).await?;
         manager.write_metadata(&paths.metadata, metadata).await?;
+        if let Some(output) = &metadata.output {
+            self.record_final_metrics(output);
+        }
         let warning = (checkpoint.registered_reshoot_count as f64
             / (checkpoint.reshoot_frame_count.max(1) as f64)
             < crate::reconstruction::good_registered_ratio())
@@ -2667,11 +2823,13 @@ mod tests {
                 .unwrap();
             let events = Arc::new(std::sync::Mutex::new(Vec::new()));
             let output = events.clone();
+            let metrics = PlannerEffectivenessTracker::default();
             let runner = PipelineRunner::new_with_planner(
                 EnginePaths::from_root(root.path().join("engines")),
                 true,
                 move |event| output.lock().unwrap().push(event),
-            );
+            )
+            .with_effectiveness_tracker(metrics.clone());
             let report = ReconstructionReport {
                 input_images: 4,
                 registered_images: 4,
@@ -2697,6 +2855,11 @@ mod tests {
                 .await;
             let captured = events.lock().unwrap().clone();
             assert_eq!(captured[0].stage, PipelineStage::Exporting);
+            let final_metrics = metrics.snapshot().final_result;
+            assert_eq!(
+                final_metrics.as_ref().map(|v| v.splat_count),
+                if failure { None } else { Some(23) }
+            );
             if failure {
                 assert!(result.is_err());
                 assert!(captured.iter().all(

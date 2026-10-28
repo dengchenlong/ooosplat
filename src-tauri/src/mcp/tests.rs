@@ -7,6 +7,34 @@ use rmcp::{
 };
 
 #[test]
+fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v3() {
+    let definition = definitions()
+        .into_iter()
+        .find(|t| t.name == "create_generation_task")
+        .unwrap();
+    let schema = serde_json::to_value(definition.input_schema).unwrap();
+    let version = schema
+        .pointer("/properties/generation_policy/properties/version")
+        .unwrap();
+    assert_eq!(version["minimum"], 1);
+    assert_eq!(version["maximum"], 3);
+    assert_eq!(version["default"], 3);
+    for version in [1, 2, 3] {
+        let request: CreateRequest = serde_json::from_value(json!({"input_path":"clip.mp4","quality":"fast",
+            "client_request_id":"version-test","generation_policy":{"version":version,"frameSamplingRatio":0.9}})).unwrap();
+        assert_eq!(
+            request
+                .generation_policy
+                .unwrap()
+                .validate()
+                .unwrap()
+                .version,
+            version
+        );
+    }
+}
+
+#[test]
 fn reshoot_requests_are_explicit_and_old_generation_requests_remain_unchanged() {
     let old: CreateRequest = serde_json::from_value(
         json!({"input_path":"clip.mp4","quality":"fast","client_request_id":"old"}),

@@ -29,6 +29,40 @@ pub use service::{TelemetryDeliveryStatus, TelemetryPreferences, TelemetryServic
 #[derive(Debug)]
 struct StageTiming {
     active: Option<(PipelineStage, Instant, bool)>,
+    last_stage: Option<TelemetryStage>,
+}
+
+#[cfg(test)]
+mod failure_stage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_stage_does_not_erase_the_failure_location() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(root.path().join("telemetry.json"));
+        service.preferences().await.unwrap();
+        let session =
+            PipelineTelemetrySession::new(service, Quality::High, TelemetryInputType::Images);
+        session.observe(&PipelineEvent::mapped(
+            PipelineStage::TrainingSplats,
+            0.0,
+            "start",
+        ));
+        session.observe(&PipelineEvent::mapped(
+            PipelineStage::TrainingSplats,
+            1.0,
+            "done",
+        ));
+        assert!(session.timing.lock().unwrap().active.is_none());
+        let mut log = PipelineEvent::mapped(PipelineStage::Matching, 0.0, "late log");
+        log.kind = EventKind::Log;
+        session.observe(&log);
+        session.observe(&PipelineEvent::mapped(PipelineStage::Failed, 1.0, "failed"));
+        assert_eq!(
+            session.current_stage(),
+            Some(TelemetryStage::TrainingSplats)
+        );
+    }
 }
 
 struct PlannerTelemetryRun {
@@ -62,7 +96,10 @@ impl PipelineTelemetrySession {
             quality: quality.into(),
             input_type,
             started: Instant::now(),
-            timing: Mutex::new(StageTiming { active: None }),
+            timing: Mutex::new(StageTiming {
+                active: None,
+                last_stage: None,
+            }),
             finished: AtomicBool::new(false),
             planner_run: None,
         }
@@ -81,7 +118,10 @@ impl PipelineTelemetrySession {
             quality: quality.into(),
             input_type,
             started: Instant::now(),
-            timing: Mutex::new(StageTiming { active: None }),
+            timing: Mutex::new(StageTiming {
+                active: None,
+                last_stage: None,
+            }),
             finished: AtomicBool::new(false),
             planner_run: Some(PlannerTelemetryRun {
                 run_id: uuid::Uuid::new_v4(),
@@ -112,6 +152,7 @@ impl PipelineTelemetrySession {
             .timing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        timing.last_stage = Some(stage);
 
         if timing
             .active
@@ -188,8 +229,7 @@ impl PipelineTelemetrySession {
         self.timing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
-            .and_then(|(stage, _, _)| TelemetryStage::from_pipeline(stage))
+            .last_stage
     }
 
     fn emit_stage_completed(

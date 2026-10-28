@@ -1,4 +1,5 @@
 export type Quality = "fast" | "balanced" | "high";
+export interface GenerationPolicy { version: 1 | 2 | 3; autoRetryEnabled: boolean; frameSamplingRatio: number | null; }
 export type EngineKind = "ffmpeg" | "ffprobe" | "colmap" | "brush";
 export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed" | "cancelled";
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
@@ -49,6 +50,7 @@ export interface FramePlan {
   selectedFrames?: PlannedFrame[];
   candidateFrames?: PlannedFrame[];
   rescueMaxFrames?: number;
+  bridgeSourceFrames?: number | null;
   minimumFrameOverrideApplied?: boolean;
 }
 export interface RuntimeEstimate {
@@ -112,6 +114,7 @@ export interface ReshootSourceInfo {
 }
 
 export interface ReshootInputInfo {
+  video?: VideoInfo | null;
   sourceIdentity?: string;
   projectionDetection?: ProjectionDetection;
   imageSequence?: ImageSequenceInfo;
@@ -239,6 +242,8 @@ export interface AppRuntimeStatus {
 
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
+  generationPolicy?: GenerationPolicy | null;
+  automaticallyRetried?: boolean;
   reshootRecipe?: ReshootRecipeSummary | null;
   videoProjection?: VideoProjection | null;
   inputProjection?: VideoProjection | null;

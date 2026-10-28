@@ -86,6 +86,26 @@ describe("TransformPanel", () => {
     expect(container.querySelector<HTMLInputElement>('[aria-label="位置 X"]')?.value).toBe("0.2");
   });
 
+  it("returns canvas focus on explicit Enter, but not while tabbing between fields or entering invalid values", async () => {
+    const focus = vi.fn();
+    await act(async () => root.render(<LanguageProvider><TransformPanel transform={{position:[0,0,0],rotation:[0,0,0],scale:1}}
+      onBegin={() => {}} onChange={() => {}} onCommit={() => {}} onFocusCanvas={focus} /></LanguageProvider>));
+    const input = container.querySelector<HTMLInputElement>('[aria-label="位置 X"]')!;
+    const next = container.querySelector<HTMLInputElement>('[aria-label="位置 Y"]')!;
+    await act(async () => input.focus());
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', bubbles:true })));
+    expect(focus).toHaveBeenCalledOnce();
+    focus.mockClear();
+    await act(async () => { input.focus(); next.focus(); });
+    expect(focus).not.toHaveBeenCalled(); expect(document.activeElement).toBe(next);
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(next,'invalid');
+      next.dispatchEvent(new Event('input', {bubbles:true}));
+    });
+    await act(async () => next.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true})));
+    expect(focus).not.toHaveBeenCalled();
+  });
+
   it("reserves a wider label column for English scale controls", async () => {
     window.localStorage.setItem("ooo-splat-language", "en");
     const transform: GaussianTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 };

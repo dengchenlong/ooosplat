@@ -87,10 +87,10 @@ export async function detectImageGps(path: string, sourceIdentity: string): Prom
   return invoke('detect_image_gps', { path, sourceIdentity });
 }
 export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus | null> { return inTauri() ? invoke("check_colmap_acceleration") : null; }
-export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true, cached?: import("../types/pipeline").InputAnalysis | import("../types/pipeline").VideoAnalysis, onAnalyzed?: (value: import("../types/pipeline").InputAnalysis) => void): Promise<ProbeAndPlan> {
+export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true, cached?: import("../types/pipeline").InputAnalysis | import("../types/pipeline").VideoAnalysis, onAnalyzed?: (value: import("../types/pipeline").InputAnalysis) => void, generationPolicy?: import('../types/pipeline').GenerationPolicy): Promise<ProbeAndPlan> {
   const analysis = cached ?? await invoke<import("../types/pipeline").InputAnalysis>("analyze_input", { path });
   if ('inputType' in analysis) onAnalyzed?.(analysis);
-  return invoke("probe_and_plan", { path, quality, plannerEnabled, ...('inputType' in analysis ? { inputAnalysis: analysis } : { videoAnalysis: analysis }) });
+  return invoke("probe_and_plan", { path, quality, plannerEnabled, ...(generationPolicy ? { generationPolicy } : {}), ...('inputType' in analysis ? { inputAnalysis: analysis } : { videoAnalysis: analysis }) });
 }
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
@@ -122,8 +122,8 @@ export async function onInputDragDrop(handler: (event: NativeInputDragEvent) => 
     });
   });
 }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy): Promise<PipelineResult> {
-  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy });
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy, generationPolicy?: import('../types/pipeline').GenerationPolicy): Promise<PipelineResult> {
+  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy, ...(generationPolicy ? { generationPolicy } : {}) });
   await startGuiTask(task.task_id);
   return waitForSharedTask(task.task_id);
 }
@@ -132,8 +132,8 @@ export async function resumePipeline(projectId: string): Promise<PipelineResult>
   return waitForSharedTask(receipt.task_id);
 }
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId, recipeVersion: 2 }); }
-export async function probeReshootInput(projectId: string, path: string, inputType: InputType, quality: Quality = "balanced", plannerEnabled = true): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType, recipeVersion: 2, quality, plannerEnabled }); }
-export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean; reshootOptions?: import('../types/pipeline').ReshootOptions }): Promise<PipelineResult> {
+export async function probeReshootInput(projectId: string, path: string, inputType: InputType, quality: Quality = "balanced", plannerEnabled = true, generationPolicy?: import('../types/pipeline').GenerationPolicy, videoAnalysis?: import('../types/pipeline').VideoAnalysis): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType, recipeVersion: 2, quality, plannerEnabled, generationPolicy, videoAnalysis }); }
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean; generationPolicy?: import('../types/pipeline').GenerationPolicy; reshootOptions?: import('../types/pipeline').ReshootOptions }): Promise<PipelineResult> {
   const receipt = await invoke<StartReceipt>("start_gui_reshoot", { request });
   return waitForSharedTask(receipt.task_id);
 }
@@ -234,7 +234,7 @@ export async function exportPly(result: Pick<PipelineResult, 'finalPly'>): Promi
 
 export async function getSharedTasks(): Promise<SharedTask[]> { return inTauri() ? invoke("get_shared_tasks") : []; }
 export async function getSharedTask(taskId: string): Promise<SharedTask> { return invoke("get_shared_task", { taskId }); }
-export async function startGuiTask(taskId: string): Promise<StartReceipt> { return invoke("start_gui_task", { taskId }); }
+export async function startGuiTask(taskId: string, retryFailedRunId?: string): Promise<StartReceipt> { return invoke("start_gui_task", { taskId, ...(retryFailedRunId ? {retryFailedRunId} : {}) }); }
 export async function cancelSharedTask(taskId: string, runId: string): Promise<SharedTask> { return invoke("cancel_shared_task", { taskId, runId }); }
 export async function onTaskUpdate(handler: (update: TaskUpdate) => void): Promise<UnlistenFn> { return inTauri() ? listen<TaskUpdate>("task-update", ({ payload }) => handler(payload)) : () => undefined; }
 export async function getMcpSettings(): Promise<McpConnection> { return inTauri() ? invoke("get_mcp_settings") : { settings: { enabled: false, port: 39877, inputRoots: [] }, listening: false, address: null, error: null }; }

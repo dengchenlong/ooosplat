@@ -32,6 +32,7 @@ pub struct FailureClassification {
 
 #[derive(Debug, Clone)]
 pub struct EngineProcessFailure {
+    pub last_splat_count: Option<u64>,
     pub engine: PipelineEngine,
     pub operation: String,
     pub termination: ProcessTermination,
@@ -95,6 +96,9 @@ impl EngineProcessFailure {
             format!("{evidence}\n--- current attempt tail ---\n{tail}")
         };
         Self {
+            // Brush fills this from its per-process observer, which preserves
+            // cross-stream arrival order and survives bounded output capture.
+            last_splat_count: None,
             engine,
             operation: operation.into(),
             termination: output.termination.clone(),

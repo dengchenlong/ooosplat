@@ -5,7 +5,7 @@ export type PreflightKind = 'smallImages' | 'imageOrder' | 'reshootCondition' | 
 export interface PreflightQuestion { id: string; kind: PreflightKind; draft: TaskDraft; snapshot: string }
 export type PreflightAnswers = Record<string, string>;
 export const projectionIdentity = (draft: TaskDraft) => draft.projectionDetection?.sourceIdentity || draft.inputPath || '';
-export const preflightSnapshot = (draft: TaskDraft) => JSON.stringify([draft.id, draft.inputPath, draft.inputType, draft.quality, draft.plannerEnabled, projectionIdentity(draft), draft.imageSequence?.imageCount, draft.projectionDetection?.confirmedErp, draft.projectionDetection?.supportedErp, resolvedProjection(draft), draft.reshootSource?.sourceIdentity, draft.reshootPlan?.sourceIdentity, draft.reshootPlan?.imageCount, draft.reshootSource?.warmAvailable]);
+export const preflightSnapshot = (draft: TaskDraft) => JSON.stringify([draft.id, draft.inputPath, draft.inputType, draft.quality, draft.autoRetryEnabled, draft.frameSamplingRatio, projectionIdentity(draft), draft.imageSequence?.imageCount, draft.projectionDetection?.confirmedErp, draft.projectionDetection?.supportedErp, resolvedProjection(draft), draft.reshootSource?.sourceIdentity, draft.reshootPlan?.sourceIdentity, draft.reshootPlan?.imageCount, draft.reshootSource?.warmAvailable]);
 export function resolvedProjection(draft: TaskDraft): VideoProjection {
   const detection = draft.projectionDetection;
   if (detection?.confirmedErp) return 'equirectangular';

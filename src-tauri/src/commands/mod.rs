@@ -31,10 +31,7 @@ use crate::{
         },
         PipelineEngine, PipelineStage,
     },
-    presets::{
-        resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
-        resolve_planner_resolution_plan, Quality,
-    },
+    presets::{resolve_brush_training_preset, resolve_brush_training_preset_for_plan, Quality},
     process::ProcessManager,
     project::{
         catalog::{self, AppSettings, ProjectOverview, ProjectSummary},
@@ -53,7 +50,7 @@ use crate::{
     telemetry::{TelemetryPreferences, TelemetryService},
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
-        ImageSequenceInfo, QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
+        ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -235,6 +232,8 @@ pub struct ProjectTaskLogLine {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTaskDetail {
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    automatically_retried: bool,
     reshoot_recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
     project: ProjectSummary,
     input_type: Option<ProjectInputType>,
@@ -407,8 +406,8 @@ pub struct ProbeAndPlan {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoAnalysis {
-    video: VideoInfo,
-    projection_detection: crate::video::panorama::ProjectionDetection,
+    pub(crate) video: VideoInfo,
+    pub(crate) projection_detection: crate::video::panorama::ProjectionDetection,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -606,11 +605,14 @@ pub async fn probe_and_plan(
     planner_enabled: Option<bool>,
     video_analysis: Option<VideoAnalysis>,
     input_analysis: Option<InputAnalysis>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
     let engine_paths = paths_for_app(&app);
     let samples = catalog::runtime_samples().await;
     let input = PathBuf::from(path);
-    let planner_enabled = planner_enabled.unwrap_or(true);
+    let policy = generation_policy.unwrap_or_default().validate()?;
+    let _legacy_planner_enabled = planner_enabled;
+    let planner_enabled = true;
     if input.is_dir() {
         let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
         let image_sequence = analysis
@@ -619,7 +621,7 @@ pub async fn probe_and_plan(
         let plan = create_image_plan(&image_sequence, &quality.preset());
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
         let resolution = planner_enabled.then(|| {
-            resolve_planner_resolution_plan(
+            policy.resolution(
                 quality,
                 acceleration.planning_gpu_total_memory_mb(),
                 image_sequence.width,
@@ -694,11 +696,7 @@ pub async fn probe_and_plan(
             video,
             projection_detection,
         } = video_preflight_diagnostics(&app, &engine_paths.ffprobe, &input, analysis).await?;
-        let plan = if planner_enabled {
-            QualityV2FrameSelection.create_plan(&video, &quality.preset())
-        } else {
-            UniformRatioFrameSelection.create_plan(&video, &quality.preset())
-        };
+        let plan = policy.frame_plan(&video, quality);
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
         let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
             (video.height, video.width)
@@ -706,7 +704,7 @@ pub async fn probe_and_plan(
             (video.width, video.height)
         };
         let resolution = planner_enabled.then(|| {
-            resolve_planner_resolution_plan(
+            policy.resolution(
                 quality,
                 acceleration.planning_gpu_total_memory_mb(),
                 source_width,
@@ -787,6 +785,51 @@ fn resolve_checkpoint_brush(
     if let Some(saved) = state.brush_training.resolved {
         return Ok(saved);
     }
+    if let Some(policy) = state.generation_policy.filter(|_| initial_sfm_points > 0) {
+        if let Some(panorama) = &state.panorama {
+            return policy.panorama_training(
+                quality,
+                detected_total_memory_mb,
+                panorama.face_size,
+                initial_sfm_points,
+                initial_sfm_points,
+            );
+        }
+        let resolution = state.resolution_plan.unwrap_or_else(|| {
+            policy.resolution(
+                quality,
+                detected_total_memory_mb,
+                source_long_edge,
+                source_long_edge,
+                false,
+            )
+        });
+        if policy.version >= 2
+            && quality == Quality::High
+            && state.brush_training.fine_splat_budget.is_none()
+        {
+            // Duration estimation must not scan training pixels, invent a cap,
+            // or prevent resuming before the final model has been inspected.
+            let mut estimate = resolve_brush_training_preset_for_plan(
+                quality,
+                detected_total_memory_mb,
+                source_long_edge,
+                initial_sfm_points,
+                &resolution,
+            );
+            estimate.configured_max_splats = None;
+            estimate.preset.max_splats = None;
+            return Ok(estimate);
+        }
+        return policy.training(
+            quality,
+            detected_total_memory_mb,
+            &resolution,
+            initial_sfm_points,
+            initial_sfm_points,
+            state.brush_training.fine_splat_budget.as_ref(),
+        );
+    }
     if let Some(panorama) = &state.panorama {
         return crate::presets::resolve_panorama_training_preset(
             quality,
@@ -835,6 +878,7 @@ pub async fn estimate_project_runtime(
             .max(1),
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         ..FramePlan::default()
     });
@@ -1123,6 +1167,10 @@ pub async fn get_project_task_detail(
         .as_ref()
         .map(|output| output.registered_images);
     Ok(ProjectTaskDetail {
+        generation_policy: state.as_ref().and_then(|s| s.generation_policy),
+        automatically_retried: state
+            .as_ref()
+            .is_some_and(PipelineStateFile::automatically_retried),
         reshoot_recipe: state
             .as_ref()
             .and_then(|s| s.reshoot.as_ref())
@@ -1280,6 +1328,7 @@ pub async fn create_gui_task(
     input_projection: Option<crate::video::panorama::VideoProjection>,
     input_source_identity: Option<String>,
     image_matching_strategy: Option<crate::project::ImageMatchingStrategy>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
 ) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
     let video_projection = input_projection.or(video_projection);
     let video_source_identity = input_source_identity.or(video_source_identity);
@@ -1306,7 +1355,7 @@ pub async fn create_gui_task(
             planner_enabled.unwrap_or(true),
             "gui",
             None,
-            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default()})),
+            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default(), "generationPolicy":generation_policy.unwrap_or_default()})),
         )
         .await
 }
@@ -1317,6 +1366,7 @@ pub async fn start_gui_task(
     telemetry: State<'_, TelemetryService>,
     imports: State<'_, crate::imports::ImportController>,
     task_id: Uuid,
+    retry_failed_run_id: Option<Uuid>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
     let _admission = imports.admission().await;
     if imports.is_active().await {
@@ -1324,6 +1374,16 @@ pub async fn start_gui_task(
             "TASK_BUSY",
             "已有 Gaussian 导入正在进行，请等待完成后再启动任务",
         ));
+    }
+    if let Some(failed_run) = retry_failed_run_id {
+        return state
+            .retry_failed(
+                task_id,
+                failed_run,
+                paths_for_app(&app),
+                Some(telemetry.inner().clone()),
+            )
+            .await;
     }
     state
         .start(
@@ -2365,6 +2425,26 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ordinary_high_resume_estimate_does_not_require_a_pixel_scan_or_invent_a_budget() {
+        use super::*;
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        let estimated =
+            resolve_checkpoint_brush(&state, Quality::High, None, 3840, 66_218).unwrap();
+        assert_eq!(estimated.preset.max_splats, None);
+        assert_eq!(estimated.configured_max_splats, None);
+        assert_eq!(estimated.preset.max_resolution, 3840);
+        state.generation_policy.as_mut().unwrap().version = 1;
+        assert_eq!(
+            resolve_checkpoint_brush(&state, Quality::High, None, 3840, 66_218)
+                .unwrap()
+                .preset
+                .max_splats,
+            Some(2_648_720)
+        );
+    }
+
+    #[test]
     fn panorama_estimates_use_recipe_but_saved_runs_keep_their_parameters() {
         use super::*;
         for images in [false, true] {
@@ -3030,6 +3110,8 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 pub struct IncrementalReshootRequest {
     #[serde(default)]
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    #[serde(default)]
     reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
     source_project_id: String,
     reshoot_path: String,
@@ -3059,6 +3141,7 @@ pub async fn inspect_reshoot_source(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn probe_reshoot_input(
     app: tauri::AppHandle,
     project_id: String,
@@ -3067,6 +3150,8 @@ pub async fn probe_reshoot_input(
     recipe_version: Option<u32>,
     quality: Option<Quality>,
     planner_enabled: Option<bool>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    video_analysis: Option<VideoAnalysis>,
 ) -> std::result::Result<ReshootInputInfo, SplatError> {
     let project_id =
         Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
@@ -3076,11 +3161,13 @@ pub async fn probe_reshoot_input(
             planner_enabled.unwrap_or(true),
             |_| {},
         )
-        .probe_reshoot_input_v2(
+        .with_generation_policy(Some(generation_policy.unwrap_or_default().validate()?))
+        .probe_reshoot_input_v2_cached(
             project_id,
             Path::new(&path),
             input_type,
             quality.unwrap_or(Quality::Balanced),
+            video_analysis,
         )
         .await;
     }
@@ -3127,8 +3214,19 @@ pub async fn start_gui_reshoot(
     } else {
         checkpoint.planner_enabled
     };
+    let policy = request.generation_policy.unwrap_or_else(|| {
+        crate::pipeline::generation_policy::GenerationPolicy {
+            auto_retry_enabled: request
+                .reshoot_options
+                .as_ref()
+                .map(|o| o.allow_fallback)
+                .unwrap_or(true),
+            ..Default::default()
+        }
+    });
     if let Some(options) = &request.reshoot_options {
         PipelineRunner::new_with_planner(paths_for_app(&app), planner_enabled, |_| {})
+            .with_generation_policy(Some(policy))
             .validate_reshoot_request_v2(
                 source,
                 Path::new(&request.reshoot_path),
@@ -3152,9 +3250,7 @@ pub async fn start_gui_reshoot(
             planner_enabled,
             "gui",
             None,
-            request
-                .reshoot_options
-                .map(|options| serde_json::json!({"reshootOptions":options})),
+            Some(serde_json::json!({"reshootOptions":request.reshoot_options, "generationPolicy":policy})),
         )
         .await?;
     state.mark_reshoot(task.task_id, source).await?;

@@ -12,6 +12,18 @@ beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
 async function render(props: ComponentProps<typeof MediaSourceStatus>) { await act(async () => root.render(<LanguageProvider key={localStorage.getItem('ooo-splat-language')}><MediaSourceStatus {...props} /></LanguageProvider>)); }
 
+it('distinguishes retry permission, an executed retry, and legacy optimization in completed details', async () => {
+  const props = {sourcePath:'E:/input.mp4',projectsRoot:'E:/projects',inputType:'video' as const,quality:'high' as const,plannerEnabled:true,completed:true,acceleration:null};
+  for (const used of [false,true]) {
+    await act(async () => root.render(<LanguageProvider><TaskConfiguration {...props} generationPolicy={{version:1,autoRetryEnabled:true,frameSamplingRatio:null}} automaticallyRetried={used} /></LanguageProvider>));
+    expect(container.textContent?.includes('已自动重试')).toBe(used);
+    expect(container.querySelector('.planner-switch strong')?.textContent).toBe('自动重试');
+  }
+  await act(async () => root.render(<LanguageProvider><TaskConfiguration {...props} /></LanguageProvider>));
+  expect(container.querySelector('.planner-switch strong')?.textContent).toBe('自动优化（实验性）');
+  expect(container.textContent).not.toContain('已自动重试');
+});
+
 it.each(['zh-CN', 'en'] as const)('shows only the approved GPS hint, never coordinates, counts, historical or video claims (%s)', async locale => {
   localStorage.setItem('ooo-splat-language', locale);
   await render({ inputType: 'images', gpsDetected: true });

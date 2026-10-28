@@ -689,13 +689,20 @@ pub async fn map_from_existing(
     input_model: &Path,
     output: &Path,
     automatic_optimization: bool,
+    allow_two_view_tracks: bool,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    let ceres_args = mapper_args(database, images, Some(input_model), output, false);
+    let ceres_args = mapper_args(
+        database,
+        images,
+        Some(input_model),
+        output,
+        allow_two_view_tracks,
+    );
     let (args, selection) = with_ba(
         executable,
         database,
@@ -1074,6 +1081,7 @@ pub async fn retrieve_reshoot_pairs(
 }
 
 pub struct ReshootMapperOptions<'a> {
+    pub allow_two_view_tracks: bool,
     pub images: &'a Path,
     pub input: Option<&'a Path>,
     pub output: &'a Path,
@@ -1096,7 +1104,7 @@ pub async fn map_reshoot(
         options.images,
         options.input,
         options.output,
-        false,
+        options.allow_two_view_tracks,
     );
     args.extend([
         "--Mapper.image_list_path".into(),

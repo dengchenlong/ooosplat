@@ -1,6 +1,18 @@
 import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
 
+it("centers sampling independently of its captions and keeps preview speed outside the scrollable statistics", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  expect(css.match(/\.frame-sampling-control \.field-label-row\s*\{[^}]+\}/)?.[0]).toContain("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)");
+  expect(css.match(/\.frame-sampling-control label\s*\{[^}]+\}/)?.[0]).toContain("color: #7f8999");
+  expect(css.match(/\.preview-status-items\s*\{[^}]+\}/)?.[0]).toContain("overflow-x: auto");
+  expect(css.match(/\.preview-roam-speed\s*\{[^}]+\}/)?.[0]).toContain("flex: 0 0 auto");
+  expect(css.match(/\.preview-roam-speed input\s*\{[^}]+\}/)?.[0]).toContain("height: 18px");
+  for (const pseudo of ['webkit-slider-runnable-track', 'moz-range-track']) {
+    expect(css.match(new RegExp(`\\.preview-roam-speed input::-${pseudo}\\s*\\{[^}]+\\}`))?.[0]).toContain('height: 2px');
+  }
+});
+
 it("keeps topbar controls frameless and changes only color on hover, preserving keyboard focus", () => {
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   const rule = (selector: string) => css.match(new RegExp(`${selector}\\s*\\{([^}]+)\\}`))?.[1];

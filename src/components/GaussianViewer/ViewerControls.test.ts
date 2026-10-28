@@ -600,6 +600,37 @@ describe("focused perspective WASD flight", () => {
     } finally { s.done(); }
   });
 
+  it.each([0.1, 0.5, 1, 2, 3, 4, 5])("applies multiplier %s without changing zoom, orientation or frame scheduling", multiplier => {
+    const s = flight();
+    try {
+      const start = s.controls.snapshot();
+      s.controls.setRoamSpeed(multiplier);
+      expect(s.frames.size).toBe(0);
+      s.key("keydown", "KeyW"); s.advance(16); s.key("keyup", "KeyW");
+      const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...start.target)).length();
+      expect(moved).toBeCloseTo(.15 * multiplier * 2 * start.distance * Math.tan(start.fov! * Math.PI / 360) * .016, 7);
+      expect(s.controls.snapshot().distance).toBe(start.distance);
+      expect(s.controls.snapshot().yaw).toBe(start.yaw);
+      expect(s.frames.size).toBe(0);
+    } finally { s.done(); }
+  });
+
+  it("reads speed changes during motion and retains Shift's three-times factor", () => {
+    const s = flight();
+    try {
+      s.key("keydown", "KeyW", { shiftKey: true });
+      const start = new Vec3(...s.controls.snapshot().target);
+      s.advance(16); const first = new Vec3(...s.controls.snapshot().target);
+      s.controls.setRoamSpeed(2); s.advance(32);
+      const second = new Vec3(...s.controls.snapshot().target);
+      expect(second.clone().sub(first).length() / first.clone().sub(start).length()).toBeCloseTo(2, 7);
+      s.key("keyup", "KeyW");
+      s.controls.setRoamSpeed(NaN); s.controls.restore({ ...s.controls.snapshot(), target: [0, 0, 0] });
+      s.key("keydown", "KeyW"); s.advance(48);
+      expect(new Vec3(...s.controls.snapshot().target).length()).toBeCloseTo(first.clone().sub(start).length() / 3, 7);
+    } finally { s.done(); }
+  });
+
   it.each([
     [0, 0, 0], [47, 70, 90], [-135, -70, -90],
     [90, 89.999, 180], [47, 90, 90], [-135, -90, -90],

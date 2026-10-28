@@ -130,6 +130,14 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .field-label { display: block; margin-bottom: 11px; color: #515b6d; font-size: 13px; font-weight: 700; }
 .field-label-row { min-height: 20px; margin-bottom: 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field-label-row .field-label { margin-bottom: 0; }
+.frame-sampling-control { margin-bottom: 16px; }
+.frame-sampling-control .field-label-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); font-size: 12px; margin-bottom: 8px; }
+.frame-sampling-control label { color: #7f8999; justify-self: start; }
+.frame-sampling-control output { justify-self: center; font-variant-numeric: tabular-nums; color: var(--blue, #215bff); }
+.frame-sampling-control .field-label-row button { justify-self: end; }
+.frame-sampling-control button { font-size: 11px; color: inherit; background: none; border: 0; padding: 2px 0; cursor: pointer; }
+.frame-sampling-control button:disabled { opacity: .45; cursor: default; }
+.frame-sampling-control input[type="range"] { width: 100%; margin: 0; accent-color: #215bff; cursor: pointer; }
 .input-label-row { justify-content: flex-start; gap: 6px; }
 .capture-help { position: relative; display: inline-flex; align-items: center; }
 .capture-help-trigger { width: 20px; height: 20px; padding: 0; display: grid; place-items: center; color: #7f8999; background: transparent; border: 0; cursor: help; }
@@ -708,7 +716,20 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .transform-field input { width: 100%; height: 28px; padding: 0 7px; color: #273247; background: rgba(255, 255, 255, .55); border: 1px solid #c8d0dc; font: 10px/1 "Cascadia Mono", monospace; }
 .transform-field input.invalid { color: #8b2e28; background: #fff1ef; border-color: #d58f87; }
 .transform-field input:focus { outline: 0; border-color: var(--blue); background: #f7f9ff; }
-.preview-statusbar { flex: 0 0 auto; min-height: 32px; padding: 5px 10px; display: flex; align-items: center; gap: 13px; overflow-x: auto; color: #aeb9ca; background: #202735; font: 9px/1.25 "Cascadia Mono", "Microsoft YaHei UI", monospace; white-space: nowrap; }
+.preview-statusbar { flex: 0 0 auto; min-height: 32px; padding: 5px 10px; display: flex; align-items: center; gap: 13px; min-width: 0; color: #aeb9ca; background: #202735; font: 9px/1.25 "Cascadia Mono", "Microsoft YaHei UI", monospace; white-space: nowrap; }
+.preview-status-items { display: flex; align-items: center; gap: 13px; flex: 1 1 0; min-width: 0; overflow-x: auto; }
+.preview-status-items > * { flex-shrink: 0; }
+.preview-roam-speed { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.preview-roam-speed label { color: #aeb9ca; }
+.preview-roam-speed input { appearance: none; -webkit-appearance: none; width: 110px; height: 18px; margin: 0; background: transparent; cursor: pointer; }
+.preview-roam-speed input::-webkit-slider-runnable-track { height: 2px; border-radius: 1px; background: linear-gradient(to right, #6f91df var(--roam-progress), #596476 var(--roam-progress)); }
+.preview-roam-speed input::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 10px; height: 10px; margin-top: -4px; border: 0; border-radius: 50%; background: #6f91df; }
+.preview-roam-speed input::-moz-range-track { height: 2px; border-radius: 1px; background: linear-gradient(to right, #6f91df var(--roam-progress), #596476 var(--roam-progress)); }
+.preview-roam-speed input::-moz-range-thumb { width: 10px; height: 10px; border: 0; border-radius: 50%; background: #6f91df; }
+.preview-roam-speed input:disabled { cursor: not-allowed; }
+.preview-roam-speed output { min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
+.preview-roam-speed.is-disabled { opacity: .45; }
+.preview-roam-speed input:focus-visible, .frame-sampling-control input:focus-visible { outline: 2px solid rgba(30, 92, 255, .65); outline-offset: 2px; }
 .preview-statusbar span { display: inline-flex; align-items: center; gap: 5px; }
 .preview-statusbar b { color: #6f91df; font-size: 8px; letter-spacing: .06em; }
 .preview-statusbar .save-state.saved { color: #89d2ac; }

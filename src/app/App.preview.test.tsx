@@ -305,7 +305,7 @@ describe("App preview workspace", () => {
     await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
     expect(container.querySelector('.preflight-dialog')).toBeNull();
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
-    expect(mocks.startPipeline).toHaveBeenCalledWith('E:/Download/LocalSend/IMG_8023.MOV', 'balanced', 'E:\\Projects', true, expect.any(String), 'auto', 'phone-mov', 'exhaustive');
+    expect(mocks.startPipeline).toHaveBeenCalledWith('E:/Download/LocalSend/IMG_8023.MOV', 'balanced', 'E:\\Projects', true, expect.any(String), 'auto', 'phone-mov', 'exhaustive', { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
   });
 
   it("requires an inline choice for ambiguous ERP and never opens a projection dialog", async () => {
@@ -326,7 +326,7 @@ describe("App preview workspace", () => {
     await act(async () => container.querySelector<HTMLButtonElement>(".primary-action")!.click()); await flush();
     expect(container.querySelector('.preflight-dialog')).toBeNull();
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
-    expect(mocks.startPipeline.mock.calls[0].slice(5)).toEqual(['perspective', 'source-A', 'exhaustive']);
+    expect(mocks.startPipeline.mock.calls[0].slice(5, 8)).toEqual(['perspective', 'source-A', 'exhaustive']);
   });
 
   it("keeps settings available and persists the runtime monitor preference locally", async () => {
@@ -385,7 +385,32 @@ describe("App preview workspace", () => {
     await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
     await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
     expect(container.querySelector('.preflight-dialog')).toBeNull();
-    expect(mocks.startPipeline.mock.calls.at(-1)?.slice(5)).toEqual(['equirectangular', 'confirmed', 'exhaustive']);
+    expect(mocks.startPipeline.mock.calls.at(-1)?.slice(5, 8)).toEqual(['equirectangular', 'confirmed', 'exhaustive']);
+  });
+
+  it('replans manual base sampling from cached metadata, resets on quality change, and does not replan retry consent', async () => {
+    const video = { duration:60,width:1920,height:1080,fps:30,totalFrames:1800,hasAlpha:false };
+    const projectionDetection = {sourceIdentity:'sampling-input',confirmedErp:false,requiresChoice:false,supportedErp:false,reason:'',previewJpeg:[]};
+    mocks.selectVideo.mockResolvedValueOnce('E:/sampling.mp4');
+    const metadata = {inputType:'video',video,projectionDetection,imageSequence:null,plan:{estimatedFrames:480}};
+    mocks.probeAndPlan.mockResolvedValue(metadata);
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('26.7%');
+    const slider = container.querySelector<HTMLInputElement>('.frame-sampling-control input')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(slider,'8');
+      slider.dispatchEvent(new Event('input',{bubbles:true}));
+      slider.dispatchEvent(new Event('change',{bubbles:true}));
+    }); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('70.0%');
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[3]).toMatchObject({video,projectionDetection});
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[5]).toEqual({version:3,autoRetryEnabled:true,frameSamplingRatio:.7});
+    const calls = mocks.probeAndPlan.mock.calls.length;
+    await act(async () => container.querySelector<HTMLButtonElement>('.planner-switch')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(calls);
+    await act(async () => container.querySelectorAll<HTMLButtonElement>('.quality-option')[2].click()); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('40.0%');
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[5]).toEqual({version:3,autoRetryEnabled:false,frameSamplingRatio:null});
   });
 
   it.each(['perspective', 'equirectangular'] as const)('replans quality without redetecting %s or resetting the chosen type', async projection => {
@@ -399,7 +424,7 @@ describe("App preview workspace", () => {
     let finish!: (value: unknown) => void;
     mocks.probeAndPlan.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     await act(async () => container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click()); await flush();
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector('.media-source-status.checking')).toBeNull();
     expect(container.querySelector<HTMLSelectElement>('.video-type-select')?.value).toBe(projection);
     expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(true);
@@ -408,14 +433,15 @@ describe("App preview workspace", () => {
     expect(mocks.probeAndPlan).toHaveBeenCalledTimes(2);
     mocks.probeAndPlan.mockResolvedValueOnce({ ...probe, plan: { estimatedFrames: 80 } });
     await act(async () => finish(probe)); await flush();
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'high', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'high', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector<HTMLSelectElement>('.video-type-select')?.value).toBe(projection);
     expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
     await act(async () => container.querySelector<HTMLButtonElement>('.quality-option.selected')!.click()); await flush();
     expect(mocks.probeAndPlan).toHaveBeenCalledTimes(3);
     mocks.probeAndPlan.mockResolvedValueOnce(probe);
     await act(async () => container.querySelector<HTMLButtonElement>('.planner-switch')!.click()); await flush();
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'high', false, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(3);
+    expect(container.querySelector('.planner-switch')?.getAttribute('aria-checked')).toBe('false');
   });
 
   it('finishes the initial video detection once and plans with the latest quality', async () => {
@@ -431,7 +457,7 @@ describe("App preview workspace", () => {
     expect(container.querySelector('.media-source-status.checking')).not.toBeNull();
     mocks.probeAndPlan.mockResolvedValueOnce(probe);
     await act(async () => finish(probe)); await flush();
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector('.media-source-status.checking')).toBeNull();
     expect(container.querySelector('.media-source-status')?.textContent).toContain('已识别完整 ERP');
   });
@@ -744,7 +770,7 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(mocks.classifyDroppedInput).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov");
-    expect(mocks.probeAndPlan).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov", "balanced", true, undefined, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov", "balanced", true, undefined, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector(".draft-row .project-path")?.textContent).toContain("测试 clip.mov");
   });
 
@@ -850,7 +876,7 @@ describe("App preview workspace", () => {
     await act(async () => planner.click());
     await flush();
     expect(planner.getAttribute("aria-checked")).toBe("false");
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith("E:\\Media\\next.mp4", "balanced", false, undefined, expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith("E:\\Media\\next.mp4", "balanced", true, undefined, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     await act(async () => container.querySelector<HTMLButtonElement>(".group-add-action")?.click());
     expect(container.querySelector<HTMLButtonElement>(".planner-switch")?.getAttribute("aria-checked")).toBe("true");
 
@@ -1053,7 +1079,7 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".reshoot-task-page .planner-switch em")).toBeNull();
   });
 
-  it("defaults optimization to the source value but allows changing it", async () => {
+  it("defaults automatic retry to enabled independently of legacy source optimization", async () => {
     mocks.inspectReshootSource.mockResolvedValueOnce({
       projectId: project.id,
       projectName: project.name,
@@ -1073,7 +1099,7 @@ describe("App preview workspace", () => {
 
     const planner = container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch");
     expect(planner?.disabled).toBe(false);
-    expect(planner?.getAttribute("aria-checked")).toBe("false");
+    expect(planner?.getAttribute("aria-checked")).toBe("true");
     expect(planner?.textContent).not.toContain("继承源任务");
   });
 
@@ -1138,7 +1164,7 @@ describe("App preview workspace", () => {
     await act(async () => container.querySelector<HTMLInputElement>(`.preflight-dialog input[value="${cameraRelation}"]`)!.click());
     await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer .primary-action')!.click()); await flush();
     expect(mocks.startReshootPipeline).toHaveBeenCalledTimes(1);
-    expect(mocks.startReshootPipeline).toHaveBeenCalledWith(expect.objectContaining({plannerEnabled:allowFallback,reshootOptions:expect.objectContaining({condition:'good',cameraRelation,allowFallback,sourceIdentity:'source-v1',inputIdentity:'input-v1',projection:'perspective'})}));
+    expect(mocks.startReshootPipeline).toHaveBeenCalledWith(expect.objectContaining({plannerEnabled:true,generationPolicy:expect.objectContaining({autoRetryEnabled:allowFallback}),reshootOptions:expect.objectContaining({condition:'good',cameraRelation,allowFallback,sourceIdentity:'source-v1',inputIdentity:'input-v1',projection:'perspective'})}));
   });
 
   it("probes Alpha reshoot media and preserves a backend incompatibility refusal", async () => {
@@ -1165,7 +1191,7 @@ describe("App preview workspace", () => {
     await act(async () => { videoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
 
-    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video", "balanced", true);
+    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video", "balanced", true, { version: 3, autoRetryEnabled: true, frameSamplingRatio: null }, undefined);
     expect(container.querySelector(".reshoot-plan.incompatible")?.textContent).toContain("1080 × 1920");
     expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .primary-action")?.disabled).toBe(true);
   });
@@ -1788,7 +1814,7 @@ describe("App preview workspace", () => {
     await act(async()=>{const select=container.querySelector<HTMLSelectElement>('select.video-type-select')!;select.value='equirectangular';select.dispatchEvent(new Event('change',{bubbles:true}));});
     mocks.probeAndPlan.mockResolvedValueOnce({...metadata,plan:{estimatedFrames:94}});
     await act(async()=>container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click());await flush();
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/Ballintoy/Input','fast',true,metadata,expect.any(Function));
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/Ballintoy/Input','fast',true,metadata,expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector<HTMLSelectElement>('select.video-type-select')?.value).toBe('equirectangular');
     expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
     expect(container.querySelector('.preflight-dialog')).toBeNull();

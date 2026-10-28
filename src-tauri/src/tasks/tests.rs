@@ -1,4 +1,84 @@
 use super::*;
+
+#[test]
+fn generation_defaults_are_not_retry_consent_and_invalid_ratios_are_rejected() {
+    let defaults = generation_parameters(None).unwrap();
+    assert_eq!(defaults["generationPolicy"]["autoRetryEnabled"], true);
+    assert_eq!(defaults["generationPolicy"]["version"], 3);
+    let migrated = generation_parameters(Some(serde_json::json!({"generationPolicy":{"version":1,"autoRetryEnabled":false,"frameSamplingRatio":0.5}}))).unwrap();
+    assert_eq!(migrated["generationPolicy"]["version"], 3);
+    assert_eq!(migrated["generationPolicy"]["autoRetryEnabled"], false);
+    let off=generation_parameters(Some(serde_json::json!({"generationPolicy":{"autoRetryEnabled":false,"frameSamplingRatio":0.333},"reshootOptions":{"allowFallback":true}}))).unwrap();
+    assert_eq!(off["generationPolicy"]["frameSamplingRatio"], 0.333);
+    assert_eq!(off["reshootOptions"]["allowFallback"], false);
+    // Explicit old API refusal is not silently widened by a new default.
+    let legacy = generation_parameters(Some(
+        serde_json::json!({"reshootOptions":{"allowFallback":false}}),
+    ))
+    .unwrap();
+    assert_eq!(legacy["generationPolicy"]["autoRetryEnabled"], false);
+    for ratio in [0., -1., 1.1] {
+        assert!(generation_parameters(Some(
+            serde_json::json!({"generationPolicy":{"frameSamplingRatio":ratio}})
+        ))
+        .is_err());
+    }
+    assert!(generation_parameters(Some(serde_json::json!("invalid"))).is_err());
+}
+
+#[tokio::test]
+async fn manual_retry_before_project_creation_starts_a_new_run_without_changing_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("input.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let task=service.create(None,input,Quality::Fast,root.path().join("projects"),false,"gui",None,Some(serde_json::json!({"generationPolicy":{"autoRetryEnabled":false,"frameSamplingRatio":0.5}}))).await.unwrap();
+    *service.executor.lock().unwrap() = Some(Arc::new(|task, _| {
+        Box::pin(async move {
+            assert!(task.planner_enabled);
+            assert!(!task.generation_policy.unwrap().auto_retry_enabled);
+            Err(crate::error::SplatError::Process(
+                "fixture fails before project creation".into(),
+            ))
+        })
+    }));
+    let first = service
+        .start(task.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    service.wait(task.task_id).await.unwrap();
+    let second = service
+        .retry_failed(
+            task.task_id,
+            first.run_id.unwrap(),
+            default_engine_paths(None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(second.accepted);
+    assert_ne!(first.run_id, second.run_id);
+    let finished = service.wait(task.task_id).await.unwrap();
+    assert_eq!(finished.runs.len(), 2);
+    assert_eq!(finished.runs[1].kind, "retry");
+    assert_eq!(
+        finished.generation_policy.unwrap().frame_sampling_ratio,
+        Some(0.5)
+    );
+    assert!(!finished.automatically_retried);
+    assert!(
+        !service
+            .retry_failed(
+                task.task_id,
+                first.run_id.unwrap(),
+                default_engine_paths(None),
+                None
+            )
+            .await
+            .unwrap()
+            .accepted
+    );
+}
 use crate::pipeline::runner::default_engine_paths;
 
 type RecordedUpdates = Arc<SyncMutex<Vec<TaskUpdate>>>;
@@ -44,7 +124,7 @@ async fn current_failure_status_and_classification_survive_task_restart() {
         })
     }));
     service
-        .start_inner(task.task_id, default_engine_paths(None), None, false)
+        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
         .await
         .unwrap();
     let finished = tokio::time::timeout(
@@ -105,6 +185,8 @@ fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
         last_engine: None,
         last_exit_code: None,
         error: None,
+        brush_executions: Vec::new(),
+        current_brush_execution: None,
     });
     run
 }
@@ -119,6 +201,133 @@ fn notification_event(sequence: u64, kind: crate::pipeline::EventKind) -> Pipeli
     event.sequence = sequence;
     event.elapsed_ms = sequence;
     event
+}
+
+#[tokio::test]
+async fn brush_executions_survive_runtime_clear_and_are_isolated_per_attempt_and_run() {
+    use crate::pipeline::{
+        event::PipelineOperation, runtime::RuntimeTracker, EventKind, PipelineEngine,
+    };
+    let (_root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let initial =
+        crate::presets::resolve_brush_training_preset(Quality::High, true, Some(8192), 3840, 1000);
+    let mut checkpoint = crate::project::PipelineStateFile::created(Quality::High);
+    checkpoint.brush_training.initial_resolved = Some(initial);
+    checkpoint.brush_training.resolved = Some(initial);
+    service.on_runner_update(
+        task.task_id,
+        run,
+        RunnerUpdate::Configuration(checkpoint_snapshot(&checkpoint)),
+    );
+    let mut event = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.0, "start");
+    event.sequence = 1;
+    event.engine = Some(PipelineEngine::Brush);
+    event.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    service.on_event(task.task_id, run, event.clone());
+    let mut runtime = RuntimeTracker::new();
+    runtime.snapshot.process_id = 100;
+    event.sequence = 2;
+    event.kind = EventKind::Runtime;
+    event.runtime = Some(runtime.snapshot.clone());
+    service.on_event(task.task_id, run, event.clone());
+    runtime.line("GPU initialization completed: backend=Vulkan device=NVIDIA GPU type=DiscreteGpu driver=NVIDIA driver_info=616.92", std::time::Instant::now(), true);
+    event.sequence = 3;
+    event.runtime = Some(runtime.snapshot.clone());
+    service.on_event(task.task_id, run, event.clone());
+    service.on_runner_update(
+        task.task_id,
+        run,
+        RunnerUpdate::ProcessExited {
+            engine: PipelineEngine::Brush,
+            exit_code: Some(101),
+        },
+    );
+    service.on_runner_update(task.task_id, run, RunnerUpdate::BrushPreparation);
+    let first = service.get(task.task_id).await.unwrap();
+    assert_eq!(first.runs[0].current_brush_execution, None);
+    assert_eq!(
+        first.runs[0].brush_executions[0]
+            .device
+            .as_ref()
+            .unwrap()
+            .name,
+        "NVIDIA GPU"
+    );
+    assert_eq!(first.runs[0].brush_executions[0].exit_code, Some(101));
+    let mut retry = initial;
+    retry.preset.max_splats = Some(800_000);
+    checkpoint.brush_training.resolved = Some(retry);
+    checkpoint.brush_training.oom_retry_used = true;
+    service.on_runner_update(
+        task.task_id,
+        run,
+        RunnerUpdate::Configuration(checkpoint_snapshot(&checkpoint)),
+    );
+    event.sequence = 4;
+    event.kind = EventKind::Stage;
+    event.operation = Some(PipelineOperation { id: 2, attempt: 2 });
+    event.runtime = None;
+    service.on_event(task.task_id, run, event.clone());
+    let mut second = RuntimeTracker::new();
+    second.snapshot.process_id = 101;
+    event.sequence = 5;
+    event.kind = EventKind::Runtime;
+    event.runtime = Some(second.snapshot);
+    service.on_event(task.task_id, run, event.clone());
+    // A late first-attempt sample and a foreign run must not rewrite either record.
+    event.sequence = 6;
+    event.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    event.runtime = Some(runtime.snapshot);
+    service.on_event(task.task_id, run, event.clone());
+    service.on_event(task.task_id, Uuid::new_v4(), event);
+    let mut exporting = PipelineEvent::mapped(PipelineStage::Exporting, 0.0, "publish");
+    exporting.sequence = 7;
+    exporting.operation = Some(PipelineOperation { id: 3, attempt: 0 });
+    service.on_event(task.task_id, run, exporting);
+    let saved = service.get(task.task_id).await.unwrap();
+    assert!(saved.runtime.is_none());
+    assert_eq!(saved.runs[0].brush_executions.len(), 2);
+    assert!(saved.runs[0].brush_executions[1].device.is_none());
+    assert_eq!(saved.runs[0].current_brush_execution, Some(1));
+    assert_eq!(
+        saved.runs[0].brush_executions[0].configuration,
+        Some(initial)
+    );
+    assert_eq!(saved.runs[0].brush_executions[1].configuration, Some(retry));
+    service.persist().await.unwrap();
+    let restored = TaskService::at(service.root.clone())
+        .get(task.task_id)
+        .await
+        .unwrap();
+    assert_eq!(restored.runs[0].brush_executions.len(), 2);
+    let mut old = serde_json::to_value(&saved.runs[0]).unwrap();
+    old.as_object_mut().unwrap().remove("brush_executions");
+    old.as_object_mut()
+        .unwrap()
+        .remove("current_brush_execution");
+    let old: TaskRun = serde_json::from_value(old).unwrap();
+    assert!(old.brush_executions.is_empty());
+
+    // Cancellation has no ProcessExited callback, but must still freeze this attempt.
+    let runner = Arc::new(PipelineRunner::new(default_engine_paths(None), |_| {}));
+    service
+        .finish(
+            task.task_id,
+            run,
+            runner,
+            Err(crate::error::SplatError::Cancelled),
+        )
+        .await;
+    let cancelled = service.get(task.task_id).await.unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert!(cancelled.runs[0]
+        .brush_executions
+        .iter()
+        .all(|v| v.ended_at.is_some()));
+    assert_eq!(cancelled.runs[0].brush_executions[0].exit_code, Some(101));
+    assert_eq!(cancelled.runs[0].brush_executions[1].exit_code, None);
+    assert!(cancelled.error.unwrap().failure_id.is_none());
 }
 
 #[tokio::test]
@@ -750,7 +959,10 @@ async fn image_matching_request_survives_restart_and_cannot_change_on_retry() {
             .unwrap();
         let reopened = TaskService::at(root.path().join("registry"));
         let restored = reopened.get(task.task_id).await.unwrap();
-        assert_eq!(restored.request_parameters, Some(parameters));
+        assert_eq!(
+            restored.request_parameters,
+            Some(generation_parameters(Some(parameters)).unwrap())
+        );
         assert_eq!(
             restored.input_type,
             crate::project::ProjectInputType::Images
@@ -794,7 +1006,7 @@ async fn changed_video_identity_is_rejected_before_starting_a_run() {
         .unwrap();
     std::fs::write(&input, b"changed input size").unwrap();
     let error = service
-        .start_inner(task.task_id, default_engine_paths(None), None, false)
+        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
         .await
         .unwrap_err();
     assert_eq!(error.code, "INPUT_CHANGED");
@@ -1105,6 +1317,8 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
         last_engine: None,
         last_exit_code: None,
         error: None,
+        brush_executions: Vec::new(),
+        current_brush_execution: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -1187,6 +1401,8 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
         last_engine: None,
         last_exit_code: None,
         error: None,
+        brush_executions: Vec::new(),
+        current_brush_execution: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -1479,7 +1695,10 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
             let mut records = service.records();
             let task = records.tasks.get_mut(&task.task_id).unwrap();
             task.project_id = Some(Uuid::new_v4());
-            task.status = TaskStatus::Failed;
+            // Model an interrupted legacy task, not a new-policy failed retry.
+            task.status = TaskStatus::Interrupted;
+            task.planner_enabled = enabled;
+            task.request_parameters = None;
         }
         *service.executor.lock().unwrap() = Some(Arc::new(move |task, runner| {
             Box::pin(async move {
@@ -1511,6 +1730,7 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
                 default_engine_paths(None),
                 Some(telemetry.clone()),
                 resume,
+                None,
             )
             .await
             .unwrap();
@@ -1571,8 +1791,9 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
                 .to_owned()
         ));
         let p = &evaluation["properties"];
-        assert_eq!(p["plannerEnabled"], enabled);
-        assert_eq!(p["plannerVersion"].is_null(), !enabled);
+        let expected_enabled = !resume || enabled;
+        assert_eq!(p["plannerEnabled"], expected_enabled);
+        assert_eq!(p["plannerVersion"].is_null(), !expected_enabled);
         assert_eq!(p["runKind"], if resume { "resume" } else { "new" });
         assert_eq!(p["inputType"], if is_images { "images" } else { "video" });
         assert_eq!(p["framePlan"]["sourceWidth"], 3840);
@@ -1688,6 +1909,8 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
         error: None,
         last_engine: None,
         last_exit_code: None,
+        brush_executions: Vec::new(),
+        current_brush_execution: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,

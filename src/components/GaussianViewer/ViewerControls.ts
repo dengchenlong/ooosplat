@@ -1,5 +1,6 @@
 import { BoundingBox, Entity, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Quat, Vec3, type CameraComponent } from "playcanvas";
 import type { GaussianOrthographicView } from "../../types/pipeline";
+import { DEFAULT_ROAM_SPEED, validRoamSpeed } from "./RoamPreferences";
 
 const DEFAULT_YAW = 35;
 const DEFAULT_PITCH = 22;
@@ -61,6 +62,7 @@ export class ViewerControls {
   private projectionOffset: [number, number] = [0, 0];
   private projectionScaleX = 1;
   private roamingEnabled = false;
+  private roamSpeed = DEFAULT_ROAM_SPEED;
   private readonly keys = new Set<string>();
   private roamFrame = 0;
   private roamLastAt = 0;
@@ -153,6 +155,16 @@ export class ViewerControls {
   setRoamingEnabled(value: boolean) {
     this.roamingEnabled = value;
     if (!value) { this.stopRoaming(); if (this.locating || this.leveling) this.stopNavigation(); }
+  }
+
+  setRoamSpeed(value: number) {
+    this.roamSpeed = validRoamSpeed(value) ? value : DEFAULT_ROAM_SPEED;
+  }
+
+  focus(): boolean {
+    if (this.destroyed || !this.enabled) return false;
+    this.canvas.focus({ preventScroll: true });
+    return document.activeElement === this.canvas;
   }
 
   get cameraDistance() {
@@ -568,7 +580,7 @@ export class ViewerControls {
       -Math.cos(yaw) * forward - Math.sin(yaw) * right,
     );
     if (movement.lengthSq() > 0) {
-      movement.normalize().mulScalar(ROAM_VISIBLE_HEIGHT_PER_SECOND * this.visibleHeight() * dt * (this.shifted ? 3 : 1));
+      movement.normalize().mulScalar(ROAM_VISIBLE_HEIGHT_PER_SECOND * this.roamSpeed * this.visibleHeight() * dt * (this.shifted ? 3 : 1));
       this.target.add(movement);
       // A rigid translation does not need lookAt again; at a vertical view its
       // tiny horizontal direction components can otherwise perturb the roll.

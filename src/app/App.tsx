@@ -3,6 +3,7 @@ import { NewTaskRow } from "../components/NewTaskRow";
 import { ProjectRow } from "../components/ProjectRow";
 import { ProjectResultStats } from "../components/ProjectResultStats";
 import { TaskConfiguration } from "../components/TaskConfiguration";
+import { FrameSamplingControl } from '../components/FrameSamplingControl';
 import { MediaSourceStatus } from '../components/MediaSourceStatus';
 import { EngineStatusPopover } from '../components/EngineStatusPopover';
 import { isProgressEvent, stagePercent } from '../lib/progressState';
@@ -48,7 +49,7 @@ import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
-import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
+import { createGenerationDraft, createReshootDraft, draftDisplayName, draftGenerationPolicy, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
 import { displayStatusForDraft, draftIsRunnable, draftProjectionReady, firstQueueInputIssue, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
 import { loadUiPreferences, saveUiPreferences } from "./uiPreferences";
 import { GenerationPreflightDialog, type PreflightSession } from '../components/GenerationPreflightDialog';
@@ -1104,6 +1105,8 @@ export function App() {
         // A pending probe/plan owns this draft until its result matches the latest settings.
         // Quality changes during detection must not launch another FFprobe process.
         for (;;) {
+          const settings = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+          const policy = settings ? draftGenerationPolicy(settings) : undefined;
           result = await probeAndPlan(path, quality, plannerEnabled, videoAnalysis, metadata => {
             if (inputAnalysisRevisions.current.get(draftId) !== revision) return;
             const current = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
@@ -1111,11 +1114,11 @@ export function App() {
             const changed = current.projectionAnswer && current.projectionAnswer.identity !== metadata.projectionDetection.sourceIdentity;
             updateDraft(draftId, { ...metadata, inputPlanning: true, ...(changed ? { projectionAnswer: null, videoProjection: 'auto' as const } : {}) });
             videoAnalysis = metadata;
-          });
+          }, policy);
           if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
           const latest = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
           if (!latest || latest.inputPath !== path) return false;
-          if (latest.quality === quality && latest.plannerEnabled === plannerEnabled) break;
+          if (latest.quality === quality && latest.frameSamplingRatio === policy?.frameSamplingRatio) break;
           quality = latest.quality;
           plannerEnabled = latest.plannerEnabled;
           videoAnalysis = result.projectionDetection?.sourceIdentity
@@ -1154,10 +1157,21 @@ export function App() {
           updateDraft(draftId, { error: source.reason ?? t("reshoot.ineligible"), inputChecking: false });
           return false;
         }
-        const settings = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
-        const plan = await probeReshootInput(sourceProjectId, path, inputType, settings?.quality, settings?.plannerEnabled);
+        let settings = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+        let cached = settings?.video && settings.projectionDetection ? {video:settings.video,projectionDetection:settings.projectionDetection} : undefined;
+        let plan: Awaited<ReturnType<typeof probeReshootInput>>;
+        for (;;) {
+          const policy = settings ? draftGenerationPolicy(settings) : undefined;
+          plan = await probeReshootInput(sourceProjectId, path, inputType, settings?.quality, true, policy, cached);
+          if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
+          const latest = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+          if (!latest || latest.inputPath !== path) return false;
+          if (latest.quality === settings?.quality && latest.frameSamplingRatio === policy?.frameSamplingRatio) break;
+          settings = latest;
+          cached = plan.video && plan.projectionDetection ? {video:plan.video,projectionDetection:plan.projectionDetection} : undefined;
+        }
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { reshootPlan: plan, projectionDetection: plan.projectionDetection ?? null, imageSequence: plan.imageSequence ?? null, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible"), inputChecking: false });
+        updateDraft(draftId, { reshootPlan: plan, video: plan.video ?? null, projectionDetection: plan.projectionDetection ?? null, imageSequence: plan.imageSequence ?? null, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible"), inputChecking: false });
         return plan.compatible;
       } catch (error) {
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
@@ -1179,7 +1193,7 @@ export function App() {
     if (!draft || draft.running) return false;
     queueRevisionRef.current += 1;
     updateDraft(draftId, {
-      ...(draft.inputPath !== path ? { videoProjection: "auto" as const, projectionDetection: null, projectionAnswer: null } : {}),
+      ...(draft.inputPath !== path ? { videoProjection: "auto" as const, projectionDetection: null, projectionAnswer: null, frameSamplingRatio: null } : {}),
       inputPath: path, inputType, video: null, imageSequence: null, plan: null, inputError: null,
       estimate: null, reshootPlan: null, error: null,
     });
@@ -1271,17 +1285,25 @@ export function App() {
   const chooseQuality = async (quality: Quality) => {
     if (!selectedDraft || selectedDraft.running || selectedDraft.quality === quality) return;
     queueRevisionRef.current += 1;
-    updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
+    updateDraft(selectedDraft.id, { quality, frameSamplingRatio: null, plan: null, estimate: null, error: null });
     if (selectedDraft.kind === "generation" && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled, true);
-    if (selectedDraft.kind === "reshoot") updateDraft(selectedDraft.id, { estimate: selectedDraft.reshootPlan?.estimate ?? null });
+    if (selectedDraft.kind === "reshoot" && selectedDraft.sourceProjectId && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyzeReshoot(selectedDraft.id, selectedDraft.sourceProjectId, selectedDraft.inputPath, selectedDraft.inputType);
   };
 
   const changePlannerEnabled = async () => {
     if (!selectedDraft || selectedDraft.running) return;
-    const enabled = !selectedDraft.plannerEnabled;
+    const enabled = !selectedDraft.autoRetryEnabled;
     queueRevisionRef.current += 1;
-    updateDraft(selectedDraft.id, { plannerEnabled: enabled, plannerDefaultPending: false, plan: null, estimate: null, error: null });
-    if (selectedDraft.kind === "generation" && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled, true);
+    updateDraft(selectedDraft.id, { autoRetryEnabled: enabled });
+  };
+
+  const changeFrameSampling = (ratio: number | null) => {
+    if (!selectedDraft || selectedDraft.running) return;
+    queueRevisionRef.current += 1;
+    updateDraft(selectedDraft.id, { frameSamplingRatio: ratio });
+    if (!selectedDraft.inputPath || selectedDraft.inputChecking) return;
+    if (selectedDraft.kind === 'generation') void analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, true, true);
+    else if (selectedDraft.sourceProjectId) void analyzeReshoot(selectedDraft.id, selectedDraft.sourceProjectId, selectedDraft.inputPath, selectedDraft.inputType);
   };
 
   const requestCancellation = async () => {
@@ -1346,7 +1368,7 @@ export function App() {
     let promoted = false;
     let nextIndex = 0;
     try {
-      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, draft.plannerEnabled, draft.id, resolvedProjection(taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft), draft.projectionDetection?.sourceIdentity, imageMatchingStrategy(draft, preflightAnswers));
+      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, true, draft.id, resolvedProjection(taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft), draft.projectionDetection?.sourceIdentity, imageMatchingStrategy(draft, preflightAnswers), draftGenerationPolicy(draft));
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -1581,7 +1603,7 @@ export function App() {
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
-      const finalPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, draft.quality, draft.plannerEnabled);
+      const finalPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, draft.quality, true, draftGenerationPolicy(draft), draft.video && draft.projectionDetection ? {video:draft.video,projectionDetection:draft.projectionDetection} : undefined);
       if (!finalPlan.compatible) {
         updateDraft(draft.id, { reshootPlan: finalPlan, error: finalPlan.incompatibilityReason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
@@ -1593,7 +1615,7 @@ export function App() {
       reshootAnswers = await confirmPreflight(collectPreflightQuestions([confirmedDraft]), t('generate.start'));
       if (!reshootAnswers) { if (autoRunNextRef.current) setAutoQueueEnabled(false); return; }
       const latestSource = await inspectReshootSource(draft.sourceProjectId);
-      const latestPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, confirmedDraft.quality, confirmedDraft.plannerEnabled);
+      const latestPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType, confirmedDraft.quality, true, draftGenerationPolicy(confirmedDraft), confirmedDraft.video && confirmedDraft.projectionDetection ? {video:confirmedDraft.video,projectionDetection:confirmedDraft.projectionDetection} : undefined);
       if (latestSource.sourceIdentity !== source.sourceIdentity || latestPlan.sourceIdentity !== finalPlan.sourceIdentity) throw new Error(t('preflight.changed'));
       const current = taskWorkspaceRef.current.drafts.find(item => item.id === draft.id);
       if (!current || current.inputChecking || preflightSnapshot(current) !== preflightSnapshot(confirmedDraft) || useAppStore.getState().projectsRoot !== store.projectsRoot) throw new Error(t('preflight.changed'));
@@ -1625,11 +1647,12 @@ export function App() {
         projectsRoot: store.projectsRoot,
         workspaceTaskId: draft.id,
         quality: confirmedDraft.quality,
-        plannerEnabled: confirmedDraft.plannerEnabled,
+        plannerEnabled: true,
+        generationPolicy: draftGenerationPolicy(confirmedDraft),
         reshootOptions: {
           condition: reshootAnswers![`${draft.id}:reshootCondition`] as import('../types/pipeline').ReshootCondition,
           cameraRelation: confirmedDraft.reshootSource!.projection === 'equirectangular' ? undefined : reshootAnswers![`${draft.id}:reshootCamera`] as import('../types/pipeline').ReshootCameraRelation,
-          allowFallback: confirmedDraft.plannerEnabled,
+          allowFallback: confirmedDraft.autoRetryEnabled,
           sourceIdentity: confirmedDraft.reshootSource!.sourceIdentity!,
           inputIdentity: confirmedDraft.reshootPlan!.sourceIdentity!,
           projection: confirmedDraft.reshootSource!.projection ?? 'perspective',
@@ -1808,7 +1831,7 @@ export function App() {
   const projectConfigurationDetails = selectedProject && projectDetail
     ? projectDetail.imported
       ? <ImportedProjectDetails detail={projectDetail} onRevealSource={() => void revealImportedSource(selectedProject.id).catch(error => setProjectActionError({ projectId: selectedProject.id, message: messageOf(error), occurredAt: Date.now() }))} onRelink={() => void relinkImportedSource(selectedProject.id)} />
-      : <TaskConfiguration active={selectedProject.status === "running"} reshootRecipe={projectDetail.reshootRecipe} sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} videoProjection={projectDetail.videoProjection} inputProjection={projectDetail.inputProjection} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
+      : <TaskConfiguration generationPolicy={projectDetail.generationPolicy} automaticallyRetried={projectDetail.automaticallyRetried} active={selectedProject.status === "running"} reshootRecipe={projectDetail.reshootRecipe} sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} videoProjection={projectDetail.videoProjection} inputProjection={projectDetail.inputProjection} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
     : null;
   const historicalTaskProgress = selectedProject && projectDetail
     ? projectDetail.imported || projectDetail.stage == null || projectDetail.progress == null
@@ -1903,14 +1926,15 @@ export function App() {
 
         <div className="form-section">
           <label className="field-label">{t("quality.label")}</label>
+          {selectedDraft.inputType === 'video' && <FrameSamplingControl video={selectedDraft.video} quality={selectedDraft.quality} value={selectedDraft.frameSamplingRatio} disabled={selectedDraft.running} onChange={changeFrameSampling} />}
           <div className="quality-settings">
             <div className="quality-list" role="radiogroup">
               {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                 <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
               </button>)}
             </div>
-            <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
-              <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
+            <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.autoRetryEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
+              <span><strong>{t("retry.label")}</strong><small>{t("retry.hint")}</small></span>
               <i aria-hidden="true"><span /></i>
             </button>
           </div>
@@ -1981,14 +2005,15 @@ export function App() {
 
           <div className="form-section">
             <div className="field-label-row"><label className="field-label">{t("quality.label")}</label></div>
+            {selectedDraft.inputType === 'video' && <FrameSamplingControl video={selectedDraft.video} quality={selectedDraft.quality} value={selectedDraft.frameSamplingRatio} disabled={selectedDraft.running} onChange={changeFrameSampling} />}
             <div className="quality-settings">
               <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>
                 {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                   <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
                 </button>)}
               </div>
-              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
-                <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
+              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.autoRetryEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
+                <span><strong>{t("retry.label")}</strong><small>{t("retry.hint")}</small></span>
                 <i aria-hidden="true"><span /></i>
               </button>
             </div>

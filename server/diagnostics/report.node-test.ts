@@ -7,6 +7,19 @@ function fixture() {
 }
 function request(value: unknown) { return new Request("https://example.invalid/api/telemetry/event", { method: "POST", headers: { "Content-Type": "application/json", "X-OOOSplat-Report": "diagnostic-v1" }, body: JSON.stringify(value) }); }
 
+test("existing report fields retain execution summaries and runtime GPU without a protocol or SQL change", async () => {
+  const report = fixture();
+  report.detail = "GPU OOM root cause\nBrush attempt 1: device=NVIDIA; totalMemoryMiB=8192; driver=616.92; max_splats=2000000\nBrush attempt 2: device=unknown";
+  report.environment.actualDevice = "NVIDIA";
+  report.environment.gpus[1] = { name: "NVIDIA", driverVersion: "616.92", totalMemoryMb: 8192, computeCapability: "8.6" };
+  let stored: unknown;
+  const handler = createDiagnosticReportHandler({ query: async (_sql, parameters) => { stored = JSON.parse(parameters[6] as string); } }, () => true);
+  assert.equal((await handler(request(report), "trusted-address")).status, 200);
+  assert.deepEqual(stored, report);
+  const unknown = { ...report, environment: { ...report.environment, actualDevice: null } };
+  assert.equal(validateDiagnosticReport(unknown), unknown);
+});
+
 test("strict allowlist excludes identifiers and hardware command extras", () => {
   assert.doesNotThrow(() => validateDiagnosticReport(fixture()));
   assert.throws(() => validateDiagnosticReport({ ...fixture(), installId: "private" }));

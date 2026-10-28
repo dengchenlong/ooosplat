@@ -351,6 +351,8 @@ pub struct FrameState {
     pub selected_frames: Vec<PlannedFrame>,
     #[serde(default)]
     pub candidate_frames: Vec<PlannedFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_source_frames: Option<u64>,
     #[serde(default)]
     pub rescue_max_frames: u64,
     #[serde(default)]
@@ -361,11 +363,17 @@ pub struct FrameState {
 #[serde(rename_all = "camelCase")]
 pub struct BrushTrainingCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fine_splat_budget: Option<crate::pipeline::splat_budget::FineSplatBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default)]
     pub oom_retry_used: bool,
+    #[serde(default)]
+    pub oom_retry_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_retry_source_count: Option<u64>,
 }
 
 impl From<&FramePlan> for FrameState {
@@ -382,6 +390,7 @@ impl From<&FramePlan> for FrameState {
             initial_extracted_frames: plan.estimated_frames,
             selected_frames: plan.selected_frames.clone(),
             candidate_frames: plan.candidate_frames.clone(),
+            bridge_source_frames: plan.bridge_source_frames,
             rescue_max_frames: plan.rescue_max_frames,
             minimum_frame_override_applied: plan.minimum_frame_override_applied,
         }
@@ -391,6 +400,12 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_cache_pending: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_transparency: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gps: Option<crate::reconstruction::gps::Checkpoint>,
     /// Frozen at creation. Legacy image projects retain exhaustive matching.
@@ -465,6 +480,15 @@ fn legacy_video_projection() -> crate::video::panorama::VideoProjection {
 }
 
 impl PipelineStateFile {
+    pub fn automatically_retried(&self) -> bool {
+        self.generation_policy.is_some()
+            && (self.brush_training.oom_retry_started
+                || self
+                    .reshoot
+                    .as_ref()
+                    .and_then(|r| r.recipe.as_ref())
+                    .is_some_and(|r| r.reconstruction_fallbacks > 0 || r.training_fallbacks > 0))
+    }
     pub fn created(preset: Quality) -> Self {
         Self::created_for(preset, ProjectInputType::Video)
     }
@@ -472,6 +496,9 @@ impl PipelineStateFile {
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
             // Older projects were always perspective. Never reinterpret their caches.
+            generation_policy: None,
+            retry_cache_pending: vec![],
+            actual_transparency: None,
             gps: None,
             temporary_png_focal: None,
             image_matching_strategy: ImageMatchingStrategy::default(),
@@ -501,6 +528,18 @@ impl PipelineStateFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_badge_requires_a_started_controlled_retry_and_stays_legacy_safe() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        assert!(!state.automatically_retried());
+        state.brush_training.oom_retry_used = true;
+        assert!(!state.automatically_retried());
+        state.brush_training.oom_retry_started = true;
+        assert!(state.automatically_retried());
+        state.generation_policy = None;
+        assert!(!state.automatically_retried());
+    }
     #[test]
     fn image_matching_strategy_is_frozen_and_legacy_defaults_to_exhaustive() {
         let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);

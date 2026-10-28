@@ -36,6 +36,15 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); window.localStorage.clear(); });
 
+it('shows new retry consent without waiting for a project detail and marks only actual completed retries', async () => {
+  await render(task({generation_policy:{version:1,autoRetryEnabled:false,frameSamplingRatio:.5},status:'created',stage:null,project_id:null}));
+  expect(container.querySelector('.planner-switch strong')?.textContent).toBe('自动重试');
+  expect(container.querySelector('.planner-switch')?.getAttribute('aria-checked')).toBe('false');
+  expect(container.textContent).not.toContain('已自动重试');
+  await render(task({generation_policy:{version:1,autoRetryEnabled:true,frameSamplingRatio:.5},status:'completed',automatically_retried:true,project_id:null}));
+  expect(container.textContent).toContain('已自动重试');
+});
+
 describe('restored shared task detail', () => {
   it('shows localized quiet notices as system logs without inventing counts', async () => {
     localStorage.setItem('ooo-splat-language', 'en');
@@ -141,7 +150,15 @@ describe('restored shared task detail', () => {
     expect(container.querySelector<HTMLButtonElement>('.cancel-action')!.disabled).toBe(true);
   });
 
-  it.each(['failed', 'cancelled', 'interrupted'] as const)('shows %s consistently without offering resume before a project/checkpoint exists', async status => {
+  it('explicitly retries a failed pre-project run using its run ID rather than pretending to resume a checkpoint', async () => {
+    await render(task({status:'failed',project_id:null,stage:null}));
+    expect(button('继续生成')).toBeDefined();
+    await act(async () => button('继续生成')!.click());
+    expect(mocks.start).toHaveBeenCalledWith('agent-1','run-1');
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'interrupted'] as const)('shows %s consistently without offering resume before a project/checkpoint exists', async status => {
     await render(task({ status, stage: null, estimated_progress: null }));
     expect(button('继续生成')).toBeUndefined();
     expect(container.querySelector('.cancel-action')).toBeNull();

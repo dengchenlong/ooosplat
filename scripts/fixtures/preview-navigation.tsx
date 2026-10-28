@@ -84,6 +84,34 @@ async function verify() {
   gizmoToggle.click(); await checkIdle("gizmo"); await snapshot("gizmo"); gizmoToggle.click(); await sleep(100);
   const camera = app.root.findByName("OOOSplat Preview Camera")!;
   const canvas = app.graphicsDevice.canvas;
+  const speed = () => document.querySelector<HTMLInputElement>('.preview-roam-speed input')!;
+  assert(speed() && !speed().disabled && speed().value === '1', 'Default perspective speed is not available');
+  const editField = document.querySelector<HTMLInputElement>('.transform-panel input[type="text"]')!;
+  editField.focus();
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(editField, String(Number(editField.value) + .01));
+  editField.dispatchEvent(new Event('input', { bubbles: true }));
+  await sleep(50);
+  editField.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', bubbles:true, cancelable:true }));
+  await waitFor(() => document.activeElement === canvas, `Committing an edit did not return canvas focus: active=${document.activeElement?.outerHTML.slice(0,300)}; overlay=${document.querySelector('.viewport-overlay')?.textContent}; state=${useGaussianTransformStore.getState().saveState}`);
+  const afterEditPosition = camera.getPosition().clone();
+  const editKey = new KeyboardEvent('keydown', {code:'KeyW',key:'w',bubbles:true,cancelable:true});
+  canvas.dispatchEvent(editKey);
+  assert(editKey.defaultPrevented, 'WASD was not accepted immediately after editing');
+  await waitFor(() => camera.getPosition().distance(afterEditPosition) > .0001, 'WASD after editing did not move');
+  canvas.dispatchEvent(new KeyboardEvent('keyup', {code:'KeyW',bubbles:true}));
+  const undo = button(locale === 'en' ? 'Undo' : '撤销')!;
+  undo.focus(); undo.click(); await sleep(50);
+  assert(document.activeElement === canvas, 'Undo did not return canvas focus');
+  const save = button(locale === 'en' ? 'Save edits' : '保存编辑');
+  if (save) { save.focus(); save.click(); await waitFor(() => !save.disabled && document.activeElement === canvas, 'Save did not unlock and return canvas focus'); }
+  speed().focus();
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(speed(), '2');
+  speed().dispatchEvent(new Event('input', {bubbles:true})); await sleep(50);
+  speed().dispatchEvent(new PointerEvent('pointerup', {bubbles:true}));
+  assert(document.activeElement === canvas && document.querySelector('.preview-roam-speed output')?.textContent === '2.0×', 'Speed adjustment/focus did not apply');
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(speed(), '1');
+  speed().dispatchEvent(new Event('input', {bubbles:true})); await sleep(50);
+  speed().dispatchEvent(new PointerEvent('pointerup', {bubbles:true}));
   // Synthetic PointerEvents cannot acquire native OS pointer capture. Keep capture
   // bookkeeping local in this harness; production pointer handlers remain unchanged.
   const captures = new Set<number>();
@@ -152,6 +180,7 @@ async function verify() {
     await sleep(400);
     await checkIdle(name, 250);
     assert(camera.camera!.projection === PROJECTION_ORTHOGRAPHIC, "Fixed view must remain orthographic until Locate is clicked");
+    assert(speed().disabled, 'Orthographic speed slider must be disabled');
     const atRest = camera.getPosition().clone();
     canvas.focus();
     const orthographicKey = new KeyboardEvent("keydown", { code: "KeyW", bubbles: true, cancelable: true });
@@ -276,6 +305,7 @@ async function verify() {
   const minimumFrameMs = Math.min(...animationTimes.slice(1).map((t, i) => t - animationTimes[i]));
   rendered.off();
   const proof = { renderer, locale, viewportWidth: innerWidth, viewportHeight: innerHeight, positionError, directionDot, focusReturned: true, immediateFlight: true,
+    editFocusReturned:true, immediateFlightAfterEdit:true, speedControl:true,
     idleChecks, baselineFrames, baselineMs: 500, minimumFrameMs, initialRightY, leveledRightY: camera.right.y,
     backendAdapter: (app.graphicsDevice as unknown as { unmaskedRenderer?: string }).unmaskedRenderer ?? null,
     animationSeconds, animationWallSeconds, animationFrames, videoSupported, videoFrameProgress, videoCancels, videoCommits,

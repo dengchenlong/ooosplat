@@ -96,6 +96,7 @@ try {
   // OS window dimensions include chrome/borders. Set the actual CSS viewport
   // before loading, so the 1100px minimum-width layout is not silently clipped.
   await call("Emulation.setDeviceMetricsOverride", { width: Number(width), height: 1050, deviceScaleFactor: 1, mobile: false });
+  await call("Page.bringToFront", {});
   capture = async name => {
     const screenshot = await call("Page.captureScreenshot", { format: "png" });
     await writeFile(path.join(out, `${name}.png`), Buffer.from(screenshot.data, "base64"));

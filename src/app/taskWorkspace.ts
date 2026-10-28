@@ -5,6 +5,8 @@ export const TASK_WORKSPACE_STORAGE_KEY = "ooo-splat-task-workspace-v1";
 export type TaskSelection = { kind: "draft" | "project" | "task"; id: string };
 
 export interface TaskDraft {
+  autoRetryEnabled: boolean;
+  frameSamplingRatio: number | null;
   gpsDetection?: { sourceIdentity: string; detected: boolean };
   gpsFallback?: string;
   videoProjection: import("../types/pipeline").VideoProjection;
@@ -41,7 +43,7 @@ interface PersistedWorkspace {
   schemaVersion: 1;
   nextOrdinal: number;
   selected: TaskSelection;
-  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running" | "projectionAnswer"> & { plannerEnabled?: boolean; videoProjection?: import("../types/pipeline").VideoProjection }>;
+  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running" | "projectionAnswer"> & { autoRetryEnabled?: boolean; frameSamplingRatio?: number | null; plannerEnabled?: boolean; videoProjection?: import("../types/pipeline").VideoProjection }>;
 }
 
 const newId = () => {
@@ -57,6 +59,7 @@ const newId = () => {
 
 export function createGenerationDraft(ordinal: number, plannerEnabled = true, plannerDefaultPending = false): TaskDraft {
   return {
+    autoRetryEnabled: true, frameSamplingRatio: null,
     videoProjection: "auto", projectionDetection: null,
     id: newId(), ordinal, kind: "generation", inputType: "video", inputPath: null,
     quality: "balanced", plannerEnabled, plannerDefaultPending, sourceProjectId: null, sourceProjectName: null,
@@ -94,6 +97,8 @@ export function loadTaskWorkspace(): { drafts: TaskDraft[]; selected: TaskSelect
       return ({
       ...createGenerationDraft(Number(draft.ordinal) || 1),
       ...draft,
+      autoRetryEnabled: typeof draft.autoRetryEnabled === 'boolean' ? draft.autoRetryEnabled : true,
+      frameSamplingRatio: typeof draft.frameSamplingRatio === 'number' && Number.isFinite(draft.frameSamplingRatio) && draft.frameSamplingRatio >= .001 && draft.frameSamplingRatio <= 1 ? draft.frameSamplingRatio : null,
       videoProjection: ["auto", "perspective", "equirectangular"].includes(draft.videoProjection ?? "") ? draft.videoProjection! : "auto",
       projectionAnswer: draft.projectionAnswer && typeof draft.projectionAnswer.identity === "string" && ["perspective", "equirectangular"].includes(draft.projectionAnswer.projection) ? draft.projectionAnswer : null,
       plannerEnabled: typeof draft.plannerEnabled === "boolean" ? draft.plannerEnabled : true,
@@ -129,7 +134,8 @@ export function saveTaskWorkspace(drafts: TaskDraft[], selected: TaskSelection, 
     schemaVersion: 1,
     nextOrdinal,
     selected,
-    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, plannerEnabled, plannerDefaultPending, sourceProjectId, sourceProjectName, linkedProjectId, running, videoProjection, projectionAnswer }) => ({
+    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, plannerEnabled, plannerDefaultPending, sourceProjectId, sourceProjectName, linkedProjectId, running, videoProjection, projectionAnswer, autoRetryEnabled, frameSamplingRatio }) => ({
+      autoRetryEnabled, frameSamplingRatio,
       videoProjection, projectionAnswer,
       id, ordinal, kind, inputType, inputPath, quality, sourceProjectId, sourceProjectName,
       linkedProjectId, running,
@@ -144,3 +150,5 @@ export function draftDisplayName(draft: TaskDraft, newTaskLabel: string, reshoot
   if (draft.inputPath) return draft.inputPath.split(/[\\/]/).at(-1) || newTaskLabel;
   return newTaskLabel;
 }
+
+export const draftGenerationPolicy = (draft: TaskDraft): import('../types/pipeline').GenerationPolicy => ({ version: 3, autoRetryEnabled: draft.autoRetryEnabled, frameSamplingRatio: draft.inputType === 'video' ? draft.frameSamplingRatio : null });

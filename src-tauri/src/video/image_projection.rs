@@ -633,6 +633,15 @@ pub fn checkpoint(
     quality: crate::presets::Quality,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<super::panorama::PanoramaCheckpoint> {
+    checkpoint_for_policy(source, quality, cancel, false)
+}
+
+pub fn checkpoint_for_policy(
+    source: &Path,
+    quality: crate::presets::Quality,
+    cancel: &tokio_util::sync::CancellationToken,
+    native: bool,
+) -> Result<super::panorama::PanoramaCheckpoint> {
     let scan = analyze(source)?;
     if !scan.detection.supported_erp {
         return Err(invalid());
@@ -640,9 +649,14 @@ pub fn checkpoint(
     let (cap, face) = match quality {
         crate::presets::Quality::Fast => (2048, 512),
         crate::presets::Quality::Balanced => (3072, 768),
+        crate::presets::Quality::High if native => (scan.info.width, scan.info.width / 4),
         crate::presets::Quality::High => (4096, 1024),
     };
-    let width = scan.info.width.min(cap) / 4 * 4;
+    let width = if native && quality == crate::presets::Quality::High {
+        scan.info.width
+    } else {
+        scan.info.width.min(cap) / 4 * 4
+    };
     validate_cache_size(scan.info.image_count, width, width / 2, face.min(width / 4))?;
     if (scan.info.width as u64)
         .checked_mul(scan.info.height as u64)
@@ -745,10 +759,8 @@ pub fn prepare(
 ) -> Result<super::image_sequence::PreparedImageSequence> {
     let records = config.image_sources.as_ref().ok_or_else(invalid)?;
     if config.sfm_width == 0
-        || config.sfm_width > 4096
         || config.sfm_height != config.sfm_width / 2
         || config.face_size == 0
-        || config.face_size > 1024
         || config.face_size > config.sfm_width / 4
     {
         return Err(invalid());

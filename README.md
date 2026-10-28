@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-blue?style=flat" alt="Release: v0.7.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><img src="https://img.shields.io/badge/release-v0.7.1-blue?style=flat" alt="Release: v0.7.1"></a>
   <a href="#系统要求"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.0"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLM
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.7.0 加入全景视频与图片生成、外部模型导入、多格式导出、水平 WASD 漫游和自动定位视角，支持图片顺序确认，并改进生成进度、相机控制与 PNG 焦距读取。
+> 0.7.1 更新默认生成、自动重试与精细档预算，加入分级抽帧和漫游调速，完善补拍、图片 GPS 辅助、导出及错误诊断。
 
 以下以当前 `main` 源码功能为准，安装包内容以对应版本说明为准。
 
@@ -56,17 +56,20 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **全景素材**：支持已拼接、单目、完整 360°×180° 的 2:1 ERP MP4 和图片文件夹；自动检测类型，无法确定时在素材框中选择。
 - **图片顺序确认**：普通及全景图片超过100张时，生成前询问拍摄顺序；已排序使用顺序匹配，未排序或100张及以下使用穷举匹配。
 - **图片 GPS**：识别内嵌定位信息，在通过校验的 Windows x64 路径中辅助匹配与重建，可靠时提供北向与米制尺度；信息不足自动沿用原流程。[范围及验证](docs/IMAGE_GPS.md)
-- **导入外部模型**：可从“已完成”分组导入标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT；完整 COLMAP 数据会自动关联，并在满足单相机条件时支持增量高清补拍。
-- **三种质量档位**：提供快速、均衡和精细档；自动优化会根据素材与显存选择合适的抽帧、分辨率和训练配置。
+- **导入外部模型**：可从“已完成”分组导入标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT；完整 COLMAP 数据会自动关联，通过兼容性校验后可补拍，外部文件保持只读。
+- **三种质量档位**：默认启用重建优化与自动补帧，视频可分级调整抽帧比例，手动比例任务最多额外补20%；精细档保留原始训练分辨率，普通素材按有效像素与重建轨迹计算 Splat 上限（系数0.5），全景保持独立预算。
+- **自动重试**：默认开启，允许显存不足后减少点数重试或调整补拍方案；可关闭，实际重试后在完成详情标记。
 - **透明素材**：支持透明 MOV 和 PNG，保留原始颜色与 Alpha，并自动生成 COLMAP 黑白蒙版。
 - **多任务管理**：任务列表分为新任务、已完成和未完成，可保存多个草稿、调整顺序并自动执行下一个任务；同一时间只运行一个生成任务，支持取消和断点续跑。
 - **补拍**：根据原模型情况选择重建方式及是否沿用原模型，训练参数与正常生成一致；支持跨尺寸普通素材和完整 ERP 全景补拍，派生项目不覆盖原结果。
-- **预览与编辑**：支持 WebGPU／WebGL2、移动轴与旋转环、裁切、删点、反选和撤销重做；可用 WASD 水平漫游或“自动定位视角”返回首帧训练视角。
-- **多种导出**：支持标准 PLY、压缩 PLY、SPZ v4、单文件 SOG，以及竖屏或横屏 MP4、单文件离线 HTML。
+- **预览与编辑**：支持 WebGPU／WebGL2、移动轴与旋转环、裁切、删点、反选和撤销重做；静止画面停止重绘，交互最高60 FPS。支持0.1×–5.0×水平 WASD 漫游与首帧训练视角定位。
+- **多种导出**：支持标准 PLY、压缩 PLY、SPZ v4、单文件 SOG，以及竖屏或横屏 MP4、单文件离线 HTML。SPZ 坐标越界时，经确认可仅调整导出副本。
 - **本地运行**：COLMAP 重建与 Brush 训练都在本机完成；满足条件时自动使用 GPU，否则使用可用的兼容路径。
 - **跨平台与双语界面**：支持 Windows、Apple Silicon macOS 和 Ubuntu，并可在简体中文与英文之间切换。
 
 全景图片每批需至少两张且尺寸一致；仅有 2:1 比例不会自动判为全景。不支持双鱼眼、双目、VR180、裁切全景或厂商私有原片；普通与全景投影不能混合补拍。全景缓存不再设固定 20 GiB 上限，请预留足够磁盘空间；单幅解码仍限 512 MiB。格式、参数和验证范围见[全景视频](docs/PANORAMA_VIDEO_V1.md)、[全景图片](docs/PANORAMA_IMAGES_V1.md)与[补拍说明](docs/RESHOOT_V2.md)。
+
+压缩 PLY、SPZ 和 SOG 不再按估算内存拒绝导出，但仍受实际内存、磁盘和格式约束影响；取消人为门槛不代表大模型一定能够导出。详见[导出说明与验证](docs/model-export-verification.md)。
 
 ### Gaussian 编辑快捷键
 
@@ -75,7 +78,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 在矩形、球形或盒形选择中，点击“反选”或按 `Ctrl + I`（macOS 为 `⌘ + I`）切换保留或选中的部分。
 - 球形或盒形选择会自动进入正交视图，可切换侧视图、正视图和顶视图，并通过视口控制器或数值面板调整位置与大小。
 - 变换面板中的“场景操作轴”可切换“移动／旋转”，再次点击当前选中的按钮即可关闭；左键拖轴操作模型，拖动空白处转动视角。旋转环和面板旋转都围绕模型中心；松开提交一次编辑，`Esc` 取消本次拖轴，操作轴模式保存在本机。
-- 点击画布或“自动定位视角”后，使用 `WASD` 沿水平面漫游，`Shift` 三倍加速；速度随缩放调整，仅透视视图可用。
+- 使用 `WASD` 沿水平面漫游，`Shift` 三倍加速；编辑完成后可直接继续漫游，右下角滑轨支持0.1×–5.0×调速并记住本机设置。速度随缩放调整，仅透视视图可用。
 - `Ctrl + Z` 撤销，`Ctrl + Shift + Z` 或 `Ctrl + Y` 重做。模型变换、裁切和删除共享同一历史记录；相机移动和临时黄色选区不计入历史。
 
 ## 处理流程
@@ -83,12 +86,12 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ```text
 输入视频或图片序列
   │
-  ├─ 视频：FFprobe 分析，FFmpeg 按档位目标 FPS 和工作分辨率抽帧；透明视频同步生成 RGBA 画面与 Mask
+  ├─ 视频：FFprobe 分析，FFmpeg 按档位目标 FPS 或手动比例及工作分辨率抽帧；透明视频同步生成 RGBA 画面与 Mask
   ├─ 图片：快速扫描文件头并按文件名自然排序，复制源素材后优先硬链接复用；按需生成 Alpha Mask
-  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，图片默认穷举匹配，超过100张可确认按序匹配；顺序匹配在自动优化开启时沿用档位闭环检测规则
-  ├─ COLMAP：增量重建并验证注册率和三维点；自动优化开启时可按需尝试桥接补帧
+  ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，图片默认穷举匹配，超过100张可确认按序匹配；顺序匹配沿用档位闭环检测规则
+  ├─ COLMAP：增量重建并验证注册率和三维点，按需桥接补帧；仅实际透明素材启用两视图三角化
   ├─ 全景：先保留整幅 ERP 做球面重建，仅将已注册画面转为六面训练图片
-  ├─ Brush：使用可用 GPU 训练 Gaussian Splats；精细档按显存选择训练配置
+  ├─ Brush：使用可用 GPU 训练 Gaussian Splats；精细档按原始训练分辨率规划
   └─ 校验 PLY 后原子发布为 final.ply
 ```
 
@@ -139,10 +142,10 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。内置 COLMAP 在兼容 NVIDIA 设备上使用 CUDA/Caspar，否则使用 CPU/Ceres；Brush 独立选择图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
-从 main 分支 GitHub Actions 下载 `OOOSplat-0.7.0-x64-linux` Artifact 后，可执行：
+从 main 分支 GitHub Actions 下载 `OOOSplat-0.7.1-x64-linux` Artifact 后，可执行：
 
 ```bash
-sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.7.1-x64-linux.deb
 ```
 
 `.deb` 仅通过 Ubuntu 包管理器安装 FFmpeg/FFprobe；锁定的 COLMAP 和 Brush 已包含在安装包中。
@@ -151,7 +154,7 @@ sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
 
 测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
 
-1. Windows 运行 `OOOSplat-0.7.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.7.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.7.0-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.7.1-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.7.1-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.7.1-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在右侧“任务列表 → 新任务”中选择草稿或点击“新增”，再选择视频文件或图片文件夹。等待类型检测完成；无法确定时，在素材框内选择普通或全景类型。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -160,7 +163,7 @@ sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
 7. 在左侧查看所选任务的阶段、进度和日志；点击右侧任意任务可切换详情。生成出的项目按状态进入“已完成”或“未完成”，已完成项目可点击“预览”。
 8. 在“预览”的“调整”模式中修改模型，变换、裁切和删除记录会自动保存到项目中，视角按项目保存在本机。点击“保存编辑”可确认当前编辑与视角已保存；需要模型文件时，在“导出”菜单直接选择标准 PLY、压缩 PLY、SPZ 或 SOG，无需再次确认格式。调整和动画模式均可使用。
 9. 切换到“动画”，在命令栏中间选择“竖屏 / 横屏”，通过“导出 → 导出视频”生成 30 FPS、23 秒 MP4，分辨率分别为 1080×1920 和 1920×1080；调整或动画模式均可导出离线 HTML。导出使用当前编辑结果，可取消，完成后可打开所在文件夹。
-10. 如需补充细节，在已完成项目中点击“补拍”，选择新素材并检查类型，按需调整质量和自动优化。点击“开始生成”后回答原模型情况，普通素材还需确认拍摄设置是否相同，无需再次确认方案；开启自动优化也会允许失败后改用更耗时的方案。新旧素材须属于同一场景并有足够重叠。
+10. 如需补充细节，在已完成项目中点击“补拍”，选择新素材并检查类型，按需调整质量和自动重试。点击“开始生成”后回答原模型情况，普通素材还需确认拍摄设置是否相同，无需再次确认方案；开启自动重试时允许失败后改用更耗时的方案。新旧素材须属于同一场景并有足够重叠。
 
 使用提示：
 
@@ -168,32 +171,36 @@ sudo apt install ./OOOSplat-0.7.0-x64-linux.deb
 - 点击右下角百分比按钮可缩小、恢复或放大整个界面。
 - 新任务草稿会在本机保存，重启后重新检查素材。运行中的任务参数不能修改，但可以切换并编辑其他草稿；不能同时启动第二个任务。
 - 新任务可拖动排序。“自动执行下一个任务”默认关闭，开启后按顺序执行，不跳过未就绪任务；图片顺序确认会暂停启动，取消则关闭队列。
-- 新补拍默认继承源项目质量和自动优化，启动前可修改。普通补拍支持不同尺寸、宽高比和设备／镜头；全景仅接收完整 ERP，批次之间可不同尺寸。不能重复输入原素材，缺少可信图片或重建数据时不能启动。
+- 新补拍默认继承源项目质量，自动重试默认开启，启动前可修改。普通补拍支持不同尺寸、宽高比和设备／镜头；全景仅接收完整 ERP，批次之间可不同尺寸。不能重复输入原素材，缺少可信图片或重建数据时不能启动。
 - 沿用原模型时，从未经编辑的生成 PLY 初始化，旧图、新图共同使用正常完整训练配方，不另行缩短步数或降低学习率。只有确认拍摄设置相同且单相机、工作图片尺寸及方向兼容时才复用原内参。它不是完整断点续训，也不保证只改变新增区域；派生项目不继承删除或裁切。已有任务仍按原快照执行。实测范围见[补拍说明](docs/RESHOOT_V2.md)。
 - 任务页日志保留最近 500 条，完整引擎日志位于项目的 `logs/` 目录。训练资源面板默认隐藏，可在“设置 → 界面”中开启。
 - 点击“删除”会回收整个项目目录，包括源视频副本和所有中间文件；如果移入回收站失败，程序不会降级为永久删除。
 
 ## 质量档位
 
-“自动优化（实验性）”默认开启。普通视频会在抽帧时一次性缩放到对应工作分辨率，并保持原始宽高比且不会放大低分辨率素材；实际采样不会超过源视频 FPS 或总帧数。普通图片序列保留全部有效图片和原始输入分辨率，但 COLMAP 与 Brush 仍使用对应档位的处理上限。
+原自动优化的基础策略现为默认设置。快速／均衡保留工作分辨率限制，精细档使用原始训练分辨率；不放大低分辨率素材。图片保留全部有效输入，视频可在档位上方分级调整抽帧比例，并保留按源 FPS 换算的精确默认档。
 
-自动优化开启/关闭时各档位的完整参数、Bridge/Caspar/OOM 处理逻辑，以及开发环境外部配置覆盖方法见[自动优化参数配置](docs/pipeline-optimization-config.zh-CN.md)。默认参数集中维护在 `config/pipeline-optimization.json`。
+新策略、自动重试规则与兼容说明见[默认生成策略](docs/GENERATION_POLICY.md)；历史配方和开发环境配置见[参数配置](docs/pipeline-optimization-config.zh-CN.md)。
 
-自动优化开启时，视频及已确认按序排列的图片使用档位对应的离线闭环检测；关闭时不启用。闭环检测可能增加匹配时间，不保证所有素材均能闭环；新补拍独立匹配新旧画面，新增画面之间沿用窗口10和档位闭环规则，Bridge 策略不变。
+视频和已确认按序排列的图片默认使用档位对应的离线闭环检测，不保证所有素材均能闭环。补拍独立匹配新旧画面，新增画面之间沿用窗口10和档位闭环规则。自动补帧不受自动重试开关影响。
 
-下表为普通素材配置。全景使用独立配方：关闭自动优化时，快速／均衡／精细的 Splat 上限为100万／200万／300万；开启时按档位与显存确定，最高1,000万，上限不保证实际点数或显存安全。详见[全景训练参数与实测](docs/PANORAMA_IMAGES_V1.md#全景训练配方-v1)。
+手动抽帧的新任务在初始注册率低于80%、存在有效初始模型时，可按未注册区间尝试一轮桥接补帧，最多额外补首次实际帧数的20%，且不超过源视频可用帧数。例如首次360张，最多再补72张；100%抽帧不再新增。首次帧数仍遵守最少30帧规则，源帧不足时全部采用。默认抽帧仍用下表的桥接候选预算。旧任务中断续跑保留原规则；1.2倍只是帧数预算，不保证耗时或成功率。详见[补帧规则与验证](docs/MANUAL_BRIDGE_V3.md)。
 
-| 档位 | 视频初始 / 桥接目标 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
+下表为普通素材。普通精细档按已注册训练图片的有效像素与平均重建轨迹长度计算 Splat 上限，系数为0.5；完全透明像素不计入，初始化点数不被削减。公式与适用范围见[精细档预算](docs/FINE_SPLAT_BUDGET.md)。
+
+全景使用独立训练配方和点数预算。精细档保留原始 ERP，训练六面边长为 `floor(ERP宽度 / 4)`，不放大素材。点数预算按原始球面模型统计，不因六面转换乘六。所有上限均不保证实际点数、画质或显存安全。
+
+| 档位 | 默认初始 / 桥接候选目标 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
 | --- | ---: | ---: | ---: | --- |
 | 快速 | 6 / 9 FPS | 最大 1,600 | 1,200 / 4,096 | 8,000 iterations，最大分辨率 1,600 |
 | 均衡 | 8 / 12 FPS | 最大 1,920 | 1,600 / 8,192 | 15,000 iterations，最大分辨率 1,920 |
-| 精细 | 12 / 15 FPS | 依据显存为最大 3,200、3,840 或原生分辨率 | 3,200 / 16,384 | 30,000 iterations，依据显存选择最大分辨率和 Splat 上限 |
+| 精细 | 12 / 15 FPS | 原始分辨率 | 3,200 / 16,384 | 30,000 iterations，原始训练分辨率，有效像素／轨迹预算（系数0.5） |
 
 短视频会尽量保留至少 30 张画面；源帧不足时使用全部可用画面。因此实际初始和候选采样率可能高于表中的目标值，但不会超过源帧率或源素材帧数。
 
-精细档的初始配置按可用显存划分：显存低于 8 GB 或无法读取时，视频和 Brush 最大长边为 3,200；8 GB（含）至 12 GB 之间为 3,840；12 GB（含）以上保留视频原生长边，并让 Brush 使用原生长边。三个精细配置的 COLMAP 图像长边均限制为 3,200。桥接补帧仅在视频初始重建覆盖不足且仍有候选画面时尝试；失败会安全回退到初始重建，不适用于图片序列。精细档在明确检测到显存不足时最多自动降低一次训练配置并重试。
+精细档训练分辨率不再按显存分档。开启“自动重试”后，三个档位在明确 GPU OOM 时均可最多重试一次，上限取失败进程最后可信点数的80%，不降低分辨率；没有可信计数、无法实际降低或低于初始化点数时直接报错。兼容后端回退及自动补帧不受此开关控制。
 
-普通素材关闭自动优化后，快速、均衡、精细档分别恢复为保留源视频 30%、50%、100% 画面的旧版策略；视频画面长边沿用旧版最大 1,920，Brush 最大训练分辨率分别为 1,200、1,600、2,000，且不额外设置 Splat 数量上限。
+旧任务的中断续跑保留原快照；失败任务手动重试采用新策略并归档不兼容工作缓存。原素材、已发布模型和编辑结果保持不变。
 
 ## 项目与文件位置
 
@@ -247,12 +254,12 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 字段 | 说明 |
 | --- | --- |
 | 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
-| 应用版本、操作系统、CPU 架构 | 例如 `0.7.0` / `windows` / `x86_64` |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.7.1` / `windows` / `x86_64` |
 | 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
 | 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
 | 阶段耗时与总耗时 | 毫秒 |
 | 基础生成事件的帧数与视频时长 | 分桶值；Planner 效果事件另含实际素材和重建数量 |
-| 自动优化效果指标 | 匿名的素材尺寸与数量、规划结果、注册图像与三维点数、桥接补帧、Brush 配置、Splat 数量、PLY 大小和阶段耗时；普通生成、续跑及补拍均记录，关闭自动优化时仍可用于效果比较 |
+| 自动优化效果指标 | 匿名的素材尺寸与数量、规划结果、注册图像与三维点数、桥接补帧、Brush 配置、Splat 数量、PLY 大小和阶段耗时；普通生成、续跑及补拍均记录，保留原字段含义，自动重试开关不代替规划启用状态 |
 | Planner 显卡信息 | 厂商枚举和检测到的总显存，不含完整显卡名称或设备序列号；无法检测时留空或标记为未知 |
 | 失败阶段与错误码 | 枚举值，例如 `colmap_mapper_failed`；不含原始错误文本 |
 
@@ -379,7 +386,7 @@ npm run package:windows
 NSIS 安装包输出到：
 
 ```text
-dist-artifacts\OOOSplat-0.7.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.7.1-x64-windows.exe
 ```
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。
@@ -428,26 +435,28 @@ Linux 的 FFmpeg/FFprobe 保留各自的环境变量与 PATH 发现方式；Brus
 
 COLMAP 和 Brush 是两个独立阶段：COLMAP 只有兼容的 NVIDIA CUDA 环境才能使用 GPU；Brush 在 Windows 和 Linux 上使用 Vulkan，在 Apple Silicon macOS 上使用 Metal。常见组合按以下方式处理；表中未另行标注平台的组合均指 Windows：
 
-| 平台与显卡组合 | COLMAP | Brush 训练 | 自动优化的精细档显存配置 |
-|---|---|---|---|
-| Windows：单张 NVIDIA 独显 | 满足驱动和 Compute Capability 要求时使用 CUDA | 明确选择第一张独立 GPU，通过 Vulkan 运行 | 使用该 NVIDIA 显卡的总显存选择 Low、Standard 或 Large |
-| Intel 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，避免误用 Intel 核显 | 使用 NVIDIA 总显存分档 |
-| AMD 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，并仅为 Brush 子进程规避 AMD Switchable Graphics 隐式层 | 使用 NVIDIA 总显存分档 |
-| 仅 AMD，或 Intel 核显 + AMD 独显 | 自动回退 CPU | 由 Vulkan 自动选择 AMD GPU；不会禁用 AMD 图形层 | 当前使用保守的 Low 配置 |
-| 仅 Intel 核显或 Intel 独显 | 自动回退 CPU | 由 Vulkan 自动选择 Intel GPU | 当前使用保守的 Low 配置 |
-| 多张 NVIDIA 显卡 | 选择 Compute Capability 最高的兼容显卡；相同时选择 NVIDIA 索引较小者 | 因 Vulkan 与 CUDA 的设备索引不能可靠对应，不强制 Brush 的设备索引，由 Vulkan 自动选择 | 使用 COLMAP 选中显卡的总显存分档 |
-| AMD 独显 + NVIDIA 独显 | COLMAP 使用符合要求的 NVIDIA | 当前会进入单 NVIDIA 优先策略，但跨品牌独显的 Vulkan 排序无法完全保证；建议同时在 Windows 图形设置中把 `brush_app.exe` 设为“高性能”并检查任务日志中的实际适配器 | 使用 NVIDIA 总显存分档 |
-| NVIDIA 驱动过旧、型号不兼容或检测失败 | 自动回退 CPU | Brush 仍会尝试通过 Vulkan 自动选择可用 GPU，但不会强制 NVIDIA | 当前使用保守的 Low 配置 |
-| 没有可用 GPU 图形后端 | COLMAP 使用 CPU | Brush 可能无法启动；CPU-only 软件图形后端尚未完成端到端验证 | 不适用 |
-| macOS：Apple Silicon M 系列（含 Pro、Max、Ultra） | 当前使用 CPU，不启用 CUDA | 自动使用 M 系列芯片的 Metal GPU 和统一内存 | 当前不会按统一内存容量提升显存档，使用保守的 Low 配置 |
-| Ubuntu Alpha：兼容的 NVIDIA GPU | 满足运行时、驱动和 Compute Capability 要求时使用 CUDA，否则回退 CPU | 通过 Vulkan 自动选择可用 GPU，不强制 Windows 选卡策略 | 根据兼容 NVIDIA 显卡的总显存选择 Low、Standard 或 Large |
-| Ubuntu Alpha：AMD、Intel 或无法检测兼容 NVIDIA GPU | 使用 CPU | 通过 Vulkan 自动选择可用 GPU | 使用保守的 Low 配置 |
+| 平台与显卡组合 | COLMAP | Brush 训练 |
+|---|---|---|
+| Windows：单张 NVIDIA 独显 | 满足驱动和 Compute Capability 要求时使用 CUDA | 明确选择第一张独立 GPU，通过 Vulkan 运行 |
+| Intel 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，避免误用 Intel 核显 |
+| AMD 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，并仅为 Brush 子进程规避 AMD Switchable Graphics 隐式层 |
+| 仅 AMD，或 Intel 核显 + AMD 独显 | 自动回退 CPU | 由 Vulkan 自动选择 AMD GPU；不会禁用 AMD 图形层 |
+| 仅 Intel 核显或 Intel 独显 | 自动回退 CPU | 由 Vulkan 自动选择 Intel GPU |
+| 多张 NVIDIA 显卡 | 选择 Compute Capability 最高的兼容显卡；相同时选择 NVIDIA 索引较小者 | 因 Vulkan 与 CUDA 的设备索引不能可靠对应，不强制 Brush 的设备索引，由 Vulkan 自动选择 |
+| AMD 独显 + NVIDIA 独显 | COLMAP 使用符合要求的 NVIDIA | 当前会进入单 NVIDIA 优先策略，但跨品牌独显的 Vulkan 排序无法完全保证；建议同时在 Windows 图形设置中把 `brush_app.exe` 设为“高性能”并检查任务日志中的实际适配器 |
+| NVIDIA 驱动过旧、型号不兼容或检测失败 | 自动回退 CPU | Brush 仍会尝试通过 Vulkan 自动选择可用 GPU，但不会强制 NVIDIA |
+| 没有可用 GPU 图形后端 | COLMAP 使用 CPU | Brush 可能无法启动；CPU-only 软件图形后端尚未完成端到端验证 |
+| macOS：Apple Silicon M 系列（含 Pro、Max、Ultra） | 当前使用 CPU，不启用 CUDA | 自动使用 M 系列芯片的 Metal GPU 和统一内存 |
+| Ubuntu Alpha：兼容的 NVIDIA GPU | 满足运行时、驱动和 Compute Capability 要求时使用 CUDA，否则回退 CPU | 通过 Vulkan 自动选择可用 GPU，不强制 Windows 选卡策略 |
+| Ubuntu Alpha：AMD、Intel 或无法检测兼容 NVIDIA GPU | 使用 CPU | 通过 Vulkan 自动选择可用 GPU |
+
+新策略的精细档均使用原始训练分辨率，不再按显存选择 Low、Standard 或 Large；普通与全景分别采用上方质量档位中的预算规则。硬件能够启动训练不代表能承载任意分辨率或点数。
 
 上述强制选卡和 AMD 隐式层规避只通过环境变量传给单次 `brush_app.exe` 子进程，不会修改系统环境、驱动设置或其他应用，也不会将 Brush 切换到 D3D12。AMD-only 设备不会应用 AMD 隐式层规避。
 
-如果 Brush 日志显示 `Device Lost`，OOOSplat 会将其与显存不足区分并给出提示，但不会自动降低质量重试。建议接通电源、关闭其他 GPU 高负载程序，并在 Windows“设置 → 系统 → 显示 → 图形”中将 `brush_app.exe` 设为“高性能”。精细档只有在明确识别为显存不足时才会降低一级配置，并且最多重试一次。
+如果 Brush 日志显示 `Device Lost`，OOOSplat 会将其与显存不足区分并给出提示，不按 OOM 自动重试。建议接通电源、关闭其他 GPU 高负载程序，并在 Windows“设置 → 系统 → 显示 → 图形”中将 `brush_app.exe` 设为“高性能”。只有明确 GPU OOM、开启自动重试且满足可信点数等条件时，才按上方规则降低点数上限重试一次。
 
-M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把统一内存等同于独立显存。因此，即使是内存较大的 M 系列 Pro、Max 或 Ultra，精细档目前仍采用 Low 配置；这属于保守兼容策略，不代表 Metal 训练只能使用少量统一内存。
+M 系列芯片的 CPU 与 GPU 共享统一内存；新策略不会因此将精细档降为 Low 配置。原始高分辨率训练仍可能超出可用资源，macOS 与 Linux 的新策略端到端硬件验证范围见相关验证记录。
 
 ### 为什么会出现注册率较低的警告？
 
@@ -461,7 +470,7 @@ M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把�
 
 可以。在任务列表中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式支持整体 Transform，以及矩形、球形和盒形 Gaussian 选择；可以非破坏式删除、裁切、反选、撤销和重做。编辑记录会自动保存在项目中；“保存编辑”确认当前编辑与视角已保存，不生成模型文件。在“导出”菜单直接选择模型格式即可生成或安全替换编辑结果，原始 `final.ply` 始终不变。重新打开时恢复编辑与本机保存的视角，黄色选区和撤销历史不跨次恢复。“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕，以及带水印的横竖屏 MP4 和离线 HTML 导出。外部标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT 可从“已完成 → 导入”导入；不支持 LCC/LCC2、Streamed SOG、2DGS 或普通点云 PLY。
 
-`WASD` 沿水平面漫游，速度为每秒当前可见画面高度的15%，`Shift` 三倍加速。“自动定位视角”从任意视图返回首帧训练相机，全景使用最早已注册画面的 front 面；无可靠训练相机时禁用。打开预览仍优先恢复上次视角，详见[导航说明](docs/PREVIEW_NAVIGATION.md)。
+`WASD` 沿水平面漫游，默认速度为每秒当前可见画面高度的15%，右下角可调至0.1×–5.0×，`Shift` 三倍加速。“自动定位视角”从任意视图返回首帧训练相机，全景使用最早已注册画面的 front 面；无可靠训练相机时禁用。打开预览仍优先恢复上次视角，详见[导航说明](docs/PREVIEW_NAVIGATION.md)。
 
 ### 超大 PLY 可以预览吗？
 

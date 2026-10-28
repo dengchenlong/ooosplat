@@ -84,6 +84,56 @@ pub struct TaskRun {
     pub last_engine: Option<crate::pipeline::PipelineEngine>,
     #[serde(default)]
     pub last_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brush_executions: Vec<crate::pipeline::brush_execution::BrushExecutionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_brush_execution: Option<usize>,
+}
+
+impl TaskRun {
+    fn observe_brush(
+        &mut self,
+        event: &PipelineEvent,
+        configuration: Option<crate::presets::ResolvedBrushTrainingPreset>,
+    ) {
+        if event.kind == crate::pipeline::EventKind::Stage
+            && !matches!(
+                event.stage,
+                PipelineStage::TrainingSplats | PipelineStage::Exporting
+            )
+        {
+            self.current_brush_execution = None;
+        }
+        if event.engine != Some(crate::pipeline::PipelineEngine::Brush) {
+            return;
+        }
+        let Some(runtime) = event.runtime.as_ref().filter(|v| v.process_id != 0) else {
+            return;
+        };
+        if let Some(last) = self.brush_executions.last_mut() {
+            if last.process_id == runtime.process_id
+                && last.operation.as_ref().map(|v| v.id) == event.operation.as_ref().map(|v| v.id)
+            {
+                last.update(runtime);
+                return;
+            }
+        }
+        // Only the initial snapshot can create an execution. Delayed samples may not.
+        if runtime.phase != "starting" {
+            return;
+        }
+        self.brush_executions.push(
+            crate::pipeline::brush_execution::BrushExecutionSnapshot::new(
+                runtime,
+                event.operation.clone(),
+            ),
+        );
+        self.brush_executions
+            .last_mut()
+            .expect("new execution")
+            .configuration = configuration;
+        self.current_brush_execution = Some(self.brush_executions.len() - 1);
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -104,6 +154,10 @@ pub struct TaskRecord {
     pub task_kind: String,
     pub source_project_id: Option<Uuid>,
     pub planner_enabled: bool,
+    #[serde(default)]
+    pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    #[serde(default)]
+    pub automatically_retried: bool,
     pub projects_root: PathBuf,
     pub configuration: PipelineOptimizationConfig,
     pub actual_configuration: Option<Value>,
@@ -200,6 +254,49 @@ impl From<serde_json::Error> for ServiceError {
     }
 }
 pub type Result<T> = std::result::Result<T, ServiceError>;
+
+pub(crate) fn generation_parameters(parameters: Option<Value>) -> Result<Value> {
+    let mut parameters = parameters.unwrap_or_else(|| serde_json::json!({}));
+    if !parameters.is_object() {
+        return Err(ServiceError::new(
+            "INVALID_ARGUMENT",
+            "Invalid generation parameters",
+        ));
+    }
+    let policy: crate::pipeline::generation_policy::GenerationPolicy = parameters
+        .get("generationPolicy")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_else(|| crate::pipeline::generation_policy::GenerationPolicy {
+            auto_retry_enabled: parameters
+                .pointer("/reshootOptions/allowFallback")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            ..Default::default()
+        });
+    policy.validate()?;
+    // This function admits new tasks/manual retries, never interrupted resumes.
+    let policy = crate::pipeline::generation_policy::GenerationPolicy {
+        version: crate::pipeline::generation_policy::VERSION,
+        ..policy
+    };
+    parameters["generationPolicy"] = serde_json::to_value(policy)?;
+    if parameters.get("reshootOptions").is_some_and(Value::is_null) {
+        parameters.as_object_mut().unwrap().remove("reshootOptions");
+    }
+    if let Some(options) = parameters
+        .get_mut("reshootOptions")
+        .and_then(Value::as_object_mut)
+    {
+        options.insert(
+            "allowFallback".into(),
+            Value::Bool(policy.auto_retry_enabled),
+        );
+    }
+    Ok(parameters)
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
@@ -469,6 +566,9 @@ impl TaskService {
         key: Option<String>,
         parameters: Option<Value>,
     ) -> Result<TaskRecord> {
+        let parameters = Some(generation_parameters(parameters)?);
+        let _legacy_planner_enabled = planner_enabled;
+        let planner_enabled = true;
         let _gate = self.gate.lock().await;
         self.load_locked().await?;
         if let Some(key) = &key {
@@ -545,6 +645,13 @@ impl TaskService {
             planner_enabled,
             projects_root,
             configuration: (*crate::presets::pipeline_optimization_config()).clone(),
+            generation_policy: parameters
+                .as_ref()
+                .and_then(|p| p.get("generationPolicy"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            automatically_retried: false,
             actual_configuration: None,
             status: TaskStatus::Created,
             stage: None,
@@ -652,6 +759,8 @@ impl TaskService {
                 .into(),
                 source_project_id: metadata.reshoot.as_ref().map(|r| r.source_project_id),
                 planner_enabled: checkpoint.planner_enabled,
+                generation_policy: checkpoint.generation_policy,
+                automatically_retried: checkpoint.automatically_retried(),
                 projects_root: path.parent().unwrap_or(&path).into(),
                 configuration: checkpoint
                     .configuration
@@ -702,6 +811,8 @@ impl TaskService {
                     last_engine: None,
                     last_exit_code: None,
                     error: None,
+                    brush_executions: Vec::new(),
+                    current_brush_execution: None,
                 }],
                 client_request_id: None,
                 request_parameters: None,
@@ -718,6 +829,8 @@ impl TaskService {
                     existing.status = task.status;
                     existing.stage = task.stage;
                     existing.actual_configuration = task.actual_configuration;
+                    existing.generation_policy = task.generation_policy;
+                    existing.automatically_retried = task.automatically_retried;
                     existing.result = task.result;
                     existing.revision += 1;
                     if let Some(run) = existing.runs.last_mut() {
@@ -739,8 +852,19 @@ impl TaskService {
 
     pub(crate) async fn capture_failure(
         &self,
+        error: crate::commands::PipelineCommandError,
+        paths: &[PathBuf],
+    ) -> crate::commands::PipelineCommandError {
+        self.capture_failure_with_executions(error, paths, &[], None)
+            .await
+    }
+
+    async fn capture_failure_with_executions(
+        &self,
         mut error: crate::commands::PipelineCommandError,
         paths: &[PathBuf],
+        executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
+        current: Option<usize>,
     ) -> crate::commands::PipelineCommandError {
         if error.code != "cancelled" {
             let project = error
@@ -749,13 +873,15 @@ impl TaskService {
                 .and_then(|id| Uuid::parse_str(id).ok());
             error.failure_id = Some(Box::new(
                 self.diagnostics
-                    .capture(
+                    .capture_with_executions(
                         error.failed_stage,
                         error.engine,
                         error.failure_kind,
                         &error.message,
                         project,
                         paths,
+                        executions,
+                        current,
                     )
                     .await,
             ));
@@ -771,29 +897,57 @@ impl TaskService {
         telemetry: Option<TelemetryService>,
     ) -> Result<StartReceipt> {
         let service = self.clone();
-        tokio::spawn(async move { service.start_inner(id, engines, telemetry, false).await })
-            .await
-            .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+        tokio::spawn(async move {
+            service
+                .start_inner(id, engines, telemetry, false, None)
+                .await
+        })
+        .await
+        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
     }
+    pub async fn retry_failed(
+        &self,
+        id: Uuid,
+        failed_run: Uuid,
+        engines: EnginePaths,
+        telemetry: Option<TelemetryService>,
+    ) -> Result<StartReceipt> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .start_inner(id, engines, telemetry, true, Some(failed_run))
+                .await
+        })
+        .await
+        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+    }
+
     async fn start_inner(
         &self,
         id: Uuid,
         engines: EnginePaths,
         telemetry: Option<TelemetryService>,
         resume: bool,
+        retry_failed_run: Option<Uuid>,
     ) -> Result<StartReceipt> {
         let _gate = self.gate.lock().await;
         self.load_locked().await?;
-        let task = self
+        let mut task = self
             .records()
             .tasks
             .get(&id)
             .cloned()
             .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "任务不存在"))?;
+        if retry_failed_run
+            .is_some_and(|run| task.run_id != Some(run) || task.status != TaskStatus::Failed)
+        {
+            return Ok(StartReceipt::existing(&task));
+        }
+        let failed_retry = task.status == TaskStatus::Failed && resume;
         if task.status.active() || (!resume && task.status != TaskStatus::Created) {
             return Ok(StartReceipt::existing(&task));
         }
-        if !resume {
+        if !resume || task.project_id.is_none() {
             if let Some(expected) = task
                 .request_parameters
                 .as_ref()
@@ -823,6 +977,12 @@ impl TaskService {
                 task_id: Some(active.task_id),
                 run_id: active.run_id,
             });
+        }
+        let original_task = task.clone();
+        if failed_retry || (!resume && task.generation_policy.is_none()) {
+            task.planner_enabled = true;
+            task.configuration = (*crate::presets::pipeline_optimization_config()).clone();
+            task.request_parameters = Some(generation_parameters(task.request_parameters.take())?);
         }
         let run_id = Uuid::new_v4();
         let service = self.clone();
@@ -854,6 +1014,13 @@ impl TaskService {
             .map(|v| serde_json::from_value::<crate::pipeline::reshoot::ReshootOptions>(v.clone()))
             .transpose()
             .map_err(|_| ServiceError::new("INVALID_ARGUMENT", "Invalid saved reshoot options"))?;
+        let policy = task
+            .request_parameters
+            .as_ref()
+            .and_then(|p| p.get("generationPolicy"))
+            .cloned()
+            .map(serde_json::from_value::<crate::pipeline::generation_policy::GenerationPolicy>)
+            .transpose()?;
         let runner = Arc::new(
             PipelineRunner::new_with_planner(engines, task.planner_enabled, move |event| {
                 if let Some(s) = &observe {
@@ -862,6 +1029,12 @@ impl TaskService {
                 service.on_event(id, run_id, event);
             })
             .with_effectiveness_tracker(effectiveness)
+            .with_generation_policy(if !resume || failed_retry {
+                Some(policy.unwrap_or_default())
+            } else {
+                None
+            })
+            .with_failed_retry_policy(failed_retry.then(|| policy.unwrap_or_default()))
             .with_video_projection(
                 task.request_parameters
                     .as_ref()
@@ -886,6 +1059,13 @@ impl TaskService {
         let starting = {
             let mut registry = self.records();
             let t = registry.tasks.get_mut(&id).expect("task");
+            t.planner_enabled = task.planner_enabled;
+            t.configuration = task.configuration.clone();
+            t.request_parameters = task.request_parameters.clone();
+            if !resume || failed_retry {
+                t.generation_policy = policy;
+                t.automatically_retried = false;
+            }
             t.run_id = Some(run_id);
             t.status = TaskStatus::Starting;
             t.elapsed_offset_ms = t.elapsed_ms;
@@ -912,7 +1092,9 @@ impl TaskService {
             t.updated_at = Utc::now();
             t.runs.push(TaskRun {
                 run_id,
-                kind: if task.project_id.is_some() {
+                kind: if failed_retry {
+                    "retry"
+                } else if task.project_id.is_some() {
                     "resume"
                 } else {
                     &task.task_kind
@@ -924,11 +1106,13 @@ impl TaskService {
                 last_engine: None,
                 last_exit_code: None,
                 error: None,
+                brush_executions: Vec::new(),
+                current_brush_execution: None,
             });
             t.clone()
         };
         if let Err(e) = self.persist().await {
-            self.records().tasks.insert(id, task);
+            self.records().tasks.insert(id, original_task);
             *self.active.lock().await = None;
             return Err(e);
         }
@@ -1059,6 +1243,14 @@ impl TaskService {
                 t.eta_seconds = None;
                 t.runtime = None;
             }
+            let configuration = t
+                .actual_configuration
+                .as_ref()
+                .and_then(|v| v.pointer("/brush_training/resolved"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            if let Some(execution) = t.runs.last_mut() {
+                execution.observe_brush(&event, configuration);
+            }
             t.revision += 1;
             t.sequence = t.sequence.max(event.sequence);
             if lifecycle {
@@ -1134,7 +1326,21 @@ impl TaskService {
                 return;
             }
             match update {
+                RunnerUpdate::BrushPreparation => {
+                    if let Some(execution) = t.runs.last_mut() {
+                        execution.current_brush_execution = None;
+                    }
+                }
                 RunnerUpdate::Configuration(configuration) => {
+                    t.generation_policy = configuration
+                        .get("generation_policy")
+                        .filter(|p| !p.is_null())
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok());
+                    t.automatically_retried = configuration
+                        .get("automatically_retried")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     t.actual_configuration = Some(configuration);
                 }
                 RunnerUpdate::Project(metadata) => {
@@ -1158,6 +1364,16 @@ impl TaskService {
                     if let Some(r) = t.runs.last_mut() {
                         r.last_engine = Some(engine);
                         r.last_exit_code = exit_code;
+                        if engine == crate::pipeline::PipelineEngine::Brush {
+                            if let Some(execution) = r
+                                .brush_executions
+                                .iter_mut()
+                                .rev()
+                                .find(|v| v.ended_at.is_none())
+                            {
+                                execution.finish(exit_code);
+                            }
+                        }
                     }
                 }
             }
@@ -1181,6 +1397,27 @@ impl TaskService {
     ) {
         let _gate = self.gate.lock().await;
         let context = runner.failure_context();
+        let (executions, current_execution) = {
+            let mut registry = self.records();
+            let Some(task) = registry
+                .tasks
+                .get_mut(&id)
+                .filter(|t| t.run_id == Some(run))
+            else {
+                return;
+            };
+            // Cancellation and launch failures do not necessarily emit ProcessExited.
+            // Freeze the local evidence before preparing a diagnostic or terminal record.
+            task.runs
+                .last_mut()
+                .map(|v| {
+                    for execution in &mut v.brush_executions {
+                        execution.finish(None);
+                    }
+                    (v.brush_executions.clone(), v.current_brush_execution)
+                })
+                .unwrap_or_default()
+        };
         let input = self
             .records()
             .tasks
@@ -1189,13 +1426,20 @@ impl TaskService {
             .unwrap_or_default();
         let error = match &result {
             Ok(_) => None,
-            Err(e) => Some(
-                self.capture_failure(
-                    crate::commands::PipelineCommandError::from_runner(e, &runner),
-                    &[input],
-                )
-                .await,
-            ),
+            Err(e) => {
+                let error = crate::commands::PipelineCommandError::from_runner(e, &runner);
+                Some(if executions.is_empty() {
+                    self.capture_failure(error, &[input]).await
+                } else {
+                    self.capture_failure_with_executions(
+                        error,
+                        &[input],
+                        &executions,
+                        current_execution,
+                    )
+                    .await
+                })
+            }
         };
         let failure_id = error
             .as_ref()
@@ -1230,6 +1474,17 @@ impl TaskService {
             t.project_path = context.project_path.or(t.project_path.clone());
             if let Some(actual) = actual {
                 t.actual_configuration = Some(actual_snapshot(actual));
+                if let Some(actual) = &t.actual_configuration {
+                    t.generation_policy = actual
+                        .get("generation_policy")
+                        .filter(|p| !p.is_null())
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok());
+                    t.automatically_retried = actual
+                        .get("automatically_retried")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                }
             }
             t.result = result
                 .as_ref()
@@ -1328,9 +1583,13 @@ impl TaskService {
             .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "项目任务不存在"))?
             .task_id;
         let service = self.clone();
-        tokio::spawn(async move { service.start_inner(id, engines, telemetry, true).await })
-            .await
-            .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+        tokio::spawn(async move {
+            service
+                .start_inner(id, engines, telemetry, true, None)
+                .await
+        })
+        .await
+        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
     }
 
     pub async fn mark_reshoot(&self, id: Uuid, source: Uuid) -> Result<()> {
@@ -1468,7 +1727,28 @@ pub fn authorize_input(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
 
 fn actual_snapshot(state: Value) -> Value {
     let frames = state.get("frames");
+    let retried = state.get("generationPolicy").is_some_and(Value::is_object)
+        && (state
+            .pointer("/brushTraining/oomRetryStarted")
+            .and_then(Value::as_bool)
+            == Some(true)
+            || [
+                "/reshoot/recipe/reconstructionFallbacks",
+                "/reshoot/recipe/trainingFallbacks",
+            ]
+            .iter()
+            .any(|p| {
+                state
+                    .pointer(p)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 0)
+            }));
     let mut result = serde_json::json!({"quality":state.get("preset"),"planner_enabled":state.get("plannerEnabled"),"resolution_policy_version":state.get("resolutionPolicyVersion"),"resolution_plan":state.get("resolutionPlan"),"brush_training":state.get("brushTraining"),"frame_plan":{"sampling_fps":frames.and_then(|f|f.get("samplingFps")),"estimated_frames":frames.and_then(|f|f.get("estimatedFrames")),"extracted_frames":frames.and_then(|f|f.get("extractedFrames")),"mask_count":frames.and_then(|f|f.get("maskCount"))}});
+    result["generation_policy"] = state
+        .get("generationPolicy")
+        .cloned()
+        .unwrap_or(Value::Null);
+    result["automatically_retried"] = Value::Bool(retried);
     result["reshoot_recipe"] = state
         .pointer("/reshoot/recipe")
         .cloned()
