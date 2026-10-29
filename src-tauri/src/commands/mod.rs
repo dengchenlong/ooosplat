@@ -8,10 +8,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod html_export;
+pub mod model_export;
 
 use crate::{
     engines::{
-        ffprobe::probe_video,
+        ffprobe::{probe_video, with_probe_diagnostics},
         health::{
             check_colmap_acceleration as refresh_colmap_acceleration,
             check_colmap_acceleration_cached as detect_colmap_acceleration,
@@ -30,10 +31,7 @@ use crate::{
         },
         PipelineEngine, PipelineStage,
     },
-    presets::{
-        resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
-        resolve_planner_resolution_plan, Quality,
-    },
+    presets::{resolve_brush_training_preset, resolve_brush_training_preset_for_plan, Quality},
     process::ProcessManager,
     project::{
         catalog::{self, AppSettings, ProjectOverview, ProjectSummary},
@@ -52,7 +50,7 @@ use crate::{
     telemetry::{TelemetryPreferences, TelemetryService},
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
-        ImageSequenceInfo, QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
+        ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -70,7 +68,12 @@ pub struct PipelineCommandError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) project_id: Option<String>,
+    pub(crate) classification_version: Option<u32>,
+    pub(crate) classification_is_heuristic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) termination: Option<Box<crate::process::ProcessTermination>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_id: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) project_path: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +84,11 @@ pub struct PipelineCommandError {
 
 impl From<SplatError> for PipelineCommandError {
     fn from(error: SplatError) -> Self {
+        let classification = crate::failure::classify(None, &error);
+        let termination = match &error {
+            SplatError::EngineProcess(failure) => Some(Box::new(failure.termination.clone())),
+            _ => None,
+        };
         Self {
             code: if matches!(error, SplatError::Cancelled) {
                 "cancelled"
@@ -89,8 +97,12 @@ impl From<SplatError> for PipelineCommandError {
             },
             message: error.to_string(),
             failed_stage: None,
-            engine: None,
-            failure_kind: None,
+            engine: classification.engine,
+            failure_kind: classification.kind,
+            classification_version: (!matches!(error, SplatError::Cancelled))
+                .then_some(crate::failure::CLASSIFICATION_VERSION),
+            classification_is_heuristic: classification.heuristic,
+            termination,
             project_id: None,
             project_path: None,
             logs_directory: None,
@@ -109,7 +121,7 @@ impl PipelineCommandError {
             project_path,
             logs_directory,
         } = runner.failure_context();
-        let (engine, failure_kind) = classify_pipeline_failure(failed_stage, &message);
+        let classification = crate::failure::classify(failed_stage, error);
         Self {
             code: if cancelled {
                 "cancelled"
@@ -118,9 +130,15 @@ impl PipelineCommandError {
             },
             message,
             failed_stage,
-            engine,
-            failure_kind: if cancelled { None } else { failure_kind },
-            project_id: project_id.map(|value| value.to_string()),
+            engine: classification.engine,
+            failure_kind: if cancelled { None } else { classification.kind },
+            classification_version: (!cancelled).then_some(crate::failure::CLASSIFICATION_VERSION),
+            classification_is_heuristic: classification.heuristic,
+            termination: match error {
+                SplatError::EngineProcess(failure) => Some(Box::new(failure.termination.clone())),
+                _ => None,
+            },
+            project_id: project_id.map(|value| value.to_string().into_boxed_str()),
             project_path: project_path.map(Box::new),
             logs_directory: logs_directory.map(Box::new),
             failure_id: None,
@@ -128,118 +146,13 @@ impl PipelineCommandError {
     }
 }
 
+#[cfg(test)]
 fn classify_pipeline_failure(
     stage: Option<PipelineStage>,
     message: &str,
 ) -> (Option<PipelineEngine>, Option<&'static str>) {
-    let lower = message.to_ascii_lowercase();
-    match stage {
-        Some(PipelineStage::Reconstructing | PipelineStage::ValidatingReconstruction) => {
-            let source_error = [
-                "no initial image pair",
-                "no good initial image pair",
-                "could not find a good initial image pair",
-                "failed to find an initial image pair",
-                "failed to register",
-                "could not register",
-                "no images registered",
-                "registered 0 images",
-                "discarding reconstruction",
-                "failed to create any sparse model",
-                "did not produce a usable sparse model",
-                "未生成完整的稀疏模型",
-                "稀疏重建没有可用的注册图像或三维点",
-                "稀疏重建输出不完整",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            let database_io_error = ["io error", "i/o error"]
-                .iter()
-                .any(|needle| lower.contains(needle))
-                && ["database", "sqlite", "filesystem", "project file"]
-                    .iter()
-                    .any(|needle| lower.contains(needle));
-            let storage_error = database_io_error
-                || [
-                    "database is locked",
-                    "database locked",
-                    "unable to open database",
-                    "failed to open database",
-                    "cannot open database",
-                    "unable to open database file",
-                    "read-only database",
-                    "readonly database",
-                    "no space left",
-                    "disk full",
-                    "input/output error",
-                    "being used by another process",
-                    "used by another process",
-                    "sharing violation",
-                    "access denied",
-                    "permission denied",
-                    "数据库被锁定",
-                    "无法打开数据库",
-                    "磁盘空间不足",
-                    "磁盘已满",
-                    "另一个进程正在使用",
-                    "拒绝访问",
-                    "权限不足",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle));
-            (
-                Some(PipelineEngine::Colmap),
-                Some(if source_error {
-                    "mapper_source"
-                } else if storage_error {
-                    "mapper_storage"
-                } else {
-                    "mapper_source"
-                }),
-            )
-        }
-        Some(PipelineStage::TrainingSplats) => {
-            let device_lost = [
-                "devicelost",
-                "device lost",
-                "device_lost",
-                "parent device is lost",
-                "vk_error_device_lost",
-                "dxgi_error_device_removed",
-                "显卡设备连接中断",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            let dataset_error = [
-                "early eof",
-                "failed to load dataset",
-                "io error",
-                "i/o error",
-                "no such file",
-                "access denied",
-                "permission denied",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-            (
-                Some(PipelineEngine::Brush),
-                Some(if device_lost {
-                    "brush_device_lost"
-                } else if dataset_error {
-                    "brush_dataset"
-                } else {
-                    "brush_gpu"
-                }),
-            )
-        }
-        Some(PipelineStage::ProbingVideo | PipelineStage::ExtractingFrames) => {
-            (Some(PipelineEngine::Ffmpeg), None)
-        }
-        Some(PipelineStage::ExtractingFeatures | PipelineStage::Matching) => {
-            (Some(PipelineEngine::Colmap), None)
-        }
-        _ => (Some(PipelineEngine::System), None),
-    }
+    let result = crate::failure::classify(stage, &SplatError::Process(message.into()));
+    (result.engine, result.kind)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,7 +203,8 @@ pub struct PreviewController {
     active: Mutex<Option<GaussianPreviewSession>>,
     lifecycle: Mutex<()>,
     metadata_write: Mutex<()>,
-    export: Mutex<()>,
+    export: std::sync::Arc<Mutex<()>>,
+    model_export: Mutex<Option<std::sync::Arc<model_export::ModelExportSession>>>,
     video_export: Mutex<Option<GaussianVideoExportSession>>,
     html_export: Mutex<Option<html_export::HtmlExportSession>>,
     edit_save: Mutex<Option<GaussianEditSaveSession>>,
@@ -318,20 +232,40 @@ pub struct ProjectTaskLogLine {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTaskDetail {
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    automatically_retried: bool,
+    reshoot_recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
     project: ProjectSummary,
-    input_type: ProjectInputType,
+    input_type: Option<ProjectInputType>,
+    video_projection: Option<crate::video::panorama::VideoProjection>,
+    input_projection: Option<crate::video::panorama::VideoProjection>,
     source_path: PathBuf,
     projects_root: PathBuf,
-    planner_enabled: bool,
+    planner_enabled: Option<bool>,
     estimated_frames: Option<u64>,
-    stage: PipelineStage,
-    progress: f64,
+    stage: Option<PipelineStage>,
+    progress: Option<f64>,
     input_images: Option<u64>,
     registered_images: Option<u64>,
     video: Option<VideoInfo>,
     image_sequence: Option<ImageSequenceInfo>,
     source_project_id: Option<String>,
     logs: Vec<ProjectTaskLogLine>,
+    imported: Option<ImportedProjectDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectDetail {
+    source_model_path: PathBuf,
+    format: crate::project::ImportedGaussianFormat,
+    source_available: bool,
+    colmap_root: Option<PathBuf>,
+    sparse_model_path: Option<PathBuf>,
+    database_available: bool,
+    images_available: bool,
+    reshoot_eligible: bool,
+    reshoot_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -339,12 +273,17 @@ pub struct ProjectTaskDetail {
 pub enum ProjectLocation {
     Project,
     Logs,
+    Source,
 }
 
 #[derive(Debug, Clone)]
 struct GaussianPreviewSession {
     project_id: Uuid,
     asset_paths: Vec<PathBuf>,
+    read_token: Option<Uuid>,
+    read_path: Option<PathBuf>,
+    read_size: Option<u64>,
+    read_modified_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +338,9 @@ pub struct GaussianPreviewDescriptor {
     transform: GaussianTransform,
     editing: GaussianEditing,
     edit_mask_asset_path: Option<PathBuf>,
+    read_token: Option<Uuid>,
+    reference_view: Option<crate::reconstruction::reference_view::TrainingReferenceView>,
+    reference_view_unavailable: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -453,11 +395,192 @@ pub struct GaussianVideoExportResult {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeAndPlan {
+    projection_detection: Option<crate::video::panorama::ProjectionDetection>,
     input_type: ProjectInputType,
     video: Option<VideoInfo>,
     image_sequence: Option<ImageSequenceInfo>,
     plan: FramePlan,
     estimate: RuntimeEstimate,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAnalysis {
+    pub(crate) video: VideoInfo,
+    pub(crate) projection_detection: crate::video::panorama::ProjectionDetection,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputAnalysis {
+    input_type: ProjectInputType,
+    video: Option<VideoInfo>,
+    image_sequence: Option<ImageSequenceInfo>,
+    projection_detection: crate::video::panorama::ProjectionDetection,
+}
+
+async fn analyze_media(engine_paths: &EnginePaths, input: &Path) -> Result<InputAnalysis> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::Mutex<std::collections::VecDeque<(String, InputAnalysis)>>,
+    > = std::sync::OnceLock::new();
+    let identity = crate::video::panorama::source_identity(input)?;
+    // Single flight, bounded cache; quality/planner changes never re-open image headers.
+    let mut cache = CACHE.get_or_init(Default::default).lock().await;
+    if let Some((_, value)) = cache.iter().find(|(key, _)| key == &identity) {
+        return Ok(value.clone());
+    }
+    let value = if input.is_dir() {
+        let path = input.to_path_buf();
+        let analysis =
+            tokio::task::spawn_blocking(move || crate::video::image_projection::analyze(&path))
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??;
+        InputAnalysis {
+            input_type: ProjectInputType::Images,
+            video: None,
+            image_sequence: Some(analysis.info),
+            projection_detection: analysis.detection,
+        }
+    } else {
+        let (video, json) = crate::engines::ffprobe::probe_video_metadata(
+            &engine_paths.ffprobe,
+            input,
+            None,
+            &ProcessManager::new(),
+        )
+        .await?;
+        let mut detection = crate::video::panorama::detect_metadata(
+            &json,
+            &video,
+            input
+                .extension()
+                .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
+        );
+        detection.source_identity = identity.clone();
+        InputAnalysis {
+            input_type: ProjectInputType::Video,
+            video: Some(video),
+            image_sequence: None,
+            projection_detection: detection,
+        }
+    };
+    if crate::video::panorama::source_identity(input)? != identity {
+        return Err(SplatError::Process(
+            "素材文件已发生变化，请重新分析后再生成".into(),
+        ));
+    }
+    if cache.len() >= 8 {
+        cache.pop_front();
+    }
+    cache.push_back((identity, value.clone()));
+    Ok(value)
+}
+
+#[tauri::command]
+pub async fn analyze_input(app: tauri::AppHandle, path: String) -> Result<InputAnalysis> {
+    let engines = paths_for_app(&app);
+    let input = Path::new(&path);
+    let result = analyze_media(&engines, input).await;
+    if input.is_dir() {
+        result
+    } else {
+        video_preflight_diagnostics(&app, &engines.ffprobe, input, result).await
+    }
+}
+
+/// Independent of projection/quality planning: GPS never gates task creation.
+#[tauri::command]
+pub async fn detect_image_gps(path: String, source_identity: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let path = Path::new(&path);
+        if !path.is_dir()
+            || crate::video::image_projection::source_identity(path)? != source_identity
+        {
+            return Err(SplatError::Process(
+                "素材文件已发生变化，请重新分析后再生成".into(),
+            ));
+        }
+        let detected = crate::video::gps::detect(&crate::video::list_images(path)?);
+        if crate::video::image_projection::source_identity(path)? != source_identity {
+            return Err(SplatError::Process(
+                "素材文件已发生变化，请重新分析后再生成".into(),
+            ));
+        }
+        Ok(detected)
+    })
+    .await
+    .map_err(|e| SplatError::Process(e.to_string()))?
+}
+
+async fn video_preflight_diagnostics<T>(
+    app: &tauri::AppHandle,
+    executable: &Path,
+    input: &Path,
+    result: Result<T>,
+) -> Result<T> {
+    let log_path = app
+        .path()
+        .app_log_dir()
+        .map(|directory| directory.join("ffprobe-probe-latest.log"))
+        .map_err(|error| format!("Cannot resolve diagnostic log directory: {error}"));
+    with_probe_diagnostics(result, executable, input, log_path).await
+}
+
+async fn input_analysis_for_plan(
+    engines: &EnginePaths,
+    input: &Path,
+    previous: Option<InputAnalysis>,
+) -> Result<InputAnalysis> {
+    // Same identity contract as the legacy VideoAnalysis interface. Drafts can
+    // replan without a second read even after the bounded process cache evicts them.
+    if let Some(previous) = previous {
+        let shape_matches = match previous.input_type {
+            ProjectInputType::Images => {
+                input.is_dir() && previous.image_sequence.is_some() && previous.video.is_none()
+            }
+            ProjectInputType::Video => {
+                input.is_file() && previous.video.is_some() && previous.image_sequence.is_none()
+            }
+        };
+        if shape_matches
+            && previous.projection_detection.source_identity
+                == crate::video::panorama::source_identity(input)?
+        {
+            return Ok(previous);
+        }
+    }
+    analyze_media(engines, input).await
+}
+
+async fn video_analysis_for_plan(
+    ffprobe: &Path,
+    ffmpeg: &Path,
+    input: &Path,
+    previous: Option<VideoAnalysis>,
+) -> Result<VideoAnalysis> {
+    if let Some(previous) = previous {
+        if previous.projection_detection.source_identity
+            == crate::video::panorama::source_identity(input)?
+        {
+            return Ok(previous);
+        }
+    }
+    let manager = ProcessManager::new();
+    let (video, json) =
+        crate::engines::ffprobe::probe_video_metadata(ffprobe, input, None, &manager).await?;
+    let mut projection_detection = crate::video::panorama::detect_metadata(
+        &json,
+        &video,
+        input
+            .extension()
+            .is_some_and(|s| s.eq_ignore_ascii_case("mp4")),
+    );
+    projection_detection.source_identity = crate::video::panorama::source_identity(input)?;
+    let _ = ffmpeg;
+    Ok(VideoAnalysis {
+        video,
+        projection_detection,
+    })
 }
 
 pub(crate) fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
@@ -480,22 +603,25 @@ pub async fn probe_and_plan(
     path: String,
     quality: Quality,
     planner_enabled: Option<bool>,
+    video_analysis: Option<VideoAnalysis>,
+    input_analysis: Option<InputAnalysis>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
     let engine_paths = paths_for_app(&app);
     let samples = catalog::runtime_samples().await;
     let input = PathBuf::from(path);
-    let planner_enabled = planner_enabled.unwrap_or(true);
+    let policy = generation_policy.unwrap_or_default().validate()?;
+    let _legacy_planner_enabled = planner_enabled;
+    let planner_enabled = true;
     if input.is_dir() {
-        let image_sequence = tokio::task::spawn_blocking({
-            let input = input.clone();
-            move || analyze_image_sequence(&input)
-        })
-        .await
-        .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
+        let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+        let image_sequence = analysis
+            .image_sequence
+            .ok_or_else(|| SplatError::InvalidPath(input.clone()))?;
         let plan = create_image_plan(&image_sequence, &quality.preset());
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
         let resolution = planner_enabled.then(|| {
-            resolve_planner_resolution_plan(
+            policy.resolution(
                 quality,
                 acceleration.planning_gpu_total_memory_mb(),
                 image_sequence.width,
@@ -537,19 +663,40 @@ pub async fn probe_and_plan(
         );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Images,
+            projection_detection: Some(analysis.projection_detection),
             video: None,
             image_sequence: Some(image_sequence),
             plan,
             estimate,
         })
     } else {
-        let video =
-            probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
-        let plan = if planner_enabled {
-            QualityV2FrameSelection.create_plan(&video, &quality.preset())
-        } else {
-            UniformRatioFrameSelection.create_plan(&video, &quality.preset())
-        };
+        let analysis = async {
+            let video_analysis = if input_analysis.is_some() {
+                let analysis =
+                    input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+                Some(VideoAnalysis {
+                    video: analysis
+                        .video
+                        .ok_or_else(|| SplatError::InvalidPath(input.clone()))?,
+                    projection_detection: analysis.projection_detection,
+                })
+            } else {
+                video_analysis
+            };
+            video_analysis_for_plan(
+                &engine_paths.ffprobe,
+                &engine_paths.ffmpeg,
+                &input,
+                video_analysis,
+            )
+            .await
+        }
+        .await;
+        let VideoAnalysis {
+            video,
+            projection_detection,
+        } = video_preflight_diagnostics(&app, &engine_paths.ffprobe, &input, analysis).await?;
+        let plan = policy.frame_plan(&video, quality);
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
         let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
             (video.height, video.width)
@@ -557,7 +704,7 @@ pub async fn probe_and_plan(
             (video.width, video.height)
         };
         let resolution = planner_enabled.then(|| {
-            resolve_planner_resolution_plan(
+            policy.resolution(
                 quality,
                 acceleration.planning_gpu_total_memory_mb(),
                 source_width,
@@ -598,6 +745,7 @@ pub async fn probe_and_plan(
         );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
+            projection_detection: Some(projection_detection),
             video: Some(video),
             image_sequence: None,
             plan,
@@ -633,8 +781,65 @@ fn resolve_checkpoint_brush(
     detected_total_memory_mb: Option<u64>,
     source_long_edge: u32,
     initial_sfm_points: u64,
-) -> crate::presets::ResolvedBrushTrainingPreset {
-    state.resolution_plan.map_or_else(
+) -> Result<crate::presets::ResolvedBrushTrainingPreset> {
+    if let Some(saved) = state.brush_training.resolved {
+        return Ok(saved);
+    }
+    if let Some(policy) = state.generation_policy.filter(|_| initial_sfm_points > 0) {
+        if let Some(panorama) = &state.panorama {
+            return policy.panorama_training(
+                quality,
+                detected_total_memory_mb,
+                panorama.face_size,
+                initial_sfm_points,
+                initial_sfm_points,
+            );
+        }
+        let resolution = state.resolution_plan.unwrap_or_else(|| {
+            policy.resolution(
+                quality,
+                detected_total_memory_mb,
+                source_long_edge,
+                source_long_edge,
+                false,
+            )
+        });
+        if policy.version >= 2
+            && quality == Quality::High
+            && state.brush_training.fine_splat_budget.is_none()
+        {
+            // Duration estimation must not scan training pixels, invent a cap,
+            // or prevent resuming before the final model has been inspected.
+            let mut estimate = resolve_brush_training_preset_for_plan(
+                quality,
+                detected_total_memory_mb,
+                source_long_edge,
+                initial_sfm_points,
+                &resolution,
+            );
+            estimate.configured_max_splats = None;
+            estimate.preset.max_splats = None;
+            return Ok(estimate);
+        }
+        return policy.training(
+            quality,
+            detected_total_memory_mb,
+            &resolution,
+            initial_sfm_points,
+            initial_sfm_points,
+            state.brush_training.fine_splat_budget.as_ref(),
+        );
+    }
+    if let Some(panorama) = &state.panorama {
+        return crate::presets::resolve_panorama_training_preset(
+            quality,
+            state.planner_enabled,
+            detected_total_memory_mb,
+            panorama.face_size,
+            initial_sfm_points,
+        );
+    }
+    Ok(state.resolution_plan.map_or_else(
         || {
             resolve_brush_training_preset(
                 quality,
@@ -653,7 +858,7 @@ fn resolve_checkpoint_brush(
                 &resolution,
             )
         },
-    )
+    ))
 }
 
 #[tauri::command]
@@ -673,6 +878,7 @@ pub async fn estimate_project_runtime(
             .max(1),
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         ..FramePlan::default()
     });
@@ -696,7 +902,7 @@ pub async fn estimate_project_runtime(
             let plan = saved_plan.unwrap_or_else(|| {
                 UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
             });
-            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+            let brush = state.brush_training.resolved.map(Ok).unwrap_or_else(|| {
                 resolve_checkpoint_brush(
                     &state,
                     metadata.quality,
@@ -708,7 +914,7 @@ pub async fn estimate_project_runtime(
                         .map(|output| output.points_3d)
                         .unwrap_or(0),
                 )
-            });
+            })?;
             estimate_runtime_with_brush_and_resolution(
                 &video,
                 &plan,
@@ -734,7 +940,7 @@ pub async fn estimate_project_runtime(
             };
             let plan = saved_plan
                 .unwrap_or_else(|| create_image_plan(&image_sequence, &metadata.quality.preset()));
-            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+            let brush = state.brush_training.resolved.map(Ok).unwrap_or_else(|| {
                 resolve_checkpoint_brush(
                     &state,
                     metadata.quality,
@@ -746,7 +952,7 @@ pub async fn estimate_project_runtime(
                         .map(|output| output.points_3d)
                         .unwrap_or(0),
                 )
-            });
+            })?;
             estimate_runtime_for_images_with_brush_and_resolution(
                 image_sequence.image_count,
                 image_sequence.width.max(image_sequence.height),
@@ -899,42 +1105,135 @@ pub async fn get_project_task_detail(
     {
         project.status = task.status.project_status();
     }
-    let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
-    let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
-    let progress = if project.status == ProjectStatus::Completed {
-        100.0
+    let imported_detail = metadata
+        .imported
+        .as_ref()
+        .map(|imported| ImportedProjectDetail {
+            source_model_path: imported.source_model_path.clone(),
+            format: imported.source_format,
+            source_available: project.source_available.unwrap_or(false),
+            colmap_root: imported
+                .colmap
+                .as_ref()
+                .map(|value| value.root_path.clone()),
+            sparse_model_path: imported
+                .colmap
+                .as_ref()
+                .map(|value| value.sparse_model_path.clone()),
+            database_available: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.database_path.as_ref())
+                .is_some_and(|path| path.is_file()),
+            images_available: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.images_path.as_ref())
+                .is_some_and(|path| path.is_dir()),
+            reshoot_eligible: imported
+                .colmap
+                .as_ref()
+                .is_some_and(|value| value.reshoot_eligible),
+            reshoot_reason: imported
+                .colmap
+                .as_ref()
+                .and_then(|value| value.reshoot_reason.clone()),
+        });
+    let is_imported = imported_detail.is_some();
+    let state = if is_imported {
+        None
     } else {
-        resume_checkpoint_fraction(&state).0 * 100.0
+        let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
+        Some(serde_json::from_slice::<PipelineStateFile>(&state_bytes)?)
     };
-    let stage = persisted_task_stage(&state, project.status);
-    let logs = read_project_log_tail(&project_root.join("logs")).await?;
+    let progress = state.as_ref().map(|state| {
+        if project.status == ProjectStatus::Completed {
+            100.0
+        } else {
+            resume_checkpoint_fraction(state).0 * 100.0
+        }
+    });
+    let stage = state
+        .as_ref()
+        .map(|state| persisted_task_stage(state, project.status));
+    let logs = if is_imported {
+        Vec::new()
+    } else {
+        read_project_log_tail(&project_root.join("logs")).await?
+    };
     let input_images = metadata.output.as_ref().map(|output| output.input_images);
     let registered_images = metadata
         .output
         .as_ref()
         .map(|output| output.registered_images);
     Ok(ProjectTaskDetail {
+        generation_policy: state.as_ref().and_then(|s| s.generation_policy),
+        automatically_retried: state
+            .as_ref()
+            .is_some_and(PipelineStateFile::automatically_retried),
+        reshoot_recipe: state
+            .as_ref()
+            .and_then(|s| s.reshoot.as_ref())
+            .and_then(|r| r.recipe.clone()),
         project,
-        input_type: metadata.input_type,
+        input_type: (!is_imported).then_some(metadata.input_type),
+        video_projection: project_video_projection(state.as_ref(), metadata.input_type),
+        input_projection: if is_imported {
+            None
+        } else if metadata.input_type == ProjectInputType::Images {
+            Some(if state.as_ref().is_some_and(|s| s.panorama.is_some()) {
+                crate::video::panorama::VideoProjection::Equirectangular
+            } else {
+                crate::video::panorama::VideoProjection::Perspective
+            })
+        } else {
+            project_video_projection(state.as_ref(), metadata.input_type)
+        },
         source_path: metadata.source_path,
         projects_root: project_root
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default(),
-        planner_enabled: state.planner_enabled,
-        estimated_frames: state.frames.as_ref().map(|frames| frames.estimated_frames),
+        planner_enabled: state.as_ref().map(|state| state.planner_enabled),
+        estimated_frames: state
+            .as_ref()
+            .and_then(|state| state.frames.as_ref())
+            .map(|frames| frames.estimated_frames),
         stage,
         progress,
         input_images,
         registered_images,
-        video: state.video,
-        image_sequence: state.image_sequence,
+        video: state.as_ref().and_then(|state| state.video.clone()),
+        image_sequence: state
+            .as_ref()
+            .and_then(|state| state.image_sequence.clone()),
         source_project_id: metadata
             .reshoot
             .as_ref()
             .map(|reshoot| reshoot.source_project_id.to_string()),
         logs,
+        imported: imported_detail,
     })
+}
+
+fn project_video_projection(
+    state: Option<&PipelineStateFile>,
+    input_type: ProjectInputType,
+) -> Option<crate::video::panorama::VideoProjection> {
+    use crate::video::panorama::VideoProjection;
+    if input_type != ProjectInputType::Video {
+        return None;
+    }
+    let state = state?;
+    if state.panorama.is_some() {
+        return Some(VideoProjection::Equirectangular);
+    }
+    match state.video_projection {
+        VideoProjection::Equirectangular => Some(VideoProjection::Equirectangular),
+        VideoProjection::Perspective => Some(VideoProjection::Perspective),
+        VideoProjection::Auto if state.video.is_some() => Some(VideoProjection::Perspective),
+        VideoProjection::Auto => None,
+    }
 }
 
 #[tauri::command]
@@ -1000,8 +1299,11 @@ async fn wait_task_result(
             message: error.message,
             failed_stage: error.failed_stage,
             engine: error.engine,
-            failure_kind: None,
-            project_id: task.project_id.map(|v| v.to_string()),
+            failure_kind: crate::failure::known_kind(error.classification.as_deref()),
+            classification_version: error.classification_version,
+            classification_is_heuristic: error.classification_is_heuristic,
+            termination: error.termination.map(Box::new),
+            project_id: task.project_id.map(|v| v.to_string().into_boxed_str()),
             project_path: task.project_path.map(Box::new),
             logs_directory: None,
             failure_id: error.failure_id.map(Box::new),
@@ -1021,7 +1323,25 @@ pub async fn create_gui_task(
     projects_root: String,
     planner_enabled: Option<bool>,
     workspace_task_id: Option<String>,
+    video_projection: Option<crate::video::panorama::VideoProjection>,
+    video_source_identity: Option<String>,
+    input_projection: Option<crate::video::panorama::VideoProjection>,
+    input_source_identity: Option<String>,
+    image_matching_strategy: Option<crate::project::ImageMatchingStrategy>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
 ) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
+    let video_projection = input_projection.or(video_projection);
+    let video_source_identity = input_source_identity.or(video_source_identity);
+    if let Some(expected) = &video_source_identity {
+        let identity = crate::video::panorama::source_identity(std::path::Path::new(&path))
+            .map_err(|e| crate::tasks::ServiceError::new("INPUT_CHANGED", e.to_string()))?;
+        if &identity != expected {
+            return Err(crate::tasks::ServiceError::new(
+                "INPUT_CHANGED",
+                "素材文件已发生变化，请重新分析后再生成",
+            ));
+        }
+    }
     let id = workspace_task_id
         .map(|v| Uuid::parse_str(&v))
         .transpose()
@@ -1035,7 +1355,7 @@ pub async fn create_gui_task(
             planner_enabled.unwrap_or(true),
             "gui",
             None,
-            None,
+            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default(), "generationPolicy":generation_policy.unwrap_or_default()})),
         )
         .await
 }
@@ -1044,8 +1364,27 @@ pub async fn start_gui_task(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     task_id: Uuid,
+    retry_failed_run_id: Option<Uuid>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再启动任务",
+        ));
+    }
+    if let Some(failed_run) = retry_failed_run_id {
+        return state
+            .retry_failed(
+                task_id,
+                failed_run,
+                paths_for_app(&app),
+                Some(telemetry.inner().clone()),
+            )
+            .await;
+    }
     state
         .start(
             task_id,
@@ -1090,8 +1429,16 @@ pub async fn resume_gui_task(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     project_id: Uuid,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再继续任务",
+        ));
+    }
     state
         .resume(
             project_id,
@@ -1107,12 +1454,19 @@ pub async fn start_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     path: String,
     quality: Quality,
     projects_root: String,
     planner_enabled: Option<bool>,
     workspace_task_id: Option<String>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(PipelineCommandError::from(SplatError::Process(
+            "已有 Gaussian 导入正在进行，请等待完成后再启动任务".into(),
+        )));
+    }
     let id = workspace_task_id
         .map(|v| Uuid::parse_str(&v))
         .transpose()
@@ -1227,6 +1581,17 @@ pub async fn open_project_location(
     let target = match location {
         ProjectLocation::Project => project,
         ProjectLocation::Logs => project.join("logs"),
+        ProjectLocation::Source => {
+            let (_, metadata) = catalog::load_registered_project(id).await?;
+            let source = metadata
+                .imported
+                .ok_or_else(|| SplatError::Process("该项目没有外部源文件".into()))?
+                .source_model_path;
+            source
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or(SplatError::InvalidPath(source))?
+        }
     };
     if !target.is_dir() {
         return Err(SplatError::InvalidPath(target));
@@ -1352,13 +1717,23 @@ pub async fn prepare_gaussian_preview(
     project_id: String,
 ) -> Result<GaussianPreviewDescriptor> {
     let _lifecycle = state.lifecycle.lock().await;
-    if state.html_export.lock().await.is_some() || state.video_export.lock().await.is_some() {
+    if state.html_export.lock().await.is_some()
+        || state.video_export.lock().await.is_some()
+        || state.model_export.lock().await.is_some()
+    {
         return Err(SplatError::Process(
             "导出期间不能重新加载或切换预览项目".into(),
         ));
     }
     let id = parse_project_id(&project_id)?;
     let (project_root, path, metadata) = catalog::registered_final_ply_for_project(id).await?;
+    let reference_root = project_root.clone();
+    let imported = metadata.imported.is_some();
+    let (reference_view, reference_view_unavailable) = tokio::task::spawn_blocking(move || {
+        crate::reconstruction::reference_view::training_reference_view(&reference_root, imported)
+    })
+    .await
+    .unwrap_or((None, Some("unavailable")));
     let info = inspect_gaussian_ply(&path)?;
     let transform = metadata.transform.validate()?;
     let editing = metadata.editing.validate(info.splat_count)?;
@@ -1372,16 +1747,32 @@ pub async fn prepare_gaussian_preview(
     if let Some(previous) = previous {
         discard_preview_asset(&app, previous).await;
     }
-    let asset_path = create_preview_asset(&project_root, &path).await?;
-    app.asset_protocol_scope()
-        .allow_file(&asset_path)
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&asset_path);
-            SplatError::Process(format!("无法开放本地 PLY 预览资源：{error}"))
-        })?;
-    let mut asset_paths = vec![asset_path.clone()];
+    let direct_external = metadata
+        .imported
+        .as_ref()
+        .is_some_and(|imported| imported.canonical_model_path.is_none());
+    let read_token = direct_external.then(Uuid::new_v4);
+    let asset_path = if direct_external {
+        path.clone()
+    } else {
+        let asset = create_preview_asset(&project_root, &path).await?;
+        app.asset_protocol_scope()
+            .allow_file(&asset)
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&asset);
+                SplatError::Process(format!("无法开放本地 PLY 预览资源：{error}"))
+            })?;
+        asset
+    };
+    let mut asset_paths = if direct_external {
+        Vec::new()
+    } else {
+        vec![asset_path.clone()]
+    };
     let edit_mask_asset_path = if editing.revision > 0 || editing.deleted_count > 0 {
-        let path = asset_path.with_extension("mask.bin");
+        let directory = project_root.join("work").join("preview");
+        tokio::fs::create_dir_all(&directory).await?;
+        let path = directory.join(format!("preview-{}.mask.bin", Uuid::new_v4().simple()));
         tokio::fs::write(&path, &edit_mask).await?;
         app.asset_protocol_scope()
             .allow_file(&path)
@@ -1397,6 +1788,14 @@ pub async fn prepare_gaussian_preview(
     *state.active.lock().await = Some(GaussianPreviewSession {
         project_id: id,
         asset_paths,
+        read_token,
+        read_path: direct_external.then_some(path.clone()),
+        read_size: direct_external.then_some(info.file_size),
+        read_modified_ms: metadata
+            .imported
+            .as_ref()
+            .filter(|_| direct_external)
+            .and_then(|imported| imported.source_fingerprint.modified_ms),
     });
 
     Ok(GaussianPreviewDescriptor {
@@ -1409,7 +1808,79 @@ pub async fn prepare_gaussian_preview(
         transform,
         editing,
         edit_mask_asset_path,
+        read_token,
+        reference_view,
+        reference_view_unavailable,
     })
+}
+
+#[tauri::command]
+pub async fn read_gaussian_preview_chunk(
+    state: State<'_, PreviewController>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response> {
+    let token = request
+        .headers()
+        .get("x-ooosplat-preview-token")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取令牌无效".into()))?;
+    let offset = request
+        .headers()
+        .get("x-ooosplat-offset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取偏移无效".into()))?;
+    let length = request
+        .headers()
+        .get("x-ooosplat-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_024_000)
+        .min(1_024_000);
+    let active = state.active.lock().await;
+    let session = active
+        .as_ref()
+        .filter(|session| session.read_token == Some(token))
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let path = session
+        .read_path
+        .clone()
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let file_size = session
+        .read_size
+        .ok_or_else(|| SplatError::Process("Gaussian 预览读取会话已结束".into()))?;
+    let expected_modified_ms = session.read_modified_ms;
+    if length == 0 || offset >= file_size {
+        return Err(SplatError::Process("Gaussian 预览读取范围无效".into()));
+    }
+    let remaining = usize::try_from(file_size - offset).unwrap_or(usize::MAX);
+    let length = length.min(remaining);
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let metadata = path.metadata()?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64);
+        if metadata.len() != file_size
+            || expected_modified_ms.is_some_and(|expected| modified_ms != Some(expected))
+        {
+            return Err(SplatError::Process(
+                "外部 Gaussian 文件在预览加载期间发生变化，请重新打开项目".into(),
+            ));
+        }
+        let mut file = std::fs::File::open(path)?;
+        use std::io::{Read, Seek};
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; length];
+        let read = file.read(&mut bytes)?;
+        bytes.truncate(read);
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| SplatError::Process(error.to_string()))??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -1420,6 +1891,16 @@ pub async fn release_gaussian_preview(
 ) -> Result<()> {
     let _lifecycle = state.lifecycle.lock().await;
     let id = parse_project_id(&project_id)?;
+    let model_id = state
+        .model_export
+        .lock()
+        .await
+        .as_ref()
+        .filter(|session| session.project_id == id)
+        .map(|session| session.id);
+    if let Some(export_id) = model_id {
+        model_export::cancel_gaussian_model_export(state.clone(), export_id).await?;
+    }
     let mut html_export = state.html_export.lock().await;
     if let Some(session) = html_export
         .as_ref()
@@ -1751,9 +2232,9 @@ pub async fn begin_gaussian_video_export(
     }
     drop(active);
 
-    if state.html_export.lock().await.is_some() {
+    if state.html_export.lock().await.is_some() || state.model_export.lock().await.is_some() {
         return Err(SplatError::Process(
-            "已有 HTML 正在导出，请等待或取消。".into(),
+            "已有模型或 HTML 正在导出，请等待或取消。".into(),
         ));
     }
 
@@ -1943,6 +2424,292 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_high_resume_estimate_does_not_require_a_pixel_scan_or_invent_a_budget() {
+        use super::*;
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        let estimated =
+            resolve_checkpoint_brush(&state, Quality::High, None, 3840, 66_218).unwrap();
+        assert_eq!(estimated.preset.max_splats, None);
+        assert_eq!(estimated.configured_max_splats, None);
+        assert_eq!(estimated.preset.max_resolution, 3840);
+        state.generation_policy.as_mut().unwrap().version = 1;
+        assert_eq!(
+            resolve_checkpoint_brush(&state, Quality::High, None, 3840, 66_218)
+                .unwrap()
+                .preset
+                .max_splats,
+            Some(2_648_720)
+        );
+    }
+
+    #[test]
+    fn panorama_estimates_use_recipe_but_saved_runs_keep_their_parameters() {
+        use super::*;
+        for images in [false, true] {
+            let mut state = PipelineStateFile::created(Quality::High);
+            state.planner_enabled = true;
+            state.panorama = Some(serde_json::from_value(serde_json::json!({
+                "version": 1, "sourceSha256": "fixture", "sfmWidth": 4096,
+                "sfmHeight": 2048, "faceSize": 1024, "fieldOfViewDegrees": 92.0,
+                "imageSources": if images { serde_json::json!([]) } else { serde_json::Value::Null },
+            })).unwrap());
+            let resolved =
+                resolve_checkpoint_brush(&state, Quality::High, Some(8192), 4096, 10_192).unwrap();
+            assert_eq!(resolved.preset.total_steps, 45_000);
+            assert_eq!(resolved.preset.max_splats, Some(3_000_000));
+            let old = crate::presets::resolve_brush_training_preset(
+                Quality::Fast,
+                true,
+                Some(8192),
+                512,
+                10_192,
+            );
+            state.brush_training.resolved = Some(old);
+            assert_eq!(
+                resolve_checkpoint_brush(&state, Quality::High, Some(24_576), 4096, 10_192)
+                    .unwrap(),
+                old
+            );
+            // A panorama task saved before the manual-cap change must also
+            // retain its former 10M cap rather than adopting the new 3M cap.
+            let mut old_panorama = crate::presets::resolve_panorama_training_preset(
+                Quality::High,
+                false,
+                Some(8192),
+                1024,
+                10_192,
+            )
+            .unwrap();
+            old_panorama.configured_max_splats = Some(10_000_000);
+            old_panorama.preset.max_splats = Some(10_000_000);
+            let saved = serde_json::to_vec(&old_panorama).unwrap();
+            state.brush_training.resolved = Some(serde_json::from_slice(&saved).unwrap());
+            assert_eq!(
+                resolve_checkpoint_brush(&state, Quality::High, Some(24_576), 4096, 10_192)
+                    .unwrap(),
+                old_panorama
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_preflight_cache_revalidates_membership_and_never_needs_engines() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["2.png", "10.png"] {
+            image::RgbImage::new(64, 32)
+                .save(root.path().join(name))
+                .unwrap();
+        }
+        let engines = crate::engines::EnginePaths::from_root(root.path().join("missing-engines"));
+        let first = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert!(first.projection_detection.requires_choice);
+        let second = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert_eq!(
+            crate::video::image_projection::header_reads_for_test(root.path()),
+            2
+        );
+        // More drafts than the cache capacity must still replan without header reads.
+        for _ in 0..9 {
+            let other = tempfile::tempdir().unwrap();
+            for name in ["1.png", "2.png"] {
+                image::RgbImage::new(64, 32)
+                    .save(other.path().join(name))
+                    .unwrap();
+            }
+            super::analyze_media(&engines, other.path()).await.unwrap();
+        }
+        super::input_analysis_for_plan(&engines, root.path(), Some(first.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::video::image_projection::header_reads_for_test(root.path()),
+            2
+        );
+        assert_eq!(
+            first.projection_detection.source_identity,
+            second.projection_detection.source_identity
+        );
+        image::RgbImage::new(64, 32)
+            .save(root.path().join("3.png"))
+            .unwrap();
+        let changed = super::analyze_media(&engines, root.path()).await.unwrap();
+        assert_ne!(
+            first.projection_detection.source_identity,
+            changed.projection_detection.source_identity
+        );
+        assert_eq!(changed.image_sequence.unwrap().image_count, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires bundled FFprobe and a real ordinary/panorama video path"]
+    async fn fast_video_detection_benchmark_and_single_probe_cache() {
+        let source = std::path::PathBuf::from(
+            std::env::var_os("OOOSPLAT_DETECTION_VIDEO").expect("Set real video"),
+        );
+        let engines = crate::engines::EnginePaths::from_root(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("engines"),
+        );
+        let start = std::time::Instant::now();
+        let first = super::analyze_media(&engines, &source).await.unwrap();
+        eprintln!(
+            "video cold: {} us; confirmed={}, choice={}",
+            start.elapsed().as_micros(),
+            first.projection_detection.confirmed_erp,
+            first.projection_detection.requires_choice
+        );
+        let mut absent = engines.clone();
+        absent.ffprobe = std::path::PathBuf::from("must-not-execute-on-cache-hit");
+        let start = std::time::Instant::now();
+        let second = super::analyze_media(&absent, &source).await.unwrap();
+        eprintln!(
+            "video hot: {} us, zero FFprobe on cache hit",
+            start.elapsed().as_micros()
+        );
+        assert_eq!(first.video, second.video);
+    }
+
+    #[tokio::test]
+    #[ignore = "Header-only preflight cold/cache-hit timing, isolated PNG fixtures"]
+    async fn fast_folder_detection_cache_benchmark() {
+        for count in [100, 1000] {
+            let root = tempfile::tempdir().unwrap();
+            for i in 0..count {
+                image::RgbImage::new(64, 32)
+                    .save(root.path().join(format!("{i}.png")))
+                    .unwrap();
+            }
+            let engines = crate::engines::EnginePaths::from_root(root.path().join("must-not-run"));
+            let before = crate::video::image_projection::header_reads_for_test(root.path());
+            let start = std::time::Instant::now();
+            super::analyze_media(&engines, root.path()).await.unwrap();
+            let cold = start.elapsed().as_micros();
+            let middle = crate::video::image_projection::header_reads_for_test(root.path());
+            let start = std::time::Instant::now();
+            super::analyze_media(&engines, root.path()).await.unwrap();
+            let hot = start.elapsed().as_micros();
+            let after = crate::video::image_projection::header_reads_for_test(root.path());
+            assert_eq!(middle - before, count);
+            assert_eq!(after - middle, 0);
+            eprintln!("{count} PNG preflight: cold {cold} us / {} header reads; cached {hot} us / {} header reads; FFprobe=0",middle-before,after-middle);
+        }
+    }
+
+    #[tokio::test]
+    async fn quality_replanning_reuses_video_analysis_without_starting_ffprobe() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("视频.mp4");
+        std::fs::write(&input, b"identity-only fixture, not a decodable video").unwrap();
+        let previous: super::VideoAnalysis = serde_json::from_value(serde_json::json!({
+            "video": { "duration": 10.0, "width": 3840, "height": 1920, "fps": 30.0,
+                "totalFrames": 300, "codec": "h264", "rotation": 0 },
+            "projectionDetection": { "sourceIdentity": crate::video::panorama::source_identity(&input).unwrap(),
+                "confirmedErp": true, "requiresChoice": false, "supportedErp": true,
+                "reason": "metadata", "previewJpeg": [] }
+        })).unwrap();
+        let missing_engine = root.path().join("must-not-run.exe");
+        let result = super::video_analysis_for_plan(
+            &missing_engine,
+            &missing_engine,
+            &input,
+            Some(previous.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.video, previous.video);
+        assert!(result.projection_detection.confirmed_erp);
+        // Changed content, size, mtime or path must not reuse a stale detection.
+        std::fs::write(&input, b"changed").unwrap();
+        assert!(super::video_analysis_for_plan(
+            &missing_engine,
+            &missing_engine,
+            &input,
+            Some(previous)
+        )
+        .await
+        .is_err());
+        assert!(
+            super::video_analysis_for_plan(&missing_engine, &missing_engine, &input, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires OOOSPLAT_PANORAMA_DETAIL_TEST_PROJECT and the bundled engines; read-only real input verification"]
+    async fn real_panorama_metadata_and_saved_detail_without_preview_extraction() {
+        let project = std::path::PathBuf::from(
+            std::env::var_os("OOOSPLAT_PANORAMA_DETAIL_TEST_PROJECT")
+                .expect("Set a real panorama project path"),
+        );
+        let state: crate::project::PipelineStateFile =
+            serde_json::from_slice(&std::fs::read(project.join("state.json")).unwrap()).unwrap();
+        let engines = crate::pipeline::runner::default_engine_paths(Some(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("engines"),
+        ));
+        let input = project.join("source/input.mp4");
+        let manager = crate::process::ProcessManager::new();
+        let video = crate::engines::ffprobe::probe_video(&engines.ffprobe, &input, None, &manager)
+            .await
+            .unwrap();
+        let detection = crate::video::panorama::detect(
+            &engines.ffprobe,
+            &engines.ffmpeg,
+            &input,
+            &video,
+            &manager,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(detection.confirmed_erp && !detection.requires_choice);
+        assert!(!detection.source_identity.is_empty() && detection.preview_jpeg.is_empty());
+        assert_eq!(
+            super::project_video_projection(Some(&state), crate::project::ProjectInputType::Video),
+            Some(crate::video::panorama::VideoProjection::Equirectangular)
+        );
+        eprintln!(
+            "Real metadata/detail verified: {}x{}, confirmed ERP, no JPEG extraction",
+            video.width, video.height
+        );
+    }
+    #[test]
+    fn historical_video_projection_comes_from_saved_configuration_not_dimensions() {
+        use super::project_video_projection;
+        use crate::presets::Quality;
+        use crate::project::{PipelineStateFile, ProjectInputType};
+        use crate::video::panorama::VideoProjection;
+        let mut state = PipelineStateFile::created(Quality::Fast);
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            Some(VideoProjection::Perspective)
+        );
+        state.video_projection = VideoProjection::Equirectangular;
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            Some(VideoProjection::Equirectangular)
+        );
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Images),
+            None
+        );
+        state.video_projection = VideoProjection::Auto;
+        assert_eq!(
+            project_video_projection(Some(&state), ProjectInputType::Video),
+            None
+        );
+        assert_eq!(
+            project_video_projection(None, ProjectInputType::Video),
+            None
+        );
+    }
     use super::{
         classify_dropped_input_path, classify_pipeline_failure, collect_project_assets,
         contains_mp4_ftyp, create_preview_asset, next_gaussian_video_path, persisted_task_stage,
@@ -2000,17 +2767,19 @@ mod tests {
         let cancelled =
             serde_json::to_value(PipelineCommandError::from(SplatError::Cancelled)).unwrap();
         assert_eq!(cancelled["code"], "cancelled");
+        assert!(cancelled.get("classificationVersion").is_none());
         let failed = serde_json::to_value(PipelineCommandError::from(SplatError::Process(
             "boom".into(),
         )))
         .unwrap();
         assert_eq!(failed["code"], "pipeline_failed");
+        assert_eq!(failed["classificationVersion"], 1);
         assert!(failed["message"].as_str().unwrap().contains("boom"));
     }
 
     #[test]
     fn pipeline_command_error_stays_below_clippy_large_error_threshold() {
-        assert!(std::mem::size_of::<PipelineCommandError>() <= 128);
+        assert!(std::mem::size_of::<PipelineCommandError>() < 128);
     }
 
     #[test]
@@ -2145,7 +2914,7 @@ mod tests {
                 Some(PipelineStage::Reconstructing),
                 "I/O error while reading feature descriptors",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineEngine::Colmap), None),
         );
         assert_eq!(
             classify_pipeline_failure(
@@ -2408,34 +3177,68 @@ end_header
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncrementalReshootRequest {
+    #[serde(default)]
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    #[serde(default)]
+    reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
     source_project_id: String,
     reshoot_path: String,
     input_type: ReshootInputType,
     projects_root: String,
     workspace_task_id: Option<String>,
+    quality: Option<Quality>,
+    planner_enabled: Option<bool>,
 }
 
 #[tauri::command]
 pub async fn inspect_reshoot_source(
     app: tauri::AppHandle,
     project_id: String,
+    recipe_version: Option<u32>,
 ) -> std::result::Result<ReshootSourceInfo, SplatError> {
     let project_id =
         Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
+    if recipe_version == Some(2) {
+        return PipelineRunner::new(paths_for_app(&app), |_| {})
+            .inspect_reshoot_source_v2(project_id)
+            .await;
+    }
     PipelineRunner::new(paths_for_app(&app), |_| {})
         .inspect_reshoot_source(project_id)
         .await
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn probe_reshoot_input(
     app: tauri::AppHandle,
     project_id: String,
     path: String,
     input_type: ReshootInputType,
+    recipe_version: Option<u32>,
+    quality: Option<Quality>,
+    planner_enabled: Option<bool>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    video_analysis: Option<VideoAnalysis>,
 ) -> std::result::Result<ReshootInputInfo, SplatError> {
     let project_id =
         Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
+    if recipe_version == Some(2) {
+        return PipelineRunner::new_with_planner(
+            paths_for_app(&app),
+            planner_enabled.unwrap_or(true),
+            |_| {},
+        )
+        .with_generation_policy(Some(generation_policy.unwrap_or_default().validate()?))
+        .probe_reshoot_input_v2_cached(
+            project_id,
+            Path::new(&path),
+            input_type,
+            quality.unwrap_or(Quality::Balanced),
+            video_analysis,
+        )
+        .await;
+    }
     PipelineRunner::new(paths_for_app(&app), |_| {})
         .probe_reshoot_input(project_id, Path::new(&path), input_type)
         .await
@@ -2446,8 +3249,16 @@ pub async fn start_gui_reshoot(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再启动补拍",
+        ));
+    }
     let source = Uuid::parse_str(&request.source_project_id)
         .map_err(|_| crate::tasks::ServiceError::new("INVALID_ARGUMENT", "原项目 ID 无效"))?;
     let (project, metadata) = catalog::load_registered_project(source).await?;
@@ -2460,6 +3271,39 @@ pub async fn start_gui_reshoot(
     }
     let checkpoint: PipelineStateFile =
         serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
+    let imported = metadata.imported.is_some();
+    let quality = if imported || request.reshoot_options.is_some() {
+        request.quality.unwrap_or(Quality::Balanced)
+    } else {
+        metadata.quality
+    };
+    let planner_enabled = if imported || request.reshoot_options.is_some() {
+        request.planner_enabled.unwrap_or(true)
+    } else {
+        checkpoint.planner_enabled
+    };
+    let policy = request.generation_policy.unwrap_or_else(|| {
+        crate::pipeline::generation_policy::GenerationPolicy {
+            auto_retry_enabled: request
+                .reshoot_options
+                .as_ref()
+                .map(|o| o.allow_fallback)
+                .unwrap_or(true),
+            ..Default::default()
+        }
+    });
+    if let Some(options) = &request.reshoot_options {
+        PipelineRunner::new_with_planner(paths_for_app(&app), planner_enabled, |_| {})
+            .with_generation_policy(Some(policy))
+            .validate_reshoot_request_v2(
+                source,
+                Path::new(&request.reshoot_path),
+                request.input_type,
+                quality,
+                options,
+            )
+            .await?;
+    }
     let id = request
         .workspace_task_id
         .map(|v| Uuid::parse_str(&v))
@@ -2469,12 +3313,12 @@ pub async fn start_gui_reshoot(
         .create(
             id,
             request.reshoot_path.into(),
-            metadata.quality,
+            quality,
             request.projects_root.into(),
-            checkpoint.planner_enabled,
+            planner_enabled,
             "gui",
             None,
-            None,
+            Some(serde_json::json!({"reshootOptions":request.reshoot_options, "generationPolicy":policy})),
         )
         .await?;
     state.mark_reshoot(task.task_id, source).await?;
@@ -2570,6 +3414,10 @@ pub async fn list_project_assets(
     *state.active.lock().await = Some(GaussianPreviewSession {
         project_id: id,
         asset_paths,
+        read_token: None,
+        read_path: None,
+        read_size: None,
+        read_modified_ms: None,
     });
     Ok(descriptors)
 }
@@ -2579,9 +3427,10 @@ pub async fn start_incremental_reshoot_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let receipt = start_gui_reshoot(app, state.clone(), telemetry, request)
+    let receipt = start_gui_reshoot(app, state.clone(), telemetry, imports, request)
         .await
         .map_err(service_command_error)?;
     wait_task_result(state.inner(), receipt.task_id).await

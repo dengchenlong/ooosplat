@@ -62,7 +62,7 @@ export class CropOutline {
       if (!this.visible || !this.geometry) return;
       app.drawLines(this.geometry.positions, this.geometry.colors, false, worldLayer);
     };
-    const updateHandle = app.on("update", draw);
+    const updateHandle = app.on("prerender", draw);
     this.stopDrawing = () => updateHandle.off();
   }
 

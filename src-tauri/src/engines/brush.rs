@@ -20,6 +20,8 @@ pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--growth-grad-threshold",
     "--growth-select-fraction",
     "--growth-stop-iter",
+    "--growth-start-iter",
+    "--sh-degree",
     "--export-every",
     "--export-path",
     "--export-name",
@@ -34,7 +36,10 @@ pub struct BrushGpuLaunchPolicy {
 }
 
 pub struct BrushTrainingOptions<'a> {
+    pub alpha_mode: Option<&'static str>,
+    pub warm: Option<crate::pipeline::reshoot::WarmStartParameters>,
     pub preset: BrushTrainingPreset,
+    pub panorama: bool,
     pub log_path: PathBuf,
     pub gpu_launch_policy: &'a BrushGpuLaunchPolicy,
 }
@@ -42,6 +47,19 @@ pub struct BrushTrainingOptions<'a> {
 impl BrushGpuLaunchPolicy {
     pub fn from_acceleration(acceleration: &ColmapAccelerationStatus) -> Self {
         Self::resolve(cfg!(windows), acceleration)
+    }
+
+    /// COLMAP's selected GPU is not necessarily Brush's default adapter in a
+    /// multi-GPU topology. Do not give panoramas a large VRAM budget when the
+    /// launch policy cannot identify the training device.
+    pub fn known_training_memory_mb(&self, acceleration: &ColmapAccelerationStatus) -> Option<u64> {
+        self.expected_device_name.as_ref().and_then(|expected| {
+            acceleration
+                .device
+                .as_ref()
+                .filter(|device| &device.name == expected)
+                .and_then(|_| acceleration.usable_gpu_total_memory_mb())
+        })
     }
 
     fn resolve(is_windows: bool, acceleration: &ColmapAccelerationStatus) -> Self {
@@ -153,6 +171,9 @@ fn train_args(
             densification.growth_stop_iter.to_string().into(),
         ]);
     }
+    if dataset.join("manifest.json").is_file() && dataset.join("signature.json").is_file() {
+        args.extend(["--max-scene-batch-cache-size".into(), "2GiB".into()]);
+    }
     args.extend([
         OsString::from("--export-every"),
         preset.total_steps.to_string().into(),
@@ -162,6 +183,23 @@ fn train_args(
         OsString::from("final.ply.tmp"),
         dataset.into(),
     ]);
+    args
+}
+
+fn train_args_for_mode(
+    dataset: &Path,
+    output_directory: &Path,
+    preset: BrushTrainingPreset,
+    panorama: bool,
+) -> Vec<OsString> {
+    let mut args = train_args(dataset, output_directory, preset);
+    if panorama {
+        // Pin these defaults for the versioned panorama recipe only.
+        args.splice(
+            0..0,
+            ["--growth-start-iter", "0", "--sh-degree", "3"].map(OsString::from),
+        );
+    }
     args
 }
 
@@ -190,19 +228,63 @@ pub async fn train(
         }
     }
     let environment = options.gpu_launch_policy.environment();
+    let mut args = train_args_for_mode(
+        dataset,
+        output_directory,
+        options.preset,
+        options.panorama && options.warm.is_none(),
+    );
+    if let Some(mode) = options.alpha_mode {
+        args.extend([OsString::from("--alpha-mode"), OsString::from(mode)]);
+    }
+    if let Some(warm) = options.warm {
+        args.splice(
+            0..0,
+            [
+                ("--growth-start-iter", warm.growth_start.to_string()),
+                ("--sh-degree", warm.sh_degree.to_string()),
+                ("--lr-mean", warm.lr_mean.to_string()),
+                ("--lr-mean-end", warm.lr_mean_end.to_string()),
+                ("--lr-coeffs-dc", warm.lr_coeffs_dc.to_string()),
+                ("--lr-opac", warm.lr_opac.to_string()),
+                ("--lr-scale", warm.lr_scale.to_string()),
+                ("--lr-rotation", warm.lr_rotation.to_string()),
+                ("--mean-noise-weight", warm.mean_noise_weight.to_string()),
+            ]
+            .into_iter()
+            .flat_map(|(key, value)| [OsString::from(key), OsString::from(value)]),
+        );
+    }
+    let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let counts = last_splat_count.clone();
+    let observer: ProcessObserver = std::sync::Arc::new(move |update| {
+        if let crate::process::ProcessUpdate::Line { line, .. } = &update {
+            if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
+                *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
+            }
+        }
+        if let Some(observer) = &observer {
+            observer(update);
+        }
+    });
     let output = manager
         .run_with_environment(
             ProcessSpec {
                 executable: executable.to_path_buf(),
-                args: train_args(dataset, output_directory, options.preset),
+                args,
                 working_directory: Some(output_directory.to_path_buf()),
                 log_path: Some(options.log_path),
-                observer,
+                observer: Some(observer),
             },
             &environment,
         )
         .await?;
-    resolve_train_output(&output, candidate, alternate)
+    resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
+        if let SplatError::EngineProcess(failure) = &mut error {
+            failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
+        }
+        error
+    })
 }
 
 fn resolve_train_output(
@@ -211,21 +293,12 @@ fn resolve_train_output(
     alternate: PathBuf,
 ) -> Result<PathBuf> {
     if !output.success {
-        let detail = output.failure_detail();
-        if is_out_of_memory_detail(&detail) {
-            return Err(SplatError::BrushOutOfMemory(detail));
-        }
-        if is_device_lost_detail(&detail) {
-            return Err(SplatError::BrushDeviceLost(detail));
-        }
-        return Err(SplatError::Process(format!(
-            "Brush 退出码 {:?}{}",
-            output.exit_code,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!("\n{detail}")
-            }
+        return Err(SplatError::EngineProcess(Box::new(
+            crate::failure::EngineProcessFailure::from_output(
+                crate::pipeline::PipelineEngine::Brush,
+                "train",
+                output,
+            ),
         )));
     }
     let candidate = if candidate.is_file() {
@@ -244,34 +317,6 @@ fn resolve_train_output(
         )));
     }
     Ok(candidate)
-}
-
-fn is_out_of_memory_detail(detail: &str) -> bool {
-    let normalized = detail.to_ascii_lowercase();
-    [
-        "out of memory",
-        "outofmemory",
-        "buffertoobig",
-        "buffer too big",
-        "failed to allocate",
-        "allocation failed",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
-}
-
-fn is_device_lost_detail(detail: &str) -> bool {
-    let normalized = detail.to_ascii_lowercase();
-    [
-        "devicelost",
-        "device lost",
-        "device_lost",
-        "parent device is lost",
-        "vk_error_device_lost",
-        "dxgi_error_device_removed",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
 }
 
 #[cfg(test)]
@@ -338,6 +383,10 @@ mod tests {
     fn windows_single_nvidia_policy_forces_first_discrete_gpu_for_brush_only() {
         let policy =
             BrushGpuLaunchPolicy::resolve(true, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+        assert_eq!(
+            policy.known_training_memory_mb(&acceleration(ColmapBackend::Gpu, 1, Some(0))),
+            Some(6144)
+        );
         let environment = policy.environment_with_rust_log(Some("app=debug".into()));
 
         assert_eq!(
@@ -367,6 +416,7 @@ mod tests {
             acceleration(ColmapBackend::Cpu, 0, None),
         ] {
             let policy = BrushGpuLaunchPolicy::resolve(true, &status);
+            assert_eq!(policy.known_training_memory_mb(&status), None);
             let environment = policy.environment_with_rust_log(None);
             assert_eq!(
                 environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
@@ -419,6 +469,32 @@ mod tests {
     }
 
     #[test]
+    fn panorama_cli_pins_growth_start_and_sh_without_changing_ordinary_jobs() {
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            let r =
+                crate::presets::resolve_panorama_training_preset(quality, false, None, 512, 10_192)
+                    .unwrap();
+            let dataset = Path::new("existing panorama");
+            let output = Path::new("isolated output");
+            let args = args_as_strings(train_args_for_mode(dataset, output, r.preset, true));
+            assert_eq!(args.last().unwrap(), "existing panorama");
+            for (flag, value) in [
+                ("--growth-start-iter", "0".into()),
+                ("--sh-degree", "3".into()),
+                ("--total-train-iters", r.preset.total_steps.to_string()),
+                ("--max-splats", r.preset.max_splats.unwrap().to_string()),
+            ] {
+                assert_eq!(args.iter().filter(|v| *v == flag).count(), 1);
+                assert!(args.windows(2).any(|w| w[0] == flag && w[1] == value));
+            }
+            assert_eq!(
+                train_args_for_mode(dataset, output, r.preset, false),
+                train_args(dataset, output, r.preset)
+            );
+        }
+    }
+
+    #[test]
     fn completed_iterations_or_zero_exit_do_not_establish_successful_export() {
         let directory = tempfile::tempdir().unwrap();
         let candidate = directory.path().join("final.ply.tmp");
@@ -426,6 +502,7 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
+            termination: crate::process::ProcessTermination::default(),
             stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
             stderr: "Export at iteration 4 failed".into(),
         };
@@ -443,7 +520,7 @@ mod tests {
         };
         assert!(matches!(
             resolve_train_output(&failed, candidate, alternate),
-            Err(SplatError::BrushDeviceLost(_))
+            Err(SplatError::EngineProcess(ref failure)) if failure.classification.kind == Some("brush_device_lost")
         ));
     }
 
@@ -546,9 +623,12 @@ mod tests {
 
     #[test]
     fn gpu_failure_classifiers_keep_oom_and_device_loss_separate() {
-        assert!(is_out_of_memory_detail("OutOfMemory while allocating"));
-        assert!(is_out_of_memory_detail("BufferTooBig(2290420416)"));
-        assert!(is_out_of_memory_detail("GPU allocation failed"));
+        use crate::failure::{
+            device_lost as is_device_lost_detail, gpu_oom as is_out_of_memory_detail,
+        };
+        assert!(is_out_of_memory_detail("wgpu OutOfMemory while allocating"));
+        assert!(!is_out_of_memory_detail("BufferTooBig(2290420416)"));
+        assert!(!is_out_of_memory_detail("GPU allocation failed"));
         assert!(!is_out_of_memory_detail("DeviceLost: driver reset"));
         assert!(is_device_lost_detail("DeviceLost: driver reset"));
         assert!(is_device_lost_detail("Parent device is lost"));
@@ -558,5 +638,24 @@ mod tests {
             "process exited with code -1073740791"
         ));
         assert!(!is_out_of_memory_detail("process exited with code 1"));
+    }
+
+    #[test]
+    fn real_panorama_wgpu_oom_remains_oom_despite_secondary_kernel_failures() {
+        let output = ProcessOutput {
+            success: false,
+            exit_code: Some(101),
+            termination: crate::process::ProcessTermination::default(),
+            stdout: "Refine iter 41001, 3476124 splats.".into(),
+            stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
+        };
+        assert!(matches!(
+            resolve_train_output(
+                &output,
+                PathBuf::from("absent.ply"),
+                PathBuf::from("absent.tmp.ply")
+            ),
+            Err(ref error) if error.is_brush_oom()
+        ));
     }
 }

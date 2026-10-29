@@ -100,6 +100,8 @@ export class OrbitAxisGuide {
   private destroyed = false;
   private visible = false;
   private modelSpan: number;
+  private geometryKey = "";
+  private geometry: OrbitAxisGuideGeometry | null = null;
   private readonly stopDrawing: () => void;
 
   constructor(app: Application, controls: ViewerControls, modelSpan: number) {
@@ -107,10 +109,16 @@ export class OrbitAxisGuide {
     const worldLayer = app.scene.layers.getLayerById(LAYERID_WORLD) ?? undefined;
     const draw = () => {
       if (!this.visible) return;
-      const geometry = buildOrbitAxisGuide(controls.orbitGuideState(), this.modelSpan);
+      const state = controls.orbitGuideState();
+      const key = [...state.target, state.radius, state.height, state.angleDegrees, this.modelSpan].join(",");
+      if (key !== this.geometryKey || !this.geometry) {
+        this.geometry = buildOrbitAxisGuide(state, this.modelSpan);
+        this.geometryKey = key;
+      }
+      const geometry = this.geometry;
       app.drawLines(geometry.positions, geometry.colors, false, worldLayer);
     };
-    const updateHandle = app.on("update", draw);
+    const updateHandle = app.on("prerender", draw);
     this.stopDrawing = () => updateHandle.off();
   }
 

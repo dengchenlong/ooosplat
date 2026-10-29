@@ -1,20 +1,21 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-04",
+  "generatedAt": "2026-10-18",
   "engines": [
     {
       "name": "FFmpeg / FFprobe",
       "requestedSeries": "8.1",
-      "actualVersion": "n8.1.3-14-g330caae0c1-20261003",
+      "actualVersion": "n8.1.3-9-g29e619e767-20260930",
       "distribution": "BtbN win64 LGPL shared 8.1",
-      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-03-18-14/ffmpeg-n8.1.3-14-g330caae0c1-win64-lgpl-shared-8.1.zip",
-      "archiveSha256": "11A4B44BC69721274909619A779D82544C8B83A6557C5B1BE92DCE9A41A968BE",
-      "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1.zip",
+      "archiveSha256": "3E47BDA1607740550141E37C0E49D1E5182B34699F15ADFD137EE266D346811A",
+      "license": "LGPL-3.0-or-later; GPL/nonfree codecs disabled",
       "licenseFiles": [
-        "licenses/FFmpeg-LGPL-2.1.txt"
+        "licenses/FFmpeg-LGPL-3.0.txt",
+        "licenses/FFmpeg-GPL-3.0.txt"
       ],
       "install": {
-        "archiveName": "ffmpeg-n8.1.3-14-g330caae0c1-win64-lgpl-shared-8.1.zip",
+        "archiveName": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1.zip",
         "destination": "engines/ffmpeg",
         "anchorFile": "ffmpeg.exe",
         "rootFromAnchorParent": 0
@@ -77,8 +78,15 @@
     }
   ],
   "requiredFiles": [
-    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "CBBD35C98C9378B7F3C0DB18D52BF926B44A419984D69F0A96ADFEA59703CEB7" },
-    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "A5B0B3099BBA84D94EA3B2764B09B9CCF0B7FA1D19055B61901B2D092EE3F051" },
+    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "A3BF949B1262EC9893BD80B681EC6001BA028BC7C8A4885E23C8DF5B0CE95B1A" },
+    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "FE818A56825E31F39791216977C729CCF1223051E3ABFB13ACBF8EA16E0E94BD" },
+    { "path": "engines/ffmpeg/avcodec-62.dll", "sha256": "4F817870CFAEACED3E34A083C50A1B4BE0389202D7FB821632D47CF9B3F4D82A" },
+    { "path": "engines/ffmpeg/avdevice-62.dll", "sha256": "34BC695CFDD3106DE29551C6868F1C2CDC0FA36903494506F1708251E6A3075E" },
+    { "path": "engines/ffmpeg/avfilter-11.dll", "sha256": "28E202431DC0643AF97C307DC6437DA13F8C08AA016FC28D1F9EC8FD0336E172" },
+    { "path": "engines/ffmpeg/avformat-62.dll", "sha256": "BCF514A394DC5EC43FE64E4F1624BA63B23E9C25967081EA2D03D95B0DC359EF" },
+    { "path": "engines/ffmpeg/avutil-60.dll", "sha256": "481620C7B5CD8E831A50762FAE55699C821091E96C42226D04FEE725A4AAE2F5" },
+    { "path": "engines/ffmpeg/swresample-6.dll", "sha256": "3BAAD8AC0C8F0050CFD5742F5104603A27127397521409BF7D1742E6D02F955B" },
+    { "path": "engines/ffmpeg/swscale-9.dll", "sha256": "D217A08BCD92B3A4B7ECB02E841724460A5C94A103D957370CFE75E892AC3DC2" },
     { "path": "engines/colmap/SHA256SUMS", "sha256": "79EEA38B9F9A4D55FE79C2FAE8DCBEBE4873D2DAB8A20DEBB0DFE596301A8C87" },
     { "path": "engines/brush/brush_app.exe", "sha256": "F65BBA1C7FCBDBB13E9299897ECB885F90F30555BEE9452A526E372EACF338DF" }
   ]

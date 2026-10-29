@@ -52,6 +52,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm run setup:engines
           npm run verify:engines
+          node scripts/smoke-ffmpeg-windows.mjs engines/ffmpeg
           node scripts/smoke-colmap-image-io.mjs engines/colmap/bin/colmap.exe
 
       - name: Rust formatting

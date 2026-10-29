@@ -4,6 +4,8 @@ pub mod commands;
 pub mod diagnostics;
 pub mod engines;
 pub mod error;
+pub mod failure;
+pub mod imports;
 pub mod mcp;
 pub mod pipeline;
 pub mod planner;
@@ -13,6 +15,7 @@ pub mod project;
 pub mod reconstruction;
 pub mod tasks;
 pub mod telemetry;
+pub mod updates;
 pub mod video;
 
 pub fn run_app() {
@@ -28,10 +31,13 @@ pub fn run_app() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .manage(commands::PipelineController::default())
         .manage(commands::PreviewController::default())
         .manage(telemetry::TelemetryService::new())
+        .manage(updates::UpdateService::default())
+        .manage(imports::ImportController::default())
         .setup(|app| {
             use tauri::Manager;
             let tasks = app.state::<commands::PipelineController>().inner().clone();
@@ -57,9 +63,12 @@ pub fn run_app() {
         })
         .manage(mcp::McpController::default())
         .invoke_handler(tauri::generate_handler![
+            updates::check_app_update,
             commands::check_engines,
             commands::check_colmap_acceleration,
             commands::probe_and_plan,
+            commands::analyze_input,
+            commands::detect_image_gps,
             commands::classify_dropped_input,
             commands::estimate_project_runtime,
             commands::start_pipeline,
@@ -84,16 +93,32 @@ pub fn run_app() {
             commands::export_ply,
             commands::get_project_overview,
             commands::get_project_task_detail,
+            imports::select_gaussian_import_source,
+            imports::probe_gaussian_import,
+            imports::begin_gaussian_import,
+            imports::read_gaussian_import_chunk,
+            imports::write_gaussian_import_chunk,
+            imports::complete_gaussian_import,
+            imports::cancel_gaussian_import,
+            imports::relink_imported_project,
             commands::set_projects_root,
             commands::set_planner_enabled,
             commands::delete_project,
             commands::prepare_gaussian_preview,
+            commands::read_gaussian_preview_chunk,
             commands::release_gaussian_preview,
             commands::save_gaussian_transform,
             commands::begin_gaussian_edit_save,
             commands::commit_gaussian_edit_save,
             commands::reset_gaussian_edits,
             commands::export_transformed_gaussian,
+            commands::model_export::begin_gaussian_model_export,
+            commands::model_export::prepare_gaussian_model_export,
+            commands::model_export::start_gaussian_model_encoding,
+            commands::model_export::read_gaussian_model_export_chunk,
+            commands::model_export::write_gaussian_model_export_chunk,
+            commands::model_export::complete_gaussian_model_export,
+            commands::model_export::cancel_gaussian_model_export,
             commands::begin_gaussian_video_export,
             commands::commit_gaussian_video_export,
             commands::cancel_gaussian_video_export,

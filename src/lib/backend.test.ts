@@ -12,9 +12,40 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm, open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
-import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { probeAndPlan, prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { startPipeline } from './backend';
 
 describe("backend browser guards", () => {
+  it("preserves new failure classification and native termination when waiting for a task", async () => {
+    const termination = { exitCode: -1073740940, windowsStatus: "0xC0000374" };
+    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'failed', project_id: 'project',
+      error: { message: 'Could not register image', failed_stage: 'reconstructing', engine: 'colmap', classification: 'colmap_crash', classification_version: 1, classification_is_heuristic: false, termination } });
+    await expect(startPipeline('E:/input.mp4', 'balanced', 'E:/projects', false)).rejects.toMatchObject({ code: 'pipeline_failed', failureKind: 'colmap_crash', classificationVersion: 1, classificationIsHeuristic: false, termination });
+    expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
+  it.each(['sequential', 'exhaustive', undefined] as const)('forwards image matching %s before starting exactly one task', async imageMatchingStrategy => {
+    const result = { projectId: 'project' };
+    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'completed', result });
+    await expect(startPipeline('E:/photos', 'balanced', 'E:/projects', true, 'draft', 'equirectangular', 'identity', imageMatchingStrategy)).resolves.toEqual(result);
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'create_gui_task', { path: 'E:/photos', quality: 'balanced', projectsRoot: 'E:/projects', plannerEnabled: true, workspaceTaskId: 'draft', inputProjection: 'equirectangular', inputSourceIdentity: 'identity', imageMatchingStrategy });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'start_gui_task', { taskId: 'task' });
+    expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
+  it("publishes fast metadata before planning and preserves the legacy replanning interface", async () => {
+    const metadata = { inputType: 'video', video: null, imageSequence: null, projectionDetection: { sourceIdentity: 'fresh', confirmedErp: false, requiresChoice: false, supportedErp: false, reason: '', previewJpeg: [] } };
+    mocks.invoke.mockResolvedValueOnce(metadata);
+    const analyzed = vi.fn();
+    await probeAndPlan("E:/clip.mp4", "balanced", true, undefined, analyzed);
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'analyze_input', { path: 'E:/clip.mp4' });
+    expect(analyzed).toHaveBeenCalledWith(metadata);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("probe_and_plan", { path: "E:/clip.mp4", quality: "balanced", plannerEnabled: true, inputAnalysis: metadata });
+    const videoAnalysis = {
+      video: { duration: 10, width: 200, height: 100, fps: 30, totalFrames: 300, codec: "h264", rotation: 0, pixelFormat: "yuv420p", hasAlpha: false },
+      projectionDetection: { sourceIdentity: "same-source", confirmedErp: true, requiresChoice: false, supportedErp: true, reason: "", previewJpeg: [] },
+    };
+    await probeAndPlan("E:/clip.mp4", "fast", false, videoAnalysis);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("probe_and_plan", { path: "E:/clip.mp4", quality: "fast", plannerEnabled: false, videoAnalysis });
+  });
   it("submits only opaque diagnostic tokens, never frontend paths or report payloads", async () => {
     await prepareErrorReport("failure-token"); expect(mocks.invoke).toHaveBeenLastCalledWith("prepare_error_report", {failureId:"failure-token"});
     await sendErrorReport("draft-token"); expect(mocks.invoke).toHaveBeenLastCalledWith("send_error_report", {draftId:"draft-token"});

@@ -22,6 +22,25 @@ const event = (sequence: number, progress: number): PipelineEvent => ({
 });
 
 describe("app store", () => {
+  it('keeps panorama monitor data through logs and heartbeats, but isolates a new process execution', () => {
+    useAppStore.getState().beginRun();
+    const base = { ...event(1, 50), kind: 'stage' as const, stage: 'reconstructing', substage: 'panoramaReconstruction', operation: { id: 1, attempt: 1 }, stageProgress: null, indeterminate: true };
+    const snapshot: RuntimeSnapshot = { processId: 42, phase: 'running', updatedAt: new Date().toISOString(), lastOutputAgeMs: 0, training: null, device: null, backend: null, config: {}, resources: null };
+    useAppStore.getState().receiveEvent(base);
+    useAppStore.getState().receiveEvent({ ...base, sequence: 2, kind: 'runtime', runtime: snapshot });
+    for (let sequence = 3; sequence <= 20; sequence++) {
+      useAppStore.getState().receiveEvent({ ...base, sequence, kind: sequence % 2 ? 'log' : 'heartbeat', substage: null });
+      expect(useAppStore.getState().latestRuntime).toBe(snapshot);
+      expect(useAppStore.getState().latestEvent?.substage).toBe('panoramaReconstruction');
+    }
+    const retry = { ...base, sequence: 21, operation: { id: 2, attempt: 2 }, progress: 45 };
+    useAppStore.getState().receiveEvent(retry);
+    expect(useAppStore.getState().latestRuntime).toBeNull();
+    useAppStore.getState().receiveEvent({ ...base, sequence: 22, kind: 'runtime', runtime: snapshot });
+    expect(useAppStore.getState().latestRuntime).toBeNull();
+    expect(useAppStore.getState().latestEvent?.operation?.attempt).toBe(2);
+    expect(useAppStore.getState().progress).toBe(50);
+  });
   beforeEach(() => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null, video: null, imageSequence: null,

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LanguageProvider, useI18n } from "../i18n";
 import type { RuntimeSnapshot } from "../types/pipeline";
 import { RuntimePanel } from "./RuntimePanel";
+import { TaskProgress } from './TaskProgress';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -53,6 +54,35 @@ afterEach(async () => {
 });
 
 describe("runtime panel", () => {
+  it.each(['zh-CN', 'en'])('does not retain the finishing monitor after a durable completion (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    const value = { ...snapshot(), phase: 'finishing', training: { ...snapshot().training!, iteration: 100 } };
+    const show = async (status: string) => act(async () => root.render(<LanguageProvider><TaskProgress status={status} stage={status === 'completed' ? 'completed' : 'trainingSplats'} progress={100} runtime={value} logs={[{ key: 'published', text: '已发布 200 个 Splat', source: 'system' }]} /></LanguageProvider>));
+    await show('running');
+    expect(container.querySelector('.runtime-panel')).not.toBeNull();
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('99.9%');
+    await show('completed');
+    expect(container.querySelector('.runtime-panel')).toBeNull();
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('100.0%');
+    expect(container.querySelector('.live-log')?.textContent).toContain('200');
+  });
+  it('keeps the same monitor container across preparation, samples and a true operation transition', async () => {
+    const renderTask = async (runtime: RuntimeSnapshot | null, substage: string) => act(async () => root.render(<LanguageProvider><TaskProgress status="running" stage="trainingSplats" substage={substage} progress={99.99} runtime={runtime} logs={[]} message="正在准备训练图片" /></LanguageProvider>));
+    await renderTask(null, 'panoramaTrainingPreparation');
+    const panel = container.querySelector('.runtime-panel');
+    expect(panel).not.toBeNull();
+    expect(container.querySelector('.stage-timeline li.active b')?.textContent).toBe('Splat 训练');
+    expect(container.querySelector('.process-metrics b')?.textContent).toBe('Splat 训练');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('99.9%');
+    for (let index = 0; index < 10; index++) {
+      await renderTask(snapshot(), 'training');
+      expect(container.querySelector('.runtime-panel')).toBe(panel);
+    }
+    await renderTask(null, 'training');
+    expect(container.querySelector('.runtime-panel')).toBe(panel);
+    expect(panel?.textContent).not.toContain('42');
+    expect(panel?.querySelector('.runtime-step-heading')).toBeNull();
+  });
   it("shows actual steps, resources and translated details", async () => {
     await render(snapshot());
     expect(container.textContent).toContain("50 / 100");

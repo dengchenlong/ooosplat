@@ -1,5 +1,11 @@
+mod panorama_training;
 mod pipeline_config;
 pub mod quality;
+
+pub use panorama_training::{
+    resolve_panorama_training_preset, PanoramaTrainingConfig, PanoramaTrainingSnapshot,
+    MAX_PANORAMA_SPLATS,
+};
 
 pub use pipeline_config::{
     pipeline_optimization_config, spawn_pipeline_blocking, with_pipeline_config,

@@ -22,6 +22,14 @@ pub enum ProjectInputType {
     Images,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMatchingStrategy {
+    Sequential,
+    #[default]
+    Exhaustive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GaussianTransform {
@@ -65,8 +73,18 @@ impl GaussianTransform {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum GaussianCrop {
-    Sphere { center: [f64; 3], radius: f64 },
-    Box { center: [f64; 3], size: [f64; 3] },
+    Sphere {
+        center: [f64; 3],
+        radius: f64,
+        #[serde(default)]
+        inverted: bool,
+    },
+    Box {
+        center: [f64; 3],
+        size: [f64; 3],
+        #[serde(default)]
+        inverted: bool,
+    },
 }
 
 impl GaussianCrop {
@@ -74,8 +92,8 @@ impl GaussianCrop {
         let valid_vector = |values: &[f64; 3]| values.iter().all(|value| value.is_finite());
         let valid_extent = |value: f64| value.is_finite() && (0.000_001..=1.0e12).contains(&value);
         let valid = match self {
-            Self::Sphere { center, radius } => valid_vector(&center) && valid_extent(radius),
-            Self::Box { center, size } => {
+            Self::Sphere { center, radius, .. } => valid_vector(&center) && valid_extent(radius),
+            Self::Box { center, size, .. } => {
                 valid_vector(&center) && size.iter().all(|value| valid_extent(*value))
             }
         };
@@ -89,19 +107,31 @@ impl GaussianCrop {
 
     pub fn contains(self, point: [f64; 3]) -> bool {
         match self {
-            Self::Sphere { center, radius } => {
-                point
+            Self::Sphere {
+                center,
+                radius,
+                inverted,
+            } => {
+                let inside = point
                     .iter()
                     .zip(center)
                     .map(|(value, origin)| (value - origin).powi(2))
                     .sum::<f64>()
-                    <= radius * radius
+                    <= radius * radius;
+                inside != inverted
             }
-            Self::Box { center, size } => point
-                .iter()
-                .zip(center)
-                .zip(size)
-                .all(|((value, origin), extent)| (value - origin).abs() <= extent * 0.5),
+            Self::Box {
+                center,
+                size,
+                inverted,
+            } => {
+                let inside = point
+                    .iter()
+                    .zip(center)
+                    .zip(size)
+                    .all(|((value, origin), extent)| (value - origin).abs() <= extent * 0.5);
+                inside != inverted
+            }
         }
     }
 }
@@ -164,6 +194,51 @@ pub struct ProjectOutput {
     pub points_3d: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportedGaussianFormat {
+    Ply,
+    CompressedPly,
+    Sog,
+    Spz,
+    Splat,
+    Ksplat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalFileFingerprint {
+    pub sha256: String,
+    pub file_size: u64,
+    pub modified_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedColmapProvenance {
+    pub root_path: PathBuf,
+    pub sparse_model_path: PathBuf,
+    pub database_path: Option<PathBuf>,
+    pub images_path: Option<PathBuf>,
+    pub registered_images: u64,
+    pub points_3d: u64,
+    pub camera_count: u64,
+    pub reshoot_eligible: bool,
+    pub reshoot_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectProvenance {
+    pub source_model_path: PathBuf,
+    pub source_format: ImportedGaussianFormat,
+    pub source_fingerprint: ExternalFileFingerprint,
+    /// Relative to the OOOSplat project root. Present for converted formats.
+    pub canonical_model_path: Option<PathBuf>,
+    #[serde(default)]
+    pub colmap: Option<ImportedColmapProvenance>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMetadata {
@@ -208,6 +283,10 @@ pub struct ProjectMetadata {
     /// 高清补拍溯源：仅当本项目由补拍派生时存在。源项目始终只读。
     #[serde(default)]
     pub reshoot: Option<ReshootProvenance>,
+    /// Provenance for an externally-owned Gaussian model. External files are
+    /// references only; OOOSplat deletes only its own project and cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<ImportedProjectProvenance>,
 }
 
 /// Where a derived reshoot project came from, and what was added to it.
@@ -244,7 +323,7 @@ pub struct ReshootProvenance {
 }
 
 pub const fn schema_version() -> u32 {
-    7
+    9
 }
 
 fn default_model() -> String {
@@ -272,6 +351,8 @@ pub struct FrameState {
     pub selected_frames: Vec<PlannedFrame>,
     #[serde(default)]
     pub candidate_frames: Vec<PlannedFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_source_frames: Option<u64>,
     #[serde(default)]
     pub rescue_max_frames: u64,
     #[serde(default)]
@@ -282,11 +363,17 @@ pub struct FrameState {
 #[serde(rename_all = "camelCase")]
 pub struct BrushTrainingCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fine_splat_budget: Option<crate::pipeline::splat_budget::FineSplatBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default)]
     pub oom_retry_used: bool,
+    #[serde(default)]
+    pub oom_retry_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_retry_source_count: Option<u64>,
 }
 
 /// Segment stage (issue #3) checkpoint: when `complete` is true the persisted
@@ -318,6 +405,7 @@ impl From<&FramePlan> for FrameState {
             initial_extracted_frames: plan.estimated_frames,
             selected_frames: plan.selected_frames.clone(),
             candidate_frames: plan.candidate_frames.clone(),
+            bridge_source_frames: plan.bridge_source_frames,
             rescue_max_frames: plan.rescue_max_frames,
             minimum_frame_override_applied: plan.minimum_frame_override_applied,
         }
@@ -327,6 +415,24 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_cache_pending: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_transparency: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gps: Option<crate::reconstruction::gps::Checkpoint>,
+    /// Frozen at creation. Legacy image projects retain exhaustive matching.
+    #[serde(default)]
+    pub image_matching_strategy: ImageMatchingStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) temporary_png_focal:
+        Option<crate::video::temporary_png_focal_workaround::Checkpoint>,
+    #[serde(default = "legacy_video_projection")]
+    pub video_projection: crate::video::panorama::VideoProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panorama: Option<crate::video::panorama::PanoramaCheckpoint>,
     #[serde(default)]
     pub configuration: Option<crate::presets::PipelineOptimizationConfig>,
     pub stage: PipelineStage,
@@ -365,6 +471,8 @@ pub struct PipelineStateFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
     pub source_snapshot_complete: bool,
     pub supplemental_frames_complete: bool,
     pub supplemental_features_complete: bool,
@@ -384,13 +492,35 @@ pub struct ReshootState {
     pub registered_reshoot_count: u64,
 }
 
+fn legacy_video_projection() -> crate::video::panorama::VideoProjection {
+    crate::video::panorama::VideoProjection::Perspective
+}
+
 impl PipelineStateFile {
+    pub fn automatically_retried(&self) -> bool {
+        self.generation_policy.is_some()
+            && (self.brush_training.oom_retry_started
+                || self
+                    .reshoot
+                    .as_ref()
+                    .and_then(|r| r.recipe.as_ref())
+                    .is_some_and(|r| r.reconstruction_fallbacks > 0 || r.training_fallbacks > 0))
+    }
     pub fn created(preset: Quality) -> Self {
         Self::created_for(preset, ProjectInputType::Video)
     }
 
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
+            // Older projects were always perspective. Never reinterpret their caches.
+            generation_policy: None,
+            retry_cache_pending: vec![],
+            actual_transparency: None,
+            gps: None,
+            temporary_png_focal: None,
+            image_matching_strategy: ImageMatchingStrategy::default(),
+            video_projection: crate::video::panorama::VideoProjection::Perspective,
+            panorama: None,
             configuration: None,
             stage: PipelineStage::Created,
             preset,
@@ -417,10 +547,60 @@ impl PipelineStateFile {
 mod tests {
     use super::*;
     #[test]
+    fn retry_badge_requires_a_started_controlled_retry_and_stays_legacy_safe() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        assert!(!state.automatically_retried());
+        state.brush_training.oom_retry_used = true;
+        assert!(!state.automatically_retried());
+        state.brush_training.oom_retry_started = true;
+        assert!(state.automatically_retried());
+        state.generation_policy = None;
+        assert!(!state.automatically_retried());
+    }
+    #[test]
+    fn image_matching_strategy_is_frozen_and_legacy_defaults_to_exhaustive() {
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.image_matching_strategy = ImageMatchingStrategy::Sequential;
+        state.matching_complete = true;
+        let mut json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["imageMatchingStrategy"], "sequential");
+        let restored: PipelineStateFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            restored.image_matching_strategy,
+            ImageMatchingStrategy::Sequential
+        );
+        assert!(restored.matching_complete);
+        json.as_object_mut()
+            .unwrap()
+            .remove("imageMatchingStrategy");
+        let legacy: PipelineStateFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            legacy.image_matching_strategy,
+            ImageMatchingStrategy::Exhaustive
+        );
+        json["imageMatchingStrategy"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<PipelineStateFile>(json).is_err());
+    }
+
+    #[test]
     fn state_uses_frame_strategy_vocabulary_only() {
         let json = serde_json::to_string(&PipelineStateFile::created(Quality::Balanced)).unwrap();
         assert!(json.contains("\"preset\":\"balanced\""));
         assert!(!json.contains("targetFrames"));
+    }
+
+    #[test]
+    fn legacy_projects_do_not_reinterpret_two_to_one_frames_as_panorama() {
+        let mut value = serde_json::to_value(PipelineStateFile::created(Quality::Fast)).unwrap();
+        value.as_object_mut().unwrap().remove("videoProjection");
+        value.as_object_mut().unwrap().remove("panorama");
+        let legacy: PipelineStateFile = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            legacy.video_projection,
+            crate::video::panorama::VideoProjection::Perspective
+        );
+        assert!(legacy.panorama.is_none());
     }
 
     #[test]
@@ -501,6 +681,53 @@ mod tests {
     }
 
     #[test]
+    fn panorama_recipe_snapshot_survives_resume_and_legacy_presets_stay_legacy() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        let initial = crate::presets::resolve_panorama_training_preset(
+            Quality::High,
+            true,
+            Some(8192),
+            1024,
+            10_192,
+        )
+        .unwrap();
+        state.brush_training.initial_resolved = Some(initial);
+        state.brush_training.resolved = initial.downgrade_after_oom(10_192);
+        state.brush_training.oom_retry_used = true;
+        let json = serde_json::to_vec(&state).unwrap();
+        let restored: PipelineStateFile = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.brush_training, state.brush_training);
+        assert_eq!(
+            restored
+                .brush_training
+                .initial_resolved
+                .unwrap()
+                .preset
+                .max_splats,
+            Some(3_000_000)
+        );
+        assert_eq!(
+            restored.brush_training.resolved.unwrap().preset.max_splats,
+            Some(1_500_000)
+        );
+
+        let mut old = serde_json::to_value(crate::presets::resolve_brush_training_preset(
+            Quality::Fast,
+            true,
+            Some(8192),
+            512,
+            10_192,
+        ))
+        .unwrap();
+        old.as_object_mut().unwrap().remove("panorama");
+        let restored: crate::presets::ResolvedBrushTrainingPreset =
+            serde_json::from_value(old).unwrap();
+        assert_eq!(restored.preset.total_steps, 8000);
+        assert_eq!(restored.preset.max_splats, Some(500_000));
+        assert!(restored.panorama.is_none());
+    }
+
+    #[test]
     fn staged_resolution_plan_round_trips_without_affecting_old_states() {
         let mut state = PipelineStateFile::created(Quality::High);
         state.resolution_policy_version = Some(crate::presets::PLANNER_RESOLUTION_POLICY_VERSION);
@@ -566,11 +793,13 @@ mod tests {
         let crop = GaussianCrop::Sphere {
             center: [0.0, 1.0, 2.0],
             radius: 4.0,
+            inverted: false,
         };
         assert!(crop.validate().is_ok());
         assert!(GaussianCrop::Box {
             center: [0.0; 3],
             size: [1.0, 0.0, 1.0],
+            inverted: false,
         }
         .validate()
         .is_err());
@@ -582,5 +811,22 @@ mod tests {
         }
         .validate(9)
         .is_err());
+    }
+
+    #[test]
+    fn inverted_crops_keep_the_complement_and_old_projects_default_to_inside() {
+        for json in [
+            r#"{"kind":"sphere","center":[0,0,0],"radius":1}"#,
+            r#"{"kind":"box","center":[0,0,0],"size":[2,2,2]}"#,
+        ] {
+            let normal: GaussianCrop = serde_json::from_str(json).unwrap();
+            let inverted: GaussianCrop =
+                serde_json::from_str(&json.replace('}', ",\"inverted\":true}")).unwrap();
+            assert!(normal.contains([0.0, 0.0, 0.0]));
+            assert!(!inverted.contains([0.0, 0.0, 0.0]));
+            assert!(!normal.contains([3.0, 0.0, 0.0]));
+            assert!(inverted.contains([3.0, 0.0, 0.0]));
+            assert!(inverted.validate().is_ok());
+        }
     }
 }

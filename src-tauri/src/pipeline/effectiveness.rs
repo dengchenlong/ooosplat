@@ -40,6 +40,19 @@ pub struct PlannerFramePlanMetrics {
     pub minimum_frame_target_unreachable: bool,
 }
 
+impl PlannerFramePlanMetrics {
+    pub fn images(width: u32, height: u32, count: u64) -> Self {
+        Self {
+            source_width: width.into(),
+            source_height: height.into(),
+            source_item_count: count,
+            initial_selected_count: count,
+            candidate_count: count,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannerInitialReconstructionMetrics {
@@ -203,9 +216,48 @@ pub struct PlannerEffectivenessSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct PlannerEffectivenessTracker {
     inner: Arc<Mutex<PlannerEffectivenessSnapshot>>,
+    pending_brush: Arc<Mutex<Option<(ResolvedBrushTrainingPreset, bool)>>>,
 }
 
 impl PlannerEffectivenessTracker {
+    /// Keep the plan even if GPU initialization fails; don't report an unstarted
+    /// fallback as the final executed configuration.
+    pub fn prepare_brush(
+        &self,
+        initial: Option<ResolvedBrushTrainingPreset>,
+        resolved: Option<ResolvedBrushTrainingPreset>,
+        oom_retry_used: bool,
+    ) {
+        *self.pending_brush.lock().unwrap_or_else(|p| p.into_inner()) =
+            resolved.map(|v| (v, oom_retry_used));
+        self.update(|snapshot| {
+            let brush = snapshot.brush.get_or_insert_with(Default::default);
+            if brush.initial_profile.is_none() {
+                brush.initial_profile = initial.map(|v| v.profile);
+            }
+            if brush.final_profile.is_none() {
+                if let Some(resolved) = resolved {
+                    let first = brush.initial_profile;
+                    brush.update(resolved, oom_retry_used);
+                    brush.initial_profile = first;
+                    brush.final_profile = None;
+                }
+            }
+        });
+    }
+
+    pub fn brush_started(&self) {
+        let pending = *self.pending_brush.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((resolved, oom)) = pending {
+            self.update(|snapshot| {
+                let brush = snapshot.brush.get_or_insert_with(Default::default);
+                let first = brush.initial_profile;
+                brush.update(resolved, oom);
+                brush.initial_profile = first;
+            });
+        }
+    }
+
     fn update(&self, apply: impl FnOnce(&mut PlannerEffectivenessSnapshot)) {
         let mut snapshot = self
             .inner
@@ -246,6 +298,27 @@ impl PlannerEffectivenessTracker {
         });
     }
 
+    pub fn restore_brush(
+        &self,
+        initial: Option<ResolvedBrushTrainingPreset>,
+        resolved: Option<ResolvedBrushTrainingPreset>,
+        oom_retry_used: bool,
+    ) {
+        if initial.is_none() && resolved.is_none() {
+            return;
+        }
+        self.update(|snapshot| {
+            let mut brush = PlannerBrushMetrics::default();
+            if let Some(resolved) = resolved.or(initial) {
+                brush.update(resolved, oom_retry_used);
+            }
+            // Old OOM checkpoints can contain only the final profile. Keep the
+            // unknown initial profile null instead of reporting the fallback as initial.
+            brush.initial_profile = initial.map(|value| value.profile);
+            snapshot.brush = Some(brush);
+        });
+    }
+
     pub fn record_final_result(&self, metrics: PlannerFinalResultMetrics) {
         self.update(|snapshot| snapshot.final_result = Some(metrics));
     }
@@ -258,7 +331,42 @@ impl PlannerEffectivenessTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presets::{BrushTrainingPreset, ResolvedBrushTrainingPreset};
+    use crate::presets::{BrushTrainingPreset, Quality, ResolvedBrushTrainingPreset};
+
+    #[test]
+    fn a_failed_first_execution_and_its_retry_keep_both_profiles_and_actual_caps() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let first = crate::presets::resolve_brush_training_preset(
+            Quality::High,
+            true,
+            Some(8192),
+            3840,
+            1000,
+        );
+        tracker.prepare_brush(Some(first), Some(first), false);
+        assert_eq!(tracker.snapshot().brush.unwrap().final_profile, None);
+        tracker.brush_started();
+        let mut retry = first;
+        retry.profile = BrushTrainingProfile::HighLow;
+        retry.preset.max_splats = Some(800_000);
+        tracker.prepare_brush(Some(first), Some(retry), true);
+        // A fallback that could not start must not replace the last executed config.
+        assert_eq!(
+            tracker.snapshot().brush.unwrap().final_profile,
+            Some(first.profile)
+        );
+        tracker.brush_started();
+        let result = tracker.snapshot().brush.unwrap();
+        assert_eq!(result.initial_profile, Some(first.profile));
+        assert_eq!(result.final_profile, Some(retry.profile));
+        assert_eq!(result.max_splats, Some(800_000));
+        assert!(result.oom_retry_used);
+        // New policy changes only cap, not profile.
+        retry.preset.max_splats = Some(600_000);
+        tracker.prepare_brush(Some(first), Some(retry), true);
+        tracker.brush_started();
+        assert_eq!(tracker.snapshot().brush.unwrap().max_splats, Some(600_000));
+    }
 
     #[test]
     fn tracker_accumulates_stage_durations_and_keeps_initial_brush_profile() {
@@ -269,6 +377,7 @@ mod tests {
             profile,
             detected_total_memory_mb: Some(8_192),
             configured_max_splats: Some(1_500_000),
+            panorama: None,
             preset: BrushTrainingPreset {
                 total_steps: 30_000,
                 max_resolution: 3_840,
@@ -289,5 +398,25 @@ mod tests {
         );
         assert_eq!(brush.final_profile, Some(BrushTrainingProfile::HighLow));
         assert!(brush.oom_retry_used);
+    }
+
+    #[test]
+    fn old_oom_checkpoint_does_not_invent_an_initial_profile() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let resolved = crate::presets::resolve_brush_training_preset(
+            crate::presets::Quality::High,
+            true,
+            Some(8192),
+            3840,
+            1000,
+        );
+        tracker.restore_brush(None, Some(resolved), true);
+        let brush = tracker.snapshot().brush.unwrap();
+        assert_eq!(brush.initial_profile, None);
+        assert_eq!(brush.final_profile, Some(resolved.profile));
+        assert!(brush.oom_retry_used);
+        // Absence of an OOM flag does not prove an older reshoot never fell back.
+        tracker.restore_brush(None, Some(resolved), false);
+        assert_eq!(tracker.snapshot().brush.unwrap().initial_profile, None);
     }
 }

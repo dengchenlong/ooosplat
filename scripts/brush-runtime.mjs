@@ -9,7 +9,7 @@ export const brushCommit = "866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5";
 export const brushTag = "ooo-v1.0.0";
 export const brushVersion = "brush-cli 1.0.0";
 export const requiredBrushFlags = ["--total-train-iters", "--max-resolution", "--refine-every", "--max-splats",
-  "--growth-grad-threshold", "--growth-select-fraction", "--growth-stop-iter", "--export-every", "--export-path", "--export-name"];
+  "--growth-grad-threshold", "--growth-select-fraction", "--growth-stop-iter", "--growth-start-iter", "--sh-degree", "--export-every", "--export-path", "--export-name"];
 const metadataFiles = ["LICENSE", "BUILDINFO.json", "UPSTREAM-SHA256SUMS", "UPSTREAM-README.md", "INSTALL-INFO.json"];
 const platforms = {
   windows: { host: "win32", arch: "x64", target: "x86_64-pc-windows-msvc", sourceBinary: "brush-cli.exe", viewer: "brush.exe",

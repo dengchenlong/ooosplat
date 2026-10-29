@@ -18,4 +18,11 @@ describe("previewAssetUrl", () => {
     expect(retried).toContain("retry=1");
     expect(retried).not.toContain("retry=0");
   });
+
+  it("resolves an imported model identity without treating it as an absolute URL", () => {
+    const resolved = previewAssetUrl("ooosplat-import-session.ply", "retry", "1");
+    const url = new URL(resolved);
+    expect(url.pathname).toMatch(/\/ooosplat-import-session\.ply$/);
+    expect(url.searchParams.get("retry")).toBe("1");
+  });
 });

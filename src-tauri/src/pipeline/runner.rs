@@ -2,15 +2,22 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
 };
 
+#[cfg(test)]
+use crate::planner::plan_bridge_backfill;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
+
+#[path = "gps_runner.rs"]
+mod gps_runner;
+#[path = "reshoot_runner.rs"]
+mod reshoot_runner;
 
 use crate::{
     engines::{
@@ -39,13 +46,13 @@ use crate::{
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
-        bridge_trigger_ratio, plan_bridge_backfill, read_registered_source_indices,
+        bridge_trigger_ratio, plan_bridge_backfill_cancellable, read_registered_source_indices,
         write_bridge_pair_list, BridgeBackfillStatus,
     },
     presets::{
         resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
-        resolve_planner_resolution_plan, Quality, ResolvedBrushTrainingPreset,
-        PLANNER_RESOLUTION_POLICY_VERSION,
+        resolve_panorama_training_preset, resolve_planner_resolution_plan, Quality,
+        ResolvedBrushTrainingPreset, PLANNER_RESOLUTION_POLICY_VERSION,
     },
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
@@ -105,6 +112,9 @@ pub struct PipelineResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootSourceInfo {
+    pub source_identity: String,
+    pub projection: crate::video::panorama::VideoProjection,
+    pub warm_available: bool,
     pub project_id: String,
     pub project_name: String,
     pub quality: Quality,
@@ -116,6 +126,7 @@ pub struct ReshootSourceInfo {
     pub source_image_count: u64,
     pub eligible: bool,
     pub reason: Option<String>,
+    pub imported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +139,14 @@ pub enum ReshootInputType {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootInputInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_detection: Option<crate::video::panorama::ProjectionDetection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_sequence: Option<ImageSequenceInfo>,
     pub input_type: ReshootInputType,
     pub image_count: Option<u64>,
     pub duration: Option<f64>,
@@ -143,6 +162,11 @@ pub struct ReshootInputInfo {
 
 #[derive(Clone)]
 struct EventSink {
+    context: Arc<std::sync::Mutex<OperationContext>>,
+    bound_operation: Option<super::event::PipelineOperation>,
+    // 0 ordinary; 1 panorama; 2 face preparation; 3 validation; 4 frame timing.
+    panorama_phase: Arc<AtomicU64>,
+    panorama_images: Arc<AtomicBool>,
     emit: Arc<dyn Fn(PipelineEvent) + Send + Sync>,
     sequence: Arc<AtomicU64>,
     last_progress_milli_percent: Arc<AtomicU64>,
@@ -151,7 +175,64 @@ struct EventSink {
     started: Instant,
 }
 
+#[derive(Default)]
+struct OperationContext {
+    serial: u64,
+    stage: Option<PipelineStage>,
+    substage: Option<String>,
+    current: Option<super::event::PipelineOperation>,
+    attempts: Vec<(PipelineStage, u32)>,
+}
+
 impl EventSink {
+    fn substage(&self, stage: PipelineStage) -> Option<String> {
+        match (stage, self.panorama_phase.load(Ordering::Relaxed)) {
+            (PipelineStage::ExtractingFrames, 4) => Some("panoramaTimestamps"),
+            (PipelineStage::ExtractingFrames, 1) => {
+                Some(if self.panorama_images.load(Ordering::Relaxed) {
+                    "panoramaImagesPreparation"
+                } else {
+                    "panoramaExtraction"
+                })
+            }
+            (PipelineStage::Reconstructing, 1) => {
+                Some(if self.panorama_images.load(Ordering::Relaxed) {
+                    "panoramaImagesReconstruction"
+                } else {
+                    "panoramaReconstruction"
+                })
+            }
+            (PipelineStage::TrainingSplats, 2) => Some("panoramaTrainingPreparation"),
+            (PipelineStage::TrainingSplats, 3) => Some("panoramaTrainingValidation"),
+            (PipelineStage::TrainingSplats, _) => Some("training"),
+            _ => None,
+        }
+        .map(str::to_owned)
+    }
+
+    fn begin_process(&self, stage: PipelineStage) -> Self {
+        let _dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut context = self.context.lock().unwrap_or_else(|p| p.into_inner());
+        let attempt =
+            if let Some((_, count)) = context.attempts.iter_mut().find(|(key, _)| *key == stage) {
+                *count += 1;
+                *count
+            } else {
+                context.attempts.push((stage, 1));
+                1
+            };
+        context.serial += 1;
+        let operation = super::event::PipelineOperation {
+            id: context.serial,
+            attempt,
+        };
+        context.stage = Some(stage);
+        context.substage = self.substage(stage);
+        context.current = Some(operation.clone());
+        let mut scoped = self.clone();
+        scoped.bound_operation = Some(operation);
+        scoped
+    }
     #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
@@ -166,28 +247,77 @@ impl EventSink {
         total: Option<u64>,
         unit: Option<&str>,
     ) {
-        if !matches!(
-            stage,
-            PipelineStage::Completed | PipelineStage::Failed | PipelineStage::Cancelled
-        ) {
+        let _dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut context = self.context.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .bound_operation
+            .as_ref()
+            .is_some_and(|op| context.current.as_ref().map(|active| active.id) != Some(op.id))
+        {
+            return;
+        }
+        let substage = self.substage(stage);
+        if kind == EventKind::Stage
+            && (context.stage != Some(stage) || context.substage != substage)
+        {
+            context.serial += 1;
+            context.current = Some(super::event::PipelineOperation {
+                id: context.serial,
+                attempt: 0,
+            });
+            context.stage = Some(stage);
+            context.substage = substage.clone();
+        }
+        let operation = context.current.clone();
+        let (stage, substage) = if matches!(kind, EventKind::Log | EventKind::Heartbeat) {
+            (context.stage.unwrap_or(stage), context.substage.clone())
+        } else {
+            (stage, substage)
+        };
+        drop(context);
+        if kind == EventKind::Stage
+            && !matches!(
+                stage,
+                PipelineStage::Completed | PipelineStage::Failed | PipelineStage::Cancelled
+            )
+        {
             *self
                 .last_stage
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stage);
         }
-        let (start, end) = stage_progress_range(stage);
+        let phase = self.panorama_phase.load(Ordering::Relaxed);
+        let (start, end) = if stage == PipelineStage::TrainingSplats && phase != 0 {
+            if phase == 2 || phase == 3 {
+                (60.0, 66.0)
+            } else {
+                (66.0, 98.0)
+            }
+        } else {
+            stage_progress_range(stage)
+        };
         let progress = stage_progress
             .map(|value| start + (end - start) * value.clamp(0.0, 1.0))
             .unwrap_or(start);
+        let progress = if stage != PipelineStage::Completed {
+            progress.min(99.9)
+        } else {
+            progress
+        };
         self.last_progress_milli_percent.fetch_max(
             (progress.max(0.0) * 1_000.0).round() as u64,
             Ordering::Relaxed,
         );
-        let _dispatch = self
-            .dispatch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stage_percent = stage_progress.map(|value| {
+            if stage == PipelineStage::TrainingSplats && phase != 0 {
+                (start + (end - start) * value.clamp(0.0, 1.0) - 60.0) / 38.0 * 100.0
+            } else {
+                value.clamp(0.0, 1.0) * 100.0
+            }
+        });
+        let progress = self.last_progress_milli_percent.load(Ordering::Relaxed) as f32 / 1_000.0;
         (self.emit)(PipelineEvent {
+            operation,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -196,9 +326,10 @@ impl EventSink {
             kind,
             level,
             stage,
+            substage,
             engine,
             progress,
-            stage_progress: stage_progress.map(|value| value.clamp(0.0, 1.0) * 100.0),
+            stage_progress: stage_percent,
             indeterminate,
             message: message.into(),
             current,
@@ -231,6 +362,7 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            operation: None,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -243,6 +375,7 @@ impl EventSink {
                 EventLevel::Warning
             },
             stage: PipelineStage::Created,
+            substage: None,
             engine: Some(PipelineEngine::Colmap),
             progress: 0.0,
             stage_progress: None,
@@ -262,7 +395,16 @@ impl EventSink {
             .dispatch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let context = self.context.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .bound_operation
+            .as_ref()
+            .is_some_and(|op| context.current.as_ref().map(|active| active.id) != Some(op.id))
+        {
+            return;
+        }
         (self.emit)(PipelineEvent {
+            operation: context.current.clone(),
             task_id: None,
             run_id: None,
             revision: 0,
@@ -271,6 +413,7 @@ impl EventSink {
             kind: EventKind::Runtime,
             level: EventLevel::Info,
             stage,
+            substage: context.substage.clone(),
             engine: Some(engine),
             progress: self.last_progress_milli_percent.load(Ordering::Relaxed) as f32 / 1_000.0,
             stage_progress: None,
@@ -292,6 +435,12 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            operation: self
+                .context
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .current
+                .clone(),
             task_id: None,
             run_id: None,
             revision: 0,
@@ -308,6 +457,7 @@ impl EventSink {
             } else {
                 PipelineStage::Failed
             },
+            substage: None,
             engine: Some(PipelineEngine::System),
             progress: self.last_progress_milli_percent.load(Ordering::Relaxed) as f32 / 1_000.0,
             stage_progress: None,
@@ -341,6 +491,8 @@ struct ActiveProjectContext {
 
 #[derive(Debug, Clone)]
 pub enum RunnerUpdate {
+    /// Telemetry-only boundary: a new attempt must not borrow the previous GPU.
+    BrushPreparation,
     Configuration(serde_json::Value),
     Project(Box<crate::project::ProjectMetadata>),
     LogOpened {
@@ -354,6 +506,11 @@ pub enum RunnerUpdate {
 }
 
 pub struct PipelineRunner {
+    failed_retry_policy: Option<super::generation_policy::GenerationPolicy>,
+    generation_policy: std::sync::RwLock<Option<super::generation_policy::GenerationPolicy>>,
+    reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
+    image_matching_strategy: crate::project::ImageMatchingStrategy,
+    video_projection: crate::video::panorama::VideoProjection,
     lifecycle: Option<Arc<dyn Fn(RunnerUpdate) + Send + Sync>>,
     input_boundary: Option<PathBuf>,
     engines: EnginePaths,
@@ -376,9 +533,23 @@ fn reshoot_project_name(source_name: &str) -> String {
     format!("{source_name}_补拍")
 }
 
+fn image_matching_policy(
+    input: ProjectInputType,
+    strategy: crate::project::ImageMatchingStrategy,
+    quality: Quality,
+    planner_enabled: bool,
+) -> (bool, bool) {
+    let sequential = input == ProjectInputType::Video
+        || strategy == crate::project::ImageMatchingStrategy::Sequential;
+    (
+        sequential,
+        sequential && quality.loop_detection_enabled(planner_enabled),
+    )
+}
+
 impl PipelineRunner {
     pub fn new(engines: EnginePaths, emit: impl Fn(PipelineEvent) + Send + Sync + 'static) -> Self {
-        Self::new_with_planner(engines, true, emit)
+        Self::new_with_planner(engines, true, emit).with_generation_policy(Some(Default::default()))
     }
 
     pub fn new_with_planner(
@@ -387,11 +558,20 @@ impl PipelineRunner {
         emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
     ) -> Self {
         Self {
+            reshoot_options: None,
+            failed_retry_policy: None,
+            generation_policy: std::sync::RwLock::new(None),
+            video_projection: crate::video::panorama::VideoProjection::Auto,
+            image_matching_strategy: crate::project::ImageMatchingStrategy::default(),
             engines,
             lifecycle: None,
             input_boundary: None,
             process_manager: ProcessManager::new(),
             events: EventSink {
+                context: Default::default(),
+                bound_operation: None,
+                panorama_phase: Arc::new(AtomicU64::new(0)),
+                panorama_images: Arc::new(AtomicBool::new(false)),
                 emit: Arc::new(emit),
                 sequence: Arc::new(AtomicU64::new(0)),
                 last_progress_milli_percent: Arc::new(AtomicU64::new(0)),
@@ -408,8 +588,73 @@ impl PipelineRunner {
         }
     }
 
+    pub fn with_generation_policy(
+        mut self,
+        policy: Option<super::generation_policy::GenerationPolicy>,
+    ) -> Self {
+        self.planner_enabled = policy.is_some() || self.planner_enabled;
+        *self
+            .generation_policy
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner()) = policy;
+        self
+    }
+
+    fn policy(&self) -> Option<super::generation_policy::GenerationPolicy> {
+        *self
+            .generation_policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn with_failed_retry_policy(
+        mut self,
+        policy: Option<super::generation_policy::GenerationPolicy>,
+    ) -> Self {
+        self.failed_retry_policy = policy;
+        self
+    }
+
+    fn resolution_plan(
+        &self,
+        quality: Quality,
+        memory: Option<u64>,
+        width: u32,
+        height: u32,
+        video: bool,
+    ) -> crate::presets::PlannerResolutionPlan {
+        self.policy().map_or_else(
+            || resolve_planner_resolution_plan(quality, memory, width, height, video),
+            |p| p.resolution(quality, memory, width, height, video),
+        )
+    }
+
     pub fn with_input_boundary(mut self, path: Option<PathBuf>) -> Self {
         self.input_boundary = path;
+        self
+    }
+
+    pub fn with_reshoot_options(
+        mut self,
+        options: Option<crate::pipeline::reshoot::ReshootOptions>,
+    ) -> Self {
+        self.reshoot_options = options;
+        self
+    }
+
+    pub fn with_video_projection(
+        mut self,
+        projection: crate::video::panorama::VideoProjection,
+    ) -> Self {
+        self.video_projection = projection;
+        self
+    }
+
+    pub fn with_image_matching_strategy(
+        mut self,
+        strategy: crate::project::ImageMatchingStrategy,
+    ) -> Self {
+        self.image_matching_strategy = strategy;
         self
     }
 
@@ -448,6 +693,219 @@ impl PipelineRunner {
     pub fn with_effectiveness_tracker(mut self, tracker: PlannerEffectivenessTracker) -> Self {
         self.effectiveness = Some(tracker);
         self
+    }
+
+    pub(crate) fn record_frame_metrics(
+        &self,
+        state: &PipelineStateFile,
+        selected_count: u64,
+        plan: Option<&FramePlan>,
+    ) {
+        let Some(tracker) = &self.effectiveness else {
+            return;
+        };
+        let (source_width, source_height, source_item_count) =
+            match (state.video.as_ref(), state.image_sequence.as_ref()) {
+                (Some(video), _) => (
+                    u64::from(video.width),
+                    u64::from(video.height),
+                    video.total_frames,
+                ),
+                (_, Some(images)) => (
+                    u64::from(images.width),
+                    u64::from(images.height),
+                    images.image_count,
+                ),
+                _ => return,
+            };
+        let frames = state.frames.as_ref();
+        let is_reshoot = state.reshoot.is_some();
+        let is_planned_video = state.planner_enabled && state.video.is_some();
+        let initial_selected_count = if is_reshoot {
+            selected_count
+        } else {
+            frames
+                .map(|frames| frames.initial_extracted_frames)
+                .filter(|count| *count > 0)
+                .unwrap_or(selected_count)
+        };
+        let has_candidates = is_planned_video && !is_reshoot;
+        let source_candidates = plan
+            .and_then(|plan| plan.bridge_source_frames)
+            .or_else(|| frames.and_then(|frames| frames.bridge_source_frames));
+        let candidate_count = if has_candidates {
+            source_candidates
+                .or_else(|| plan.map(FramePlan::candidate_count))
+                .or_else(|| frames.map(|frames| frames.candidate_frames.len() as u64))
+                .filter(|count| *count > 0)
+                .unwrap_or(initial_selected_count)
+        } else {
+            initial_selected_count
+        };
+        let preset = state.preset.preset();
+        let effective_fps = |count| {
+            state
+                .video
+                .as_ref()
+                .map(|video| count as f64 / video.duration.max(0.001))
+        };
+        tracker.record_frame_plan(PlannerFramePlanMetrics {
+            source_width,
+            source_height,
+            source_item_count,
+            configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
+            configured_candidate_fps: (has_candidates && source_candidates.is_none())
+                .then_some(preset.rescue_max_fps)
+                .flatten(),
+            effective_target_fps: effective_fps(initial_selected_count),
+            effective_candidate_fps: (!is_reshoot)
+                .then(|| effective_fps(candidate_count))
+                .flatten(),
+            initial_selected_count,
+            candidate_count,
+            minimum_frame_override_applied: is_planned_video
+                && if is_reshoot {
+                    state.video.as_ref().is_some_and(|video| {
+                        preset.initial_fps.is_some_and(|fps| {
+                            crate::video::minimum_selected_frames() as f64
+                                / video.duration.max(0.001)
+                                > fps
+                        })
+                    })
+                } else {
+                    plan.map(|plan| plan.minimum_frame_override_applied)
+                        .or_else(|| frames.map(|frames| frames.minimum_frame_override_applied))
+                        .unwrap_or(false)
+                },
+            minimum_frame_target_unreachable: is_planned_video
+                && source_item_count < crate::video::minimum_selected_frames(),
+        });
+    }
+
+    pub(super) fn record_input_plan(
+        &self,
+        quality: Quality,
+        video: &VideoInfo,
+        plan: &FramePlan,
+        is_reshoot: bool,
+    ) {
+        let mut state = PipelineStateFile::created(quality);
+        state.planner_enabled = self.planner_enabled;
+        state.video = Some(video.clone());
+        state.frames = Some(FrameState::from(plan));
+        if is_reshoot {
+            state.reshoot = Some(Default::default());
+        }
+        self.record_frame_metrics(&state, plan.estimated_frames, Some(plan));
+    }
+
+    /// Restore known source facts before a resumed run performs fallible cache checks.
+    /// A reshoot's frame checkpoint contains old + new images, not its source count.
+    fn restore_source_metrics(&self, state: &PipelineStateFile) {
+        let selected = if let Some(reshoot) = &state.reshoot {
+            reshoot
+                .supplemental_frames_complete
+                .then_some(reshoot.reshoot_frame_count)
+        } else {
+            state
+                .frames
+                .as_ref()
+                .map(|frames| frames.extracted_frames.unwrap_or(frames.estimated_frames))
+        };
+        if let Some(selected) = selected.filter(|count| *count > 0) {
+            self.record_frame_metrics(state, selected, None);
+        } else if let Some(images) = &state.image_sequence {
+            if let Some(tracker) = &self.effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    images.width,
+                    images.height,
+                    images.image_count,
+                ));
+            }
+        } else if let Some(video) = &state.video {
+            let plan = if let Some(policy) = state.generation_policy {
+                policy.frame_plan(video, state.preset)
+            } else if state.planner_enabled {
+                QualityV2FrameSelection.create_plan(video, &state.preset.preset())
+            } else {
+                UniformRatioFrameSelection.create_plan(video, &state.preset.preset())
+            };
+            self.record_frame_metrics(state, plan.estimated_frames, Some(&plan));
+        }
+    }
+
+    pub(crate) fn record_reconstruction_metrics(
+        &self,
+        report: &ReconstructionReport,
+        acceleration: &crate::engines::ColmapAccelerationStatus,
+        allow_two_view_tracks: bool,
+        is_reshoot: bool,
+    ) {
+        let Some(tracker) = &self.effectiveness else {
+            return;
+        };
+        tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
+            PlannerGpuVendor::Nvidia
+        } else if cfg!(target_os = "macos") {
+            PlannerGpuVendor::Apple
+        } else {
+            PlannerGpuVendor::Unknown
+        });
+        tracker.record_initial_reconstruction(PlannerInitialReconstructionMetrics {
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            points_3d: report.points_3d,
+            backend: acceleration.backend,
+            allow_two_view_tracks,
+        });
+        if is_reshoot {
+            tracker.record_bridge(PlannerBridgeMetrics {
+                status: PlannerBridgeStatus::NotApplicable,
+                trigger_ratio: bridge_trigger_ratio(),
+                initial_input_images: report.input_images,
+                initial_registered_images: report.registered_images,
+                initial_points_3d: report.points_3d,
+                final_input_images: report.input_images,
+                final_registered_images: report.registered_images,
+                final_points_3d: report.points_3d,
+                ..Default::default()
+            });
+        }
+    }
+
+    pub(crate) fn record_brush_metrics(&self, state: &PipelineStateFile) {
+        if let Some(tracker) = &self.effectiveness {
+            tracker.restore_brush(
+                state.brush_training.initial_resolved,
+                state.brush_training.resolved,
+                state.brush_training.oom_retry_used,
+            );
+        }
+    }
+
+    pub(super) fn prepare_brush_observation(&self, state: &PipelineStateFile) {
+        if let Some(observer) = &self.lifecycle {
+            observer(RunnerUpdate::BrushPreparation);
+        }
+        if let Some(tracker) = &self.effectiveness {
+            tracker.prepare_brush(
+                state.brush_training.initial_resolved,
+                state.brush_training.resolved,
+                state.brush_training.oom_retry_used,
+            );
+        }
+    }
+
+    pub(crate) fn record_final_metrics(&self, output: &ProjectOutput) {
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_final_result(PlannerFinalResultMetrics {
+                input_images: output.input_images,
+                registered_images: output.registered_images,
+                points_3d: output.points_3d,
+                splat_count: output.splat_count,
+                ply_size_bytes: output.file_size,
+            });
+        }
     }
 
     pub fn with_workspace_task_id(mut self, workspace_task_id: Option<uuid::Uuid>) -> Self {
@@ -555,10 +1013,11 @@ impl PipelineRunner {
         planner_enabled: bool,
         probed_video: Option<VideoInfo>,
         target_dimensions: Option<(u32, u32)>,
+        panorama: bool,
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
-        let video = match probed_video {
+        let mut video = match probed_video {
             Some(video) => video,
             None => {
                 probe_video(
@@ -586,11 +1045,53 @@ impl PipelineRunner {
 
         self.events
             .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
-        let plan = if planner_enabled {
+        let mut plan = if let Some(policy) = self.policy() {
+            policy.frame_plan(&video, quality)
+        } else if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
+        self.record_input_plan(quality, &video, &plan, self.reshoot_options.is_some());
+        // A 2:1 target is set only by the persisted panorama branch. Keep real
+        // decoder PTS and indices, including a separate rescue candidate pool.
+        if panorama {
+            target_dimensions.ok_or_else(|| SplatError::Process("全景抽帧缺少目标尺寸".into()))?;
+            self.events.panorama_phase.store(4, Ordering::Relaxed);
+            self.events.send(
+                PipelineStage::ExtractingFrames,
+                Some(PipelineEngine::Ffmpeg),
+                EventKind::Stage,
+                EventLevel::Info,
+                None,
+                true,
+                "正在读取视频帧时间信息",
+                None,
+                None,
+                None,
+            );
+            let times = crate::video::panorama::actual_frame_plan(
+                &self.engines.ffprobe,
+                input,
+                &mut plan,
+                &self.process_manager,
+            )
+            .await?;
+            self.events.panorama_phase.store(1, Ordering::Relaxed);
+            if let Some(total) = plan.bridge_source_frames {
+                video.total_frames = total;
+            }
+            self.events
+                .stage(PipelineStage::ExtractingFrames, 0.0, "正在提取全景画面");
+            tokio::fs::write(
+                output
+                    .parent()
+                    .unwrap_or(output)
+                    .join("panorama-frame-times.json"),
+                serde_json::to_vec_pretty(&times)?,
+            )
+            .await?;
+        }
         self.events.stage(
             PipelineStage::PlanningFrames,
             1.0,
@@ -598,8 +1099,8 @@ impl PipelineRunner {
                 "预计提取 {} 帧（目标 {:.2} FPS，候选池 {} 帧 / 最高约 {:.2} FPS）",
                 plan.estimated_frames,
                 plan.sampling_fps,
-                plan.candidate_frames.len(),
-                plan.candidate_frames.len() as f64 / video.duration.max(f64::EPSILON)
+                plan.candidate_count(),
+                plan.candidate_count() as f64 / video.duration.max(f64::EPSILON)
             ),
         );
 
@@ -618,7 +1119,7 @@ impl PipelineRunner {
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
-        let extraction = if planner_enabled {
+        let extraction = if planner_enabled || panorama {
             extract_selected_frames(
                 &self.engines.ffmpeg,
                 input,
@@ -704,6 +1205,13 @@ impl PipelineRunner {
         .await
         .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let image_sequence = scan.info.clone();
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                image_sequence.width,
+                image_sequence.height,
+                image_sequence.image_count,
+            ));
+        }
         self.events.stage(
             PipelineStage::ProbingVideo,
             1.0,
@@ -812,6 +1320,84 @@ impl PipelineRunner {
         })
     }
 
+    async fn prepare_panorama_images(
+        &self,
+        input: &Path,
+        quality: Quality,
+        config: &crate::video::panorama::PanoramaCheckpoint,
+        frames: &Path,
+        colmap: &Path,
+        masks: &Path,
+    ) -> Result<PreparedFrames> {
+        let source = input.to_path_buf();
+        let config = config.clone();
+        let (frames, colmap, masks) = (
+            frames.to_path_buf(),
+            colmap.to_path_buf(),
+            masks.to_path_buf(),
+        );
+        let cancellation = self.process_manager.child_token();
+        let events = self.events.clone();
+        let effectiveness = self.effectiveness.clone();
+        crate::presets::spawn_pipeline_blocking(move || {
+            let scan = crate::video::image_projection::analyze(&source)?;
+            if let Some(tracker) = &effectiveness {
+                tracker.record_frame_plan(PlannerFramePlanMetrics::images(
+                    scan.info.width,
+                    scan.info.height,
+                    scan.info.image_count,
+                ));
+            }
+            let plan = crate::video::create_image_plan(&scan.info, &quality.preset());
+            events.stage(
+                PipelineStage::PlanningFrames,
+                1.0,
+                format!("将处理全部 {} 张图片", scan.info.image_count),
+            );
+            events.stage(
+                PipelineStage::ExtractingFrames,
+                0.0,
+                format!("正在准备全景图片 0/{}", scan.info.image_count),
+            );
+            let prepared = crate::video::image_projection::prepare(
+                &source,
+                &config,
+                &frames,
+                &colmap,
+                &masks,
+                &cancellation,
+                |current, total| {
+                    events.send(
+                        PipelineStage::ExtractingFrames,
+                        Some(PipelineEngine::System),
+                        EventKind::Stage,
+                        EventLevel::Info,
+                        Some(current as f32 / total.max(1) as f32),
+                        false,
+                        format!("正在准备全景图片 {current}/{total}"),
+                        Some(current),
+                        Some(total),
+                        Some("images"),
+                    );
+                },
+            )?;
+            Ok(PreparedFrames {
+                input_type: ProjectInputType::Images,
+                video: None,
+                image_sequence: Some(scan.info),
+                plan,
+                extracted_frames: prepared.image_count,
+                image_format: "images".into(),
+                mask_count: prepared.mask_count,
+                has_alpha: prepared.has_alpha,
+                working_width: config.sfm_width,
+                working_height: config.sfm_height,
+            })
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))?
+    }
+
     pub async fn generate(
         &self,
         input: &Path,
@@ -888,7 +1474,13 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
+        state.video_projection = self.video_projection;
+        if state.input_type == ProjectInputType::Images {
+            state.image_matching_strategy = self.image_matching_strategy;
+            state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
+        }
         state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+        state.generation_policy = self.policy();
         state.planner_enabled = self.planner_enabled;
         state.resolution_policy_version = self
             .planner_enabled
@@ -908,6 +1500,9 @@ impl PipelineRunner {
     ) -> Result<ReshootSourceInfo> {
         let (project, metadata) = catalog::load_registered_project(project_id).await?;
         let mut info = ReshootSourceInfo {
+            source_identity: String::new(),
+            projection: crate::video::panorama::VideoProjection::Perspective,
+            warm_available: false,
             project_id: project_id.to_string(),
             project_name: metadata.name.clone(),
             quality: metadata.quality,
@@ -919,14 +1514,52 @@ impl PipelineRunner {
             source_image_count: 0,
             eligible: false,
             reason: None,
+            imported: metadata.imported.is_some(),
         };
         if !catalog::project_is_durably_completed(&project, &metadata).await {
             info.reason = Some("只有已完成且结果完整的项目可以进行高清补拍".into());
             return Ok(info);
         }
+        if let Some(imported) = &metadata.imported {
+            let Some(colmap) = imported.colmap.as_ref() else {
+                info.reason = Some("外部项目没有可复用的 COLMAP 数据".into());
+                return Ok(info);
+            };
+            if !colmap.reshoot_eligible {
+                info.reason = colmap
+                    .reshoot_reason
+                    .clone()
+                    .or_else(|| Some("外部 COLMAP 数据不满足高清补拍条件".into()));
+                return Ok(info);
+            }
+            let colmap = colmap.clone();
+            let parsed = match crate::presets::spawn_pipeline_blocking(move || {
+                crate::imports::revalidate_imported_colmap(&colmap)
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("读取外部相机信息失败：{error}")))?
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    info.reason = Some(error.to_string());
+                    return Ok(info);
+                }
+            };
+            info.camera_id = parsed.0.id;
+            info.camera_model = parsed.0.model;
+            info.width = parsed.0.width;
+            info.height = parsed.0.height;
+            info.source_image_count = parsed.1.len() as u64;
+            info.eligible = true;
+            return Ok(info);
+        }
         let source_state: PipelineStateFile =
             serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
         info.planner_enabled = source_state.planner_enabled;
+        if source_state.panorama.is_some() {
+            info.reason = Some("全景项目暂不支持高清补拍。".into());
+            return Ok(info);
+        }
         if source_state
             .frames
             .as_ref()
@@ -1088,6 +1721,10 @@ impl PipelineRunner {
             };
         let compatible = u64::from(width) == source.width && u64::from(height) == source.height;
         Ok(ReshootInputInfo {
+            video: None,
+            source_identity: None,
+            projection_detection: None,
+            image_sequence: None,
             input_type,
             image_count,
             duration,
@@ -1113,7 +1750,20 @@ impl PipelineRunner {
         reshoot_input: &Path,
         input_type: ReshootInputType,
         projects_root: &Path,
+        requested_quality: Quality,
     ) -> Result<PipelineResult> {
+        if let Some(options) = &self.reshoot_options {
+            return self
+                .generate_reshoot_v2(
+                    source_project_id,
+                    reshoot_input,
+                    input_type,
+                    projects_root,
+                    requested_quality,
+                    options.clone(),
+                )
+                .await;
+        }
         let source = self.inspect_reshoot_source(source_project_id).await?;
         if !source.eligible {
             return Err(SplatError::Process(
@@ -1140,8 +1790,19 @@ impl PipelineRunner {
         self.events.acceleration(acceleration.clone());
         let (source_root, source_metadata) =
             catalog::load_registered_project(source_project_id).await?;
-        let source_state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+        let source_state: PipelineStateFile = if source_metadata.imported.is_some() {
+            let mut state =
+                PipelineStateFile::created_for(requested_quality, ProjectInputType::Images);
+            state.planner_enabled = self.planner_enabled;
+            state
+        } else {
+            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?
+        };
+        let quality = if source_metadata.imported.is_some() {
+            requested_quality
+        } else {
+            source_metadata.quality
+        };
         let project_manager = ProjectManager::with_root(projects_root.to_path_buf());
         let (paths, mut metadata) = if input_type == ReshootInputType::Images {
             let events = self.events.clone();
@@ -1170,15 +1831,13 @@ impl PipelineRunner {
             project_manager
                 .create_with_progress(
                     reshoot_input,
-                    source_metadata.quality,
+                    quality,
                     Some(observer),
                     Some(self.process_manager.child_token()),
                 )
                 .await?
         } else {
-            project_manager
-                .create(reshoot_input, source_metadata.quality)
-                .await?
+            project_manager.create(reshoot_input, quality).await?
         };
         let stored_source = metadata.source_path.clone();
         metadata.name = reshoot_project_name(&source_metadata.name);
@@ -1188,7 +1847,8 @@ impl PipelineRunner {
         metadata.reshoot = Some(ReshootProvenance {
             source_project_id,
             source_project_path: source_root.clone(),
-            source_final_ply: source_root.join("final.ply"),
+            source_final_ply: catalog::project_model_path(&source_root, &source_metadata)
+                .unwrap_or_else(|| source_root.join("final.ply")),
             reshoot_source_path: stored_source,
             camera_id: source.camera_id,
             camera_model: source.camera_model,
@@ -1204,7 +1864,11 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
-        inherit_reshoot_planner_settings(&source_state, &mut state);
+        if source_metadata.imported.is_some() {
+            state.planner_enabled = self.planner_enabled;
+        } else {
+            inherit_reshoot_planner_settings(&source_state, &mut state);
+        }
         state.reshoot = Some(ReshootState {
             source_image_count: source.source_image_count,
             reshoot_frame_count: input.estimated_frames,
@@ -1302,7 +1966,13 @@ impl PipelineRunner {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| project.clone()),
         );
-        let state = project_manager.read_state(&paths.state).await?;
+        let mut state = project_manager.read_state(&paths.state).await?;
+        if let Some(policy) = self.failed_retry_policy {
+            self.prepare_failed_retry(&project_manager, &paths, &mut state, policy)
+                .await?;
+        }
+        self.archive_retry_cache(&project_manager, &paths, &mut state)
+            .await?;
         if state.preset != metadata.quality {
             return Err(SplatError::Process(
                 "项目档位与检查点不一致，无法安全继续".into(),
@@ -1310,6 +1980,217 @@ impl PipelineRunner {
         }
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
+    }
+
+    async fn actual_transparency(
+        &self,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        candidate: bool,
+    ) -> Result<bool> {
+        if let Some(value) = state.actual_transparency {
+            return Ok(value);
+        }
+        if !candidate {
+            state.actual_transparency = Some(false);
+            return Ok(false);
+        }
+        let frames = paths.frames.clone();
+        let cancel = self.process_manager.child_token();
+        let value = crate::presets::spawn_pipeline_blocking(move || -> Result<bool> {
+            for file in crate::video::list_images(&frames)? {
+                if cancel.is_cancelled() {
+                    return Err(SplatError::Cancelled);
+                }
+                let mut reader = image::ImageReader::open(&file)?.with_guessed_format()?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(crate::video::panorama::MAX_DECODE_BYTES);
+                reader.limits(limits);
+                let decoder = reader
+                    .into_decoder()
+                    .map_err(|e| SplatError::Process(e.to_string()))?;
+                use image::ImageDecoder;
+                if decoder.color_type().has_alpha() {
+                    let image = image::DynamicImage::from_decoder(decoder)
+                        .map_err(|e| SplatError::Process(e.to_string()))?;
+                    if crate::video::image_sequence::has_native_transparency(&image) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
+        state.actual_transparency = Some(value);
+        Ok(value)
+    }
+
+    async fn prepare_failed_retry(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        policy: super::generation_policy::GenerationPolicy,
+    ) -> Result<()> {
+        // Finish any interrupted archive before deciding compatibility again.
+        self.archive_retry_cache(manager, paths, state).await?;
+        let legacy = state.generation_policy.is_none();
+        let current_config = crate::presets::pipeline_optimization_config();
+        let current_quality = &current_config
+            .qualities
+            .get(state.preset)
+            .automatic_optimization_on;
+        let schedule_changed = state.configuration.as_ref().is_some_and(|old| {
+            let old = &old.qualities.get(state.preset).automatic_optimization_on;
+            old.initial_fps != current_quality.initial_fps
+                || old.rescue_max_fps != current_quality.rescue_max_fps
+        });
+        let new_resolution = state.video.as_ref().map(|v| {
+            let (w, h) = oriented_video_dimensions(v);
+            policy.resolution(state.preset, None, w, h, true)
+        });
+        let panorama_pixels_changed = legacy
+            && state.preset == Quality::High
+            && state.panorama.as_ref().is_some_and(|p| {
+                let width = state
+                    .video
+                    .as_ref()
+                    .map(|v| v.width)
+                    .or_else(|| state.image_sequence.as_ref().map(|i| i.width));
+                width.is_none_or(|w| p.sfm_width != w || p.face_size != w / 4)
+            });
+        let video_pixels_changed = if state.panorama.is_some() {
+            panorama_pixels_changed
+        } else {
+            match (state.resolution_plan, new_resolution) {
+                (Some(old), Some(new)) => {
+                    (old.working_width, old.working_height)
+                        != (new.working_width, new.working_height)
+                }
+                _ => legacy,
+            }
+        };
+        let reshoot_plan_changed = state
+            .reshoot
+            .as_ref()
+            .and_then(|r| r.recipe.as_ref())
+            .is_some_and(|r| r.actual != r.initial);
+        let manual_bridge_changed = policy.frame_sampling_ratio.is_some()
+            && state
+                .generation_policy
+                .is_some_and(|old| (old.version >= 3) != (policy.version >= 3));
+        let frames_changed = (state.input_type == ProjectInputType::Video
+            && (!state.planner_enabled
+                || state.generation_policy.and_then(|p| p.frame_sampling_ratio)
+                    != policy.frame_sampling_ratio
+                || schedule_changed
+                || manual_bridge_changed
+                || video_pixels_changed))
+            || (legacy && state.reshoot.is_some())
+            || reshoot_plan_changed
+            || panorama_pixels_changed;
+        let features_changed = frames_changed
+            || (legacy && !state.planner_enabled)
+            || state.configuration.as_ref().is_some_and(|old| {
+                old.qualities
+                    .get(state.preset)
+                    .automatic_optimization_on
+                    .sfm_max_features
+                    != current_quality.sfm_max_features
+            })
+            || matches!((state.resolution_plan,new_resolution),(Some(old),Some(new)) if old.sfm_max_image_size!=new.sfm_max_image_size);
+        let triangulation_changed = legacy
+            && state.frames.as_ref().is_some_and(|f| f.has_alpha)
+            && (state.input_type == ProjectInputType::Video
+                || !state.preset.preset().sfm_allow_two_view_tracks);
+        state.retry_cache_pending.push("brush".into());
+        if features_changed {
+            state.retry_cache_pending.push("colmap".into());
+            state.features_complete = false;
+            state.matching_complete = false;
+        }
+        if frames_changed {
+            state.actual_transparency = None;
+            state.retry_cache_pending.extend(
+                ["frames", "colmap_frames", "masks", "panorama-training"].map(str::to_owned),
+            );
+            state.frames = None;
+            state.panorama = None;
+            state.bridge_backfill = Default::default();
+            if let Some(checkpoint) = &mut state.reshoot {
+                let recipe = checkpoint.recipe.take();
+                *checkpoint = Default::default();
+                checkpoint.recipe = recipe;
+            }
+        }
+        if features_changed || triangulation_changed {
+            state.reconstruction_complete = false;
+            if state.gps.is_some() {
+                state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
+            }
+        }
+        state.brush_complete = false;
+        state.brush_training = Default::default();
+        state.resolution_plan = None;
+        state.resolution_policy_version = Some(PLANNER_RESOLUTION_POLICY_VERSION);
+        state.generation_policy = Some(policy.validate()?);
+        state.configuration = Some((*current_config).clone());
+        state.planner_enabled = true;
+        if let Some(recipe) = state.reshoot.as_mut().and_then(|r| r.recipe.as_mut()) {
+            recipe.options.allow_fallback = policy.auto_retry_enabled;
+            recipe.normal_parameters_version = Some(1);
+            recipe.warm_parameters = None;
+            recipe.actual = recipe.initial;
+            recipe.reconstruction_fallbacks = 0;
+            recipe.training_fallbacks = 0;
+            if frames_changed {
+                recipe.source_names.clear();
+                recipe.new_names.clear();
+                recipe.panorama_frames.clear();
+                recipe.camera_assignment = None;
+            }
+        }
+        // A durable reuse barrier precedes all renames, including failed renames.
+        manager.write_state(&paths.state, state).await?;
+        self.archive_retry_cache(manager, paths, state).await
+    }
+
+    async fn archive_retry_cache(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+    ) -> Result<()> {
+        if state.retry_cache_pending.is_empty() {
+            return Ok(());
+        }
+        let archive = paths
+            .work
+            .join("cache-archive")
+            .join(format!("generation-policy-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&archive).await?;
+        while let Some(name) = state.retry_cache_pending.last().cloned() {
+            if ![
+                "brush",
+                "colmap",
+                "frames",
+                "colmap_frames",
+                "masks",
+                "panorama-training",
+            ]
+            .contains(&name.as_str())
+            {
+                return Err(SplatError::Process("Invalid retry cache entry".into()));
+            }
+            let source = paths.work.join(&name);
+            if source.exists() {
+                tokio::fs::rename(source, archive.join(&name)).await?;
+            }
+            state.retry_cache_pending.pop();
+            manager.write_state(&paths.state, state).await?;
+        }
+        Ok(())
     }
 
     async fn execute_project(
@@ -1320,12 +2201,24 @@ impl PipelineRunner {
         state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
+        self.restore_source_metrics(&state);
+        if state.brush_complete {
+            self.record_brush_metrics(&state);
+        }
+        if let Some(policy) = state.generation_policy {
+            policy.validate()?;
+        }
         if let Some(observer) = &self.lifecycle {
             observer(RunnerUpdate::Project(Box::new(metadata.clone())));
             observer(RunnerUpdate::Configuration(
                 crate::tasks::checkpoint_snapshot(&state),
             ));
         }
+        // A resumed legacy snapshot must not inherit the new runner defaults.
+        *self
+            .generation_policy
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = state.generation_policy;
         let lifecycle = self.lifecycle.clone();
         let project_manager = project_manager.with_checkpoint_observer(Arc::new(move |state| {
             if let Some(observer) = &lifecycle {
@@ -1402,41 +2295,87 @@ impl PipelineRunner {
         mut state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
+        if state
+            .reshoot
+            .as_ref()
+            .and_then(|r| r.recipe.as_ref())
+            .is_some()
+        {
+            return self
+                .run_reshoot_v2(project_manager, paths, metadata, state, acceleration)
+                .await;
+        }
         let provenance = metadata
             .reshoot
             .clone()
             .ok_or_else(|| SplatError::Process("补拍项目缺少来源信息".into()))?;
         let mut checkpoint = state.reshoot.clone().unwrap_or_default();
         let source_root = &provenance.source_project_path;
-        let source_frames = source_root.join("work/frames");
-        let source_colmap_frames = source_root.join("work/colmap_frames");
-        let source_database = source_root.join("work/colmap/database.db");
         let source_metadata: ProjectMetadata =
             serde_json::from_slice(&tokio::fs::read(source_root.join("project.json")).await?)?;
-        let source_state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
-        if source_state
-            .frames
-            .as_ref()
-            .and_then(|frames| frames.colmap_input_version)
-            != Some(COLMAP_INPUT_VERSION)
+        let (source_frames, source_colmap_frames, source_database, source_model) = if let Some(
+            imported,
+        ) =
+            &source_metadata.imported
         {
-            return Err(SplatError::Process(
-                "原项目使用旧版或未知的 COLMAP 图片处理语义，不能与新版补拍特征缓存混用。请先从原素材重新生成基线项目。"
-                    .into(),
-            ));
-        }
-        validate_current_colmap_input_snapshot(source_root, &source_state)
-            .await
-            .map_err(|error| {
-                SplatError::Process(format!(
-                    "原项目的 COLMAP 专用图片不完整或与原始帧不一致，不能作为补拍基线：{error}"
-                ))
+            let colmap = imported.colmap.as_ref().ok_or_else(|| {
+                SplatError::Process("外部导入项目没有可复用的 COLMAP 数据".into())
             })?;
+            if !colmap.reshoot_eligible {
+                return Err(SplatError::Process(
+                    colmap
+                        .reshoot_reason
+                        .clone()
+                        .unwrap_or_else(|| "外部 COLMAP 数据不满足高清补拍条件".into()),
+                ));
+            }
+            let images = colmap
+                .images_path
+                .clone()
+                .filter(|path| path.is_dir())
+                .ok_or_else(|| SplatError::Process("外部 COLMAP 项目缺少原始图片".into()))?;
+            let database = colmap
+                .database_path
+                .clone()
+                .filter(|path| path.is_file())
+                .ok_or_else(|| SplatError::Process("外部 COLMAP 项目缺少 database.db".into()))?;
+            (
+                images.clone(),
+                images,
+                database,
+                colmap.sparse_model_path.clone(),
+            )
+        } else {
+            let state: PipelineStateFile =
+                serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+            if state
+                .frames
+                .as_ref()
+                .and_then(|frames| frames.colmap_input_version)
+                != Some(COLMAP_INPUT_VERSION)
+            {
+                return Err(SplatError::Process("原项目使用旧版或未知的 COLMAP 图片处理语义，不能与新版补拍特征缓存混用。请先从原素材重新生成基线项目。".into()));
+            }
+            validate_current_colmap_input_snapshot(source_root, &state)
+                .await
+                .map_err(|error| {
+                    SplatError::Process(format!(
+                        "原项目的 COLMAP 专用图片不完整或与原始帧不一致，不能作为补拍基线：{error}"
+                    ))
+                })?;
+            let frames = source_root.join("work/frames");
+            let colmap_frames = source_root.join("work/colmap_frames");
+            let reconstruction =
+                reusable_reconstruction(source_root, &frames, source_metadata.output.as_ref())
+                    .await?;
+            (
+                frames,
+                colmap_frames,
+                source_root.join("work/colmap/database.db"),
+                reconstruction.model,
+            )
+        };
         archive_incompatible_colmap_input_cache(paths, &state).await?;
-        let source_reconstruction =
-            reusable_reconstruction(source_root, &source_frames, source_metadata.output.as_ref())
-                .await?;
         if !source_database.is_file()
             || std::fs::metadata(&source_database).map_or(true, |value| value.len() == 0)
         {
@@ -1444,15 +2383,26 @@ impl PipelineRunner {
                 "原项目缺少可复用的 COLMAP 数据库".into(),
             ));
         }
-        let source_model_for_validation = source_reconstruction.model.clone();
+        let source_model_for_validation = source_model.clone();
         let source_database_for_validation = source_database.clone();
+        if let Some(colmap) = source_metadata
+            .imported
+            .as_ref()
+            .and_then(|imported| imported.colmap.clone())
+        {
+            crate::presets::spawn_pipeline_blocking(move || {
+                crate::imports::revalidate_imported_colmap(&colmap).map(|_| ())
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("复检外部 COLMAP 数据失败：{error}")))??;
+        }
         crate::presets::spawn_pipeline_blocking(move || {
             let camera = read_single_camera(&source_model_for_validation)?;
             validate_database_camera(&source_database_for_validation, &camera)
         })
         .await
         .map_err(|error| SplatError::Process(format!("校验补拍基线模型失败：{error}")))??;
-        let source_model_files = reusable_model_files(&source_reconstruction.model)?;
+        let source_model_files = reusable_model_files(&source_model)?;
         let base_model = paths.colmap.join("base-model");
         let database = paths.colmap.join("database.db");
         let base_database = paths.colmap.join("base-database.db");
@@ -1560,6 +2510,7 @@ impl PipelineRunner {
                     })
                     .await
                     .map_err(|error| SplatError::Process(format!("补拍图片扫描失败：{error}")))??;
+                    state.image_sequence = Some(scan.info.clone());
                     let frames = paths.frames.clone();
                     let colmap_frames = paths.colmap_frames.clone();
                     let masks = reshoot_masks.clone();
@@ -1627,6 +2578,7 @@ impl PipelineRunner {
                         &self.process_manager,
                     )
                     .await?;
+                    state.video = Some(supplemental_video.clone());
                     let target_width = u32::try_from(provenance.width).map_err(|_| {
                         SplatError::Process("Reshoot target width exceeds supported range".into())
                     })?;
@@ -1650,6 +2602,7 @@ impl PipelineRunner {
                             state.planner_enabled,
                             Some(supplemental_video),
                             Some((target_width, target_height)),
+                            false,
                         )
                         .await?;
                     move_extracted_reshoot(
@@ -1719,6 +2672,7 @@ impl PipelineRunner {
             );
             prepared
         };
+        self.record_frame_metrics(&state, prepared.image_count, None);
         let reshoot_names = image_names_with_prefix(&paths.colmap_frames, "reshoot_").await?;
         write_image_list(&reshoot_list, &reshoot_names).await?;
 
@@ -1850,6 +2804,8 @@ impl PipelineRunner {
         }
 
         let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+        // Incremental Mapper does not enable two-view tracks or bridge backfill.
+        self.record_reconstruction_metrics(&report, acceleration, false, true);
         let model_copy = model.clone();
         let registered_reshoot_count =
             crate::presets::spawn_pipeline_blocking(move || read_registered_images(&model_copy))
@@ -1876,6 +2832,7 @@ impl PipelineRunner {
             state.brush_complete = false;
         }
         let candidate = if state.brush_complete {
+            self.record_brush_metrics(&state);
             brush_candidate(&paths.brush)
                 .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失".into()))?
         } else {
@@ -1894,7 +2851,14 @@ impl PipelineRunner {
                     report.points_3d,
                 )
             });
+            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
+                state
+                    .brush_training
+                    .initial_resolved
+                    .get_or_insert(resolved_brush);
+            }
             state.brush_training.resolved = Some(resolved_brush);
+            self.prepare_brush_observation(&state);
             project_manager.write_state(&paths.state, &state).await?;
             self.events.send(
                 PipelineStage::TrainingSplats,
@@ -1927,6 +2891,8 @@ impl PipelineRunner {
             candidate
         };
 
+        self.events
+            .stage(PipelineStage::Exporting, 0.0, "正在校验并发布 final.ply");
         let ply = inspect_gaussian_ply(&candidate)?;
         let final_ply = paths.project.join("final.ply");
         atomic_replace_file(&candidate, &final_ply).await?;
@@ -1959,6 +2925,14 @@ impl PipelineRunner {
         project_manager
             .write_metadata(&paths.metadata, metadata)
             .await?;
+        if let Some(output) = &metadata.output {
+            self.record_final_metrics(output);
+        }
+        self.events.stage(
+            PipelineStage::Exporting,
+            1.0,
+            format!("已发布 {} 个 Splat", ply.splat_count),
+        );
         self.events
             .stage(PipelineStage::Completed, 1.0, "高清补拍处理完成");
         Ok(PipelineResult {
@@ -1979,6 +2953,58 @@ impl PipelineRunner {
         })
     }
 
+    async fn temporary_png_focal_preflight(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+    ) -> Result<Option<crate::video::temporary_png_focal_workaround::FocalOverride>> {
+        use crate::video::temporary_png_focal_workaround::{detect, Request};
+        let focal = detect(
+            &self.engines.colmap,
+            &self.process_manager,
+            Request {
+                images: &paths.colmap_frames,
+                image_list: None,
+                ordinary_images: true,
+                camera_model: "SIMPLE_RADIAL",
+                single_camera: true,
+                explicit_params: None,
+                existing_camera_id: None,
+                calibrated: false,
+            },
+        )
+        .await;
+        let message = if let Some(focal) = &focal {
+            let invalidated = apply_temporary_png_focal_checkpoint(
+                project_manager,
+                paths,
+                state,
+                &focal.checkpoint,
+            )
+            .await?;
+            format!("[TemporaryPngFocal] enabled=true image={} focalLength={} xResolution={} unit={} cameraParams={} cacheInvalidated={invalidated}",
+                focal.checkpoint.image_name, focal.raw_focal_length, focal.raw_x_resolution,
+                focal.unit, focal.camera_params())
+        } else {
+            "[TemporaryPngFocal] enabled=false (input/runtime not confirmed applicable)".to_owned()
+        };
+        self.events.send(
+            // A preflight log must not advance progress before a lifecycle stage.
+            PipelineStage::Created,
+            Some(PipelineEngine::System),
+            EventKind::Log,
+            EventLevel::Info,
+            None,
+            true,
+            message,
+            None,
+            None,
+            None,
+        );
+        Ok(focal)
+    }
+
     async fn run_project(
         &self,
         project_manager: &ProjectManager,
@@ -1988,19 +3014,147 @@ impl PipelineRunner {
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
         let quality = metadata.quality;
+        let mut panorama_video = None;
+        if metadata.input_type == ProjectInputType::Video
+            && state.video_projection != crate::video::panorama::VideoProjection::Perspective
+        {
+            let video = probe_video(
+                &self.engines.ffprobe,
+                &metadata.source_path,
+                Some(paths.logs.join("ffprobe.log")),
+                &self.process_manager,
+            )
+            .await?;
+            let detection = crate::video::panorama::detect(
+                &self.engines.ffprobe,
+                &self.engines.ffmpeg,
+                &metadata.source_path,
+                &video,
+                &self.process_manager,
+                false,
+            )
+            .await?;
+            if crate::video::panorama::resolve(state.video_projection, &detection)? {
+                let input = metadata.source_path.clone();
+                let info = video.clone();
+                let native = state.generation_policy.is_some();
+                let cancellation = self.process_manager.child_token();
+                let config = crate::presets::spawn_pipeline_blocking(move || {
+                    crate::video::panorama::PanoramaCheckpoint::new_for_policy(
+                        &input,
+                        quality,
+                        &info,
+                        &cancellation,
+                        native,
+                    )
+                })
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??;
+                if state
+                    .panorama
+                    .as_ref()
+                    .is_some_and(|previous| previous != &config)
+                {
+                    let sfm_changed = state.panorama.as_ref().is_some_and(|previous| {
+                        previous.source_sha256 != config.source_sha256
+                            || previous.sfm_width != config.sfm_width
+                            || previous.sfm_height != config.sfm_height
+                    });
+                    if sfm_changed {
+                        state.frames = None;
+                        state.features_complete = false;
+                        state.matching_complete = false;
+                        state.reconstruction_complete = false;
+                        state.bridge_backfill = Default::default();
+                    }
+                    state.brush_complete = false;
+                    state.brush_training = Default::default();
+                }
+                state.panorama = Some(config);
+                state.video = Some(video.clone());
+                panorama_video = Some(video);
+                project_manager.write_state(&paths.state, &state).await?;
+            } else if state.panorama.is_some() {
+                return Err(SplatError::Process(
+                    "源视频投影已发生变化，不能复用球面重建；请将修改后的素材创建为新任务".into(),
+                ));
+            }
+        }
+        if metadata.input_type == ProjectInputType::Images
+            && state.video_projection != crate::video::panorama::VideoProjection::Perspective
+        {
+            let source = metadata.source_path.clone();
+            let cancellation = self.process_manager.child_token();
+            let requested = state.video_projection;
+            let native = state.generation_policy.is_some();
+            let config = crate::presets::spawn_pipeline_blocking(move || {
+                let scan = crate::video::image_projection::analyze(&source)?;
+                if requested == crate::video::panorama::VideoProjection::Auto && !scan.detection.confirmed_erp {
+                    if scan.detection.requires_choice {
+                        return Err(SplatError::InvalidVideo("无法判断图片类型。请选择普通图片或全景图片。当前不支持双鱼眼、双目、VR180、裁切全景和厂商私有原片。".into()));
+                    }
+                    return Ok(None);
+                }
+                crate::video::image_projection::checkpoint_for_policy(&source, quality, &cancellation, native).map(Some)
+            }).await.map_err(|e| SplatError::Process(e.to_string()))??;
+            if let Some(config) = config {
+                if state.panorama.as_ref() != Some(&config) {
+                    // A changed source, orientation or projection must never reuse old features.
+                    state.frames = None;
+                    state.features_complete = false;
+                    state.matching_complete = false;
+                    state.reconstruction_complete = false;
+                    state.bridge_backfill = Default::default();
+                    state.brush_complete = false;
+                    state.brush_training = Default::default();
+                }
+                state.panorama = Some(config);
+                state.video_projection = crate::video::panorama::VideoProjection::Equirectangular;
+                project_manager.write_state(&paths.state, &state).await?;
+            }
+        }
+        self.events.panorama_images.store(
+            state
+                .panorama
+                .as_ref()
+                .is_some_and(|p| p.image_sources.is_some()),
+            Ordering::Relaxed,
+        );
+        self.events
+            .panorama_phase
+            .store(u64::from(state.panorama.is_some()), Ordering::Relaxed);
         if state.input_type != metadata.input_type {
             return Err(SplatError::Process(
                 "项目输入类型与检查点不一致，无法安全继续".into(),
             ));
         }
         archive_incompatible_colmap_input_cache(paths, &state).await?;
+        // Temporary #73 preflight MUST precede checkpoint/database reuse.
+        let ordinary_images = metadata.input_type == ProjectInputType::Images
+            && metadata.imported.is_none()
+            && metadata.reshoot.is_none()
+            && state.panorama.is_none();
+        let mut focal_checked = false;
+        let mut focal_override = None;
+        if ordinary_images
+            && state.frames.as_ref().is_some_and(|frames| {
+                frames.colmap_input_version == Some(COLMAP_INPUT_VERSION)
+                    && frames.extracted_frames.is_some_and(|count| count > 0)
+            })
+        {
+            focal_override = self
+                .temporary_png_focal_preflight(project_manager, paths, &mut state)
+                .await?;
+            focal_checked = true;
+        }
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
         let uses_current_resolution_policy = state.planner_enabled
             && state.resolution_policy_version == Some(PLANNER_RESOLUTION_POLICY_VERSION);
         let mut preprobed_video = None;
-        if uses_current_resolution_policy
+        if state.panorama.is_none()
+            && uses_current_resolution_policy
             && state.resolution_plan.is_none()
             && metadata.input_type == ProjectInputType::Video
         {
@@ -2012,7 +3166,7 @@ impl PipelineRunner {
             )
             .await?;
             let (source_width, source_height) = oriented_video_dimensions(&video);
-            let resolution = resolve_planner_resolution_plan(
+            let resolution = self.resolution_plan(
                 quality,
                 acceleration.usable_gpu_total_memory_mb(),
                 source_width,
@@ -2025,8 +3179,14 @@ impl PipelineRunner {
             preprobed_video = Some(video);
         }
         let target_dimensions = state
-            .resolution_plan
-            .map(|plan| (plan.working_width, plan.working_height));
+            .panorama
+            .as_ref()
+            .map(|p| (p.sfm_width, p.sfm_height))
+            .or_else(|| {
+                state
+                    .resolution_plan
+                    .map(|plan| (plan.working_width, plan.working_height))
+            });
         let mut prepared =
             if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
                 self.events.stage(
@@ -2036,6 +3196,8 @@ impl PipelineRunner {
                 );
                 prepared
             } else {
+                focal_checked = false;
+                focal_override = None;
                 reset_directory(&paths.frames).await?;
                 reset_directory(&paths.colmap_frames).await?;
                 reset_directory(&paths.masks).await?;
@@ -2051,28 +3213,46 @@ impl PipelineRunner {
                             &paths.masks,
                             Some(&paths.logs),
                             state.planner_enabled,
-                            preprobed_video.or_else(|| state.video.clone()),
+                            panorama_video
+                                .or(preprobed_video)
+                                .or_else(|| state.video.clone()),
                             target_dimensions,
+                            state.panorama.is_some(),
                         )
                         .await?
                     }
                     ProjectInputType::Images => {
-                        self.prepare_images(
-                            &metadata.source_path,
-                            quality,
-                            &paths.frames,
-                            &paths.colmap_frames,
-                            &paths.masks,
-                            state.image_sequence.is_some(),
-                        )
-                        .await?
+                        if let Some(config) = &state.panorama {
+                            self.prepare_panorama_images(
+                                &metadata.source_path,
+                                quality,
+                                config,
+                                &paths.frames,
+                                &paths.colmap_frames,
+                                &paths.masks,
+                            )
+                            .await?
+                        } else {
+                            self.prepare_images(
+                                &metadata.source_path,
+                                quality,
+                                &paths.frames,
+                                &paths.colmap_frames,
+                                &paths.masks,
+                                state.image_sequence.is_some(),
+                            )
+                            .await?
+                        }
                     }
                 };
                 state.input_type = prepared.input_type;
                 state.video = prepared.video.clone();
                 state.image_sequence = prepared.image_sequence.clone();
-                if uses_current_resolution_policy && state.resolution_plan.is_none() {
-                    state.resolution_plan = Some(resolve_planner_resolution_plan(
+                if state.panorama.is_none()
+                    && uses_current_resolution_policy
+                    && state.resolution_plan.is_none()
+                {
+                    state.resolution_plan = Some(self.resolution_plan(
                         quality,
                         acceleration.usable_gpu_total_memory_mb(),
                         prepared.working_width,
@@ -2097,72 +3277,47 @@ impl PipelineRunner {
                 project_manager.write_state(&paths.state, &state).await?;
                 prepared
             };
-        let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
-        if let Some(tracker) = &self.effectiveness {
-            let (source_width, source_height, source_item_count) =
-                match (prepared.video.as_ref(), prepared.image_sequence.as_ref()) {
-                    (Some(video), _) => (
-                        u64::from(video.width),
-                        u64::from(video.height),
-                        video.total_frames,
-                    ),
-                    (_, Some(images)) => (
-                        u64::from(images.width),
-                        u64::from(images.height),
-                        images.image_count,
-                    ),
-                    _ => (0, 0, prepared.extracted_frames),
-                };
-            let preset = quality.preset();
-            let is_planned_video = state.planner_enabled && prepared.video.is_some();
-            let initial_selected_count = state
-                .frames
-                .as_ref()
-                .map(|frames| frames.initial_extracted_frames)
-                .filter(|count| *count > 0)
-                .unwrap_or(prepared.extracted_frames);
-            let candidate_count = if is_planned_video {
-                prepared.plan.candidate_frames.len() as u64
-            } else {
-                initial_selected_count
-            };
-            tracker.record_frame_plan(PlannerFramePlanMetrics {
-                source_width,
-                source_height,
-                source_item_count,
-                configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
-                configured_candidate_fps: is_planned_video
-                    .then_some(preset.rescue_max_fps)
-                    .flatten(),
-                effective_target_fps: prepared
-                    .video
-                    .as_ref()
-                    .map(|video| initial_selected_count as f64 / video.duration.max(0.001)),
-                effective_candidate_fps: prepared
-                    .video
-                    .as_ref()
-                    .map(|video| candidate_count as f64 / video.duration.max(0.001)),
-                initial_selected_count,
-                candidate_count,
-                minimum_frame_override_applied: is_planned_video
-                    && prepared.plan.minimum_frame_override_applied,
-                minimum_frame_target_unreachable: is_planned_video
-                    && source_item_count < crate::video::minimum_selected_frames(),
-            });
+        if ordinary_images && !focal_checked {
+            focal_override = self
+                .temporary_png_focal_preflight(project_manager, paths, &mut state)
+                .await?;
         }
+        let camera_params = focal_override.as_ref().map(|focal| focal.camera_params());
+        let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
+        self.record_frame_metrics(&state, prepared.extracted_frames, Some(&prepared.plan));
 
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
         let colmap_log = paths.logs.join("colmap.log");
         let preset = quality.preset();
         let sfm_max_image_size = state
-            .resolution_plan
-            .map(|plan| plan.sfm_max_image_size)
-            .unwrap_or(if state.planner_enabled {
-                preset.planned_sfm_max_image_size
-            } else {
-                preset.sfm_max_image_size
+            .panorama
+            .as_ref()
+            .map(|p| {
+                if state.generation_policy.is_some() && quality == Quality::High {
+                    p.sfm_width.min(4096)
+                } else {
+                    p.sfm_width
+                }
+            })
+            .unwrap_or_else(|| {
+                state
+                    .resolution_plan
+                    .map(|plan| plan.sfm_max_image_size)
+                    .unwrap_or(if state.planner_enabled {
+                        preset.planned_sfm_max_image_size
+                    } else {
+                        preset.sfm_max_image_size
+                    })
             });
+        if let Some(config) = &state.panorama {
+            tokio::fs::create_dir_all(&paths.colmap).await?;
+            tokio::fs::write(
+                paths.colmap.join("panorama-camera.json"),
+                serde_json::to_vec(config)?,
+            )
+            .await?;
+        }
         if let Some(resolution) = state.resolution_plan {
             self.events.send(
                 PipelineStage::ExtractingFeatures,
@@ -2214,6 +3369,13 @@ impl PipelineRunner {
             );
         } else {
             reset_directory(&paths.colmap).await?;
+            if let Some(config) = &state.panorama {
+                tokio::fs::write(
+                    paths.colmap.join("panorama-camera.json"),
+                    serde_json::to_vec(config)?,
+                )
+                .await?;
+            }
             self.events.stage(
                 PipelineStage::ExtractingFeatures,
                 0.0,
@@ -2238,6 +3400,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    camera_params.as_deref(),
                 )
                 .await?;
             } else {
@@ -2252,6 +3415,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    camera_params.as_deref(),
                 )
                 .await?;
             }
@@ -2265,11 +3429,18 @@ impl PipelineRunner {
             );
         }
 
+        // Resumes deliberately consult the persisted strategy, never the new-run builder.
+        let (sequential_matching, loop_detection) = image_matching_policy(
+            prepared.input_type,
+            state.image_matching_strategy,
+            quality,
+            state.planner_enabled,
+        );
         if state.matching_complete {
             self.events.stage(
                 PipelineStage::Matching,
                 1.0,
-                if prepared.input_type == ProjectInputType::Images {
+                if !sequential_matching {
                     "已复用穷举匹配检查点"
                 } else {
                     "已复用顺序匹配检查点"
@@ -2281,8 +3452,10 @@ impl PipelineRunner {
                 0.0,
                 format!(
                     "COLMAP 正在进行 {backend_label} {}",
-                    if prepared.input_type == ProjectInputType::Images {
+                    if !sequential_matching {
                         "穷举匹配"
+                    } else if loop_detection {
+                        "顺序匹配（已开启闭环检测）"
                     } else {
                         "顺序匹配"
                     }
@@ -2292,9 +3465,9 @@ impl PipelineRunner {
                 PipelineStage::Matching,
                 PipelineEngine::Colmap,
                 Some(prepared.extracted_frames),
-                ObserverMode::BracketProgress,
+                ObserverMode::Matching,
             ));
-            if prepared.input_type == ProjectInputType::Images {
+            if !sequential_matching {
                 colmap::match_exhaustive(
                     &self.engines.colmap,
                     &database,
@@ -2312,6 +3485,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    loop_detection,
                 )
                 .await?;
             }
@@ -2321,33 +3495,33 @@ impl PipelineRunner {
             self.events.stage(
                 PipelineStage::Matching,
                 1.0,
-                if prepared.input_type == ProjectInputType::Images {
+                if !sequential_matching {
                     "穷举匹配完成"
+                } else if loop_detection {
+                    "顺序匹配（已开启闭环检测）完成"
                 } else {
                     "顺序匹配完成"
                 },
             );
         }
 
-        let allow_two_view_tracks = should_allow_two_view_tracks(
-            state.planner_enabled,
-            preset.sfm_allow_two_view_tracks,
-            prepared.has_alpha,
-        );
+        let allow_two_view_tracks = if state.generation_policy.is_some() {
+            self.actual_transparency(paths, &mut state, prepared.has_alpha)
+                .await?
+        } else {
+            should_allow_two_view_tracks(
+                state.planner_enabled,
+                preset.sfm_allow_two_view_tracks,
+                prepared.has_alpha,
+            )
+        };
         if state.reconstruction_complete {
             self.events
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
         } else {
             reset_directory(&sparse).await?;
-            self.events.stage(
-                PipelineStage::Reconstructing,
-                0.0,
-                if allow_two_view_tracks {
-                    "正在增量重建相机轨迹（High：允许两视图三角化）"
-                } else {
-                    "正在增量重建相机轨迹"
-                },
-            );
+            self.events
+                .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
             colmap::map(
                 &self.engines.colmap,
                 &database,
@@ -2386,22 +3560,12 @@ impl PipelineRunner {
             .unwrap_or(prepared.extracted_frames);
         let (initial_model, initial_report) =
             best_sparse_model_with_input_count(&sparse, initial_input_images).await?;
-        if let Some(tracker) = &self.effectiveness {
-            tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
-                PlannerGpuVendor::Nvidia
-            } else if cfg!(target_os = "macos") {
-                PlannerGpuVendor::Apple
-            } else {
-                PlannerGpuVendor::Unknown
-            });
-            tracker.record_initial_reconstruction(PlannerInitialReconstructionMetrics {
-                input_images: initial_report.input_images,
-                registered_images: initial_report.registered_images,
-                points_3d: initial_report.points_3d,
-                backend: acceleration.backend,
-                allow_two_view_tracks,
-            });
-        }
+        self.record_reconstruction_metrics(
+            &initial_report,
+            acceleration,
+            allow_two_view_tracks,
+            false,
+        );
         let initial_report_for_metrics = initial_report.clone();
         let (model, report) = self
             .maybe_run_bridge_backfill(
@@ -2455,6 +3619,36 @@ impl PipelineRunner {
                 adopted: state.bridge_backfill.status == BridgeBackfillStatus::Completed,
             });
         }
+        let (model, report) =
+            if state.gps.is_some() && prepared.input_type == ProjectInputType::Images {
+                let sources = gps_runner::generation_inputs(metadata, &state)?;
+                let cancel = self.process_manager.child_token();
+                let records = tokio::task::spawn_blocking(move || {
+                    crate::reconstruction::gps::collect(&sources, &cancel)
+                })
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??;
+                if let Some(adjusted) = self
+                    .apply_gps(
+                        project_manager,
+                        paths,
+                        &mut state,
+                        records,
+                        None,
+                        &model,
+                        None,
+                        None,
+                    )
+                    .await?
+                {
+                    let report = ReconstructionValidator::validate(&paths.frames, &adjusted)?;
+                    (adjusted, report)
+                } else {
+                    (model, report)
+                }
+            } else {
+                (model, report)
+            };
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 {:.1}%，将继续训练，但结果质量可能受影响",
@@ -2475,18 +3669,7 @@ impl PipelineRunner {
             .await?;
 
         let candidate = if state.brush_complete {
-            if let Some(tracker) = &self.effectiveness {
-                if let Some(initial) = state
-                    .brush_training
-                    .initial_resolved
-                    .or(state.brush_training.resolved)
-                {
-                    tracker.record_brush(initial, false);
-                }
-                if let Some(resolved) = state.brush_training.resolved {
-                    tracker.record_brush(resolved, state.brush_training.oom_retry_used);
-                }
-            }
+            self.record_brush_metrics(&state);
             self.events.stage(
                 PipelineStage::TrainingSplats,
                 1.0,
@@ -2495,8 +3678,135 @@ impl PipelineRunner {
             brush_candidate(&paths.brush)
                 .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失，无法继续发布".into()))?
         } else {
+            // Freeze the recipe before cache preparation, including on cancel.
+            if state.brush_training.resolved.is_none() {
+                if let Some(config) = &state.panorama {
+                    let resolved = resolve_panorama_training_preset(
+                        quality,
+                        state.planner_enabled,
+                        brush::BrushGpuLaunchPolicy::from_acceleration(acceleration)
+                            .known_training_memory_mb(acceleration),
+                        config.face_size,
+                        report.points_3d,
+                    )?;
+                    state
+                        .brush_training
+                        .initial_resolved
+                        .get_or_insert(resolved);
+                    state.brush_training.resolved = Some(resolved);
+                    project_manager.write_state(&paths.state, &state).await?;
+                }
+            }
             reset_directory(&paths.brush).await?;
-            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let dataset = if let Some(config) = &state.panorama {
+                self.events.panorama_phase.store(2, Ordering::Relaxed);
+                self.events.send(
+                    PipelineStage::TrainingSplats,
+                    Some(PipelineEngine::System),
+                    EventKind::Stage,
+                    EventLevel::Info,
+                    None,
+                    true,
+                    "正在检查可复用的全景训练缓存",
+                    None,
+                    None,
+                    None,
+                );
+                let config = config.clone();
+                let frames = paths.frames.clone();
+                let masks = paths.masks.clone();
+                let model = model.clone();
+                let root = paths.work.join("panorama-training");
+                let cancel = self.process_manager.child_token();
+                let events = self.events.clone();
+                crate::presets::spawn_pipeline_blocking(move || {
+                    crate::video::panorama::prepare_training_cache(
+                        &frames,
+                        &masks,
+                        &model,
+                        &root,
+                        &config,
+                        &cancel,
+                        |update| {
+                            let (current, total, reused) = match update {
+                                crate::video::panorama::TrainingCacheUpdate::Faces {
+                                    completed,
+                                    total,
+                                    reused,
+                                } => (completed, total, reused),
+                                crate::video::panorama::TrainingCacheUpdate::Validating => {
+                                    events.panorama_phase.store(3, Ordering::Relaxed);
+                                    events.send(
+                                        PipelineStage::TrainingSplats,
+                                        Some(PipelineEngine::System),
+                                        EventKind::Stage,
+                                        EventLevel::Info,
+                                        Some(0.95),
+                                        true,
+                                        "正在校验训练图片和相机数据",
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                    return;
+                                }
+                            };
+                            if reused && config.image_sources.is_some() {
+                                events.send(PipelineStage::TrainingSplats,Some(PipelineEngine::System),EventKind::Log,EventLevel::Info,None,false,"已校验并复用训练缓存",None,None,None);
+                            }
+                            events.send(
+                                PipelineStage::TrainingSplats,
+                                Some(PipelineEngine::System),
+                                EventKind::Stage,
+                                EventLevel::Info,
+                                Some(if current < total {
+                                    (current as f32 / total.max(1) as f32) * 0.95
+                                } else {
+                                    0.95
+                                }),
+                                false,
+                                if config.image_sources.is_some() {
+                                    format!("正在准备训练图片：全景图片 {}/{}，六面图片 {current}/{total}", current / 6, total / 6)
+                                } else { format!(
+                                    "{}：全景帧 {}/{}，六面图片 {current}/{total}",
+                                    if reused {
+                                        "已校验并复用训练缓存"
+                                    } else {
+                                        "正在准备训练图片"
+                                    },
+                                    current / 6,
+                                    total / 6
+                                ) },
+                                Some(current),
+                                Some(total),
+                                Some(if config.image_sources.is_some() { "panoramaImageFaces" } else { "panoramaFaces" }),
+                            )
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??
+            } else {
+                prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?
+            };
+            if state.panorama.is_some() {
+                self.events.panorama_phase.store(3, Ordering::Relaxed);
+                self.events.stage(
+                    PipelineStage::TrainingSplats,
+                    1.0,
+                    "训练图片和相机数据已校验",
+                );
+                self.events.panorama_phase.store(1, Ordering::Relaxed);
+            }
+            let is_panorama = state.panorama.is_some();
+            self.prepare_fine_splat_budget(
+                &mut state,
+                quality,
+                &model,
+                &dataset.join("images"),
+                is_panorama,
+            )
+            .await?;
             let source_long_edge = prepared
                 .video
                 .as_ref()
@@ -2508,8 +3818,51 @@ impl PipelineRunner {
                         .map(|images| images.width.max(images.height))
                 })
                 .unwrap_or(1);
-            let detected_total_memory_mb = acceleration.usable_gpu_total_memory_mb();
-            let resolved_brush = state.brush_training.resolved.unwrap_or_else(|| {
+            let detected_total_memory_mb = if state.panorama.is_some() {
+                brush::BrushGpuLaunchPolicy::from_acceleration(acceleration)
+                    .known_training_memory_mb(acceleration)
+            } else {
+                acceleration.usable_gpu_total_memory_mb()
+            };
+            let mut resolved_brush = if let Some(saved) = state.brush_training.resolved {
+                saved
+            } else if let Some(policy) = state.generation_policy {
+                if let Some(config) = &state.panorama {
+                    policy.panorama_training(
+                        quality,
+                        detected_total_memory_mb,
+                        config.face_size,
+                        report.points_3d,
+                        report.points_3d,
+                    )?
+                } else {
+                    let resolution = state.resolution_plan.unwrap_or_else(|| {
+                        policy.resolution(
+                            quality,
+                            detected_total_memory_mb,
+                            prepared.working_width,
+                            prepared.working_height,
+                            false,
+                        )
+                    });
+                    policy.training(
+                        quality,
+                        detected_total_memory_mb,
+                        &resolution,
+                        report.points_3d,
+                        report.points_3d,
+                        state.brush_training.fine_splat_budget.as_ref(),
+                    )?
+                }
+            } else if let Some(config) = &state.panorama {
+                resolve_panorama_training_preset(
+                    quality,
+                    state.planner_enabled,
+                    detected_total_memory_mb,
+                    config.face_size,
+                    report.points_3d,
+                )?
+            } else {
                 state.resolution_plan.map_or_else(
                     || {
                         resolve_brush_training_preset(
@@ -2530,18 +3883,19 @@ impl PipelineRunner {
                         )
                     },
                 )
-            });
-            state
-                .brush_training
-                .initial_resolved
-                .get_or_insert(resolved_brush);
-            state.brush_training.resolved = Some(resolved_brush);
-            if let Some(tracker) = &self.effectiveness {
-                if let Some(initial) = state.brush_training.initial_resolved {
-                    tracker.record_brush(initial, false);
-                }
-                tracker.record_brush(resolved_brush, state.brush_training.oom_retry_used);
+            };
+            if let Some(config) = &state.panorama {
+                resolved_brush.preset.max_resolution =
+                    resolved_brush.preset.max_resolution.min(config.face_size);
             }
+            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
+                state
+                    .brush_training
+                    .initial_resolved
+                    .get_or_insert(resolved_brush);
+            }
+            state.brush_training.resolved = Some(resolved_brush);
+            self.prepare_brush_observation(&state);
             project_manager.write_state(&paths.state, &state).await?;
             let runtime_samples = catalog::runtime_samples().await;
             let estimated_brush_duration_ms = match (&prepared.video, &prepared.image_sequence) {
@@ -2635,14 +3989,8 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, metadata)
             .await?;
 
-        if let Some(tracker) = &self.effectiveness {
-            tracker.record_final_result(PlannerFinalResultMetrics {
-                input_images: report.input_images,
-                registered_images: report.registered_images,
-                points_3d: report.points_3d,
-                splat_count: ply.splat_count,
-                ply_size_bytes: ply.file_size,
-            });
+        if let Some(output) = &metadata.output {
+            self.record_final_metrics(output);
         }
 
         self.events.stage(
@@ -2670,6 +4018,42 @@ impl PipelineRunner {
         })
     }
 
+    async fn prepare_fine_splat_budget(
+        &self,
+        state: &mut PipelineStateFile,
+        quality: Quality,
+        model: &Path,
+        images: &Path,
+        panorama: bool,
+    ) -> Result<()> {
+        if quality != Quality::High
+            || panorama
+            || state.generation_policy.is_none_or(|p| p.version < 2)
+            || state.brush_training.resolved.is_some()
+            || state.brush_training.fine_splat_budget.is_some()
+        {
+            return Ok(());
+        }
+        let model = model.to_owned();
+        let images = images.to_owned();
+        let cancel = self.process_manager.child_token();
+        let budget = crate::presets::spawn_pipeline_blocking(move || {
+            super::splat_budget::calculate(&model, &images, &cancel)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
+        self.events.send(
+            PipelineStage::TrainingSplats, Some(PipelineEngine::System), EventKind::Log,
+            EventLevel::Info, None, false,
+            format!("[SplatBudget] version={} k={} effectivePixels={} registeredImages={} meanTrackLength={:.6} maxSplats={}",
+                budget.version, budget.coefficient, budget.effective_pixels, budget.registered_images,
+                budget.mean_track_length, budget.requested_max_splats),
+            None, None, None,
+        );
+        state.brush_training.fine_splat_budget = Some(budget);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn train_brush_with_oom_retry(
         &self,
@@ -2683,7 +4067,37 @@ impl PipelineRunner {
         resolved: ResolvedBrushTrainingPreset,
         _estimated_duration_ms: u64,
     ) -> Result<PathBuf> {
+        let mut resolved = resolved;
+        if state.generation_policy.is_some() && state.brush_training.oom_retry_used {
+            if let Some(count) = state.brush_training.oom_retry_source_count {
+                let cap = count
+                    .checked_mul(4)
+                    .map(|n| n / 5)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|cap| *cap > 0 && u64::from(*cap) >= initial_sfm_points)
+                    .ok_or_else(|| {
+                        SplatError::Process(
+                            "Initialization exceeds the saved OOM retry budget".into(),
+                        )
+                    })?;
+                resolved.preset.max_splats =
+                    Some(resolved.preset.max_splats.map_or(cap, |old| old.min(cap)));
+                state.brush_training.resolved = Some(resolved);
+                project_manager.write_state(&paths.state, state).await?;
+            }
+        }
+        self.prepare_brush_observation(state);
         self.log_brush_profile("BrushProfile", &resolved, EventLevel::Info);
+        let warm = state
+            .reshoot
+            .as_ref()
+            .and_then(|r| r.recipe.as_ref())
+            .and_then(|r| r.warm_parameters);
+        let alpha_mode = state
+            .reshoot
+            .as_ref()
+            .and_then(|r| r.recipe.as_ref())
+            .map(|_| "transparent");
         let gpu_launch_policy = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
         self.events.send(
             PipelineStage::TrainingSplats,
@@ -2702,46 +4116,84 @@ impl PipelineRunner {
         } else {
             paths.logs.join("brush.log")
         };
+        let (first_observer, first_started) = track_process_start(self.process_observer(
+            PipelineStage::TrainingSplats,
+            PipelineEngine::Brush,
+            Some(resolved.preset.total_steps as u64),
+            ObserverMode::Brush,
+        ));
         let first = brush::train(
             &self.engines.brush,
             dataset,
             &paths.brush,
             brush::BrushTrainingOptions {
+                alpha_mode,
+                warm,
                 preset: resolved.preset,
+                panorama: resolved.panorama.is_some(),
                 log_path: first_log,
                 gpu_launch_policy: &gpu_launch_policy,
             },
             &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::TrainingSplats,
-                PipelineEngine::Brush,
-                Some(resolved.preset.total_steps as u64),
-                ObserverMode::Brush,
-            )),
+            Some(first_observer),
         )
         .await;
+        if state.brush_training.oom_retry_used && first_started.load(Ordering::Relaxed) {
+            state.brush_training.oom_retry_started = true;
+            project_manager.write_state(&paths.state, state).await?;
+        }
 
         match first {
             Ok(candidate) => Ok(candidate),
-            Err(SplatError::BrushOutOfMemory(detail))
-                if quality == Quality::High
-                    && state.planner_enabled
+            Err(error)
+                if error.is_brush_oom()
+                    && state.generation_policy.map_or(
+                        state.planner_enabled
+                            && (quality == Quality::High || resolved.panorama.is_some()),
+                        |p| p.auto_retry_enabled,
+                    )
                     && !state.brush_training.oom_retry_used =>
             {
-                let Some(downgraded) = brush_oom_fallback(
-                    quality,
-                    state.planner_enabled,
-                    state.brush_training.oom_retry_used,
-                    resolved,
-                    initial_sfm_points,
-                ) else {
-                    return Err(SplatError::BrushOutOfMemory(detail));
+                let fallback = if let Some(policy) = state.generation_policy {
+                    let count = match &error {
+                        SplatError::EngineProcess(f) => f.last_splat_count,
+                        _ => None,
+                    };
+                    policy.oom_retry(
+                        resolved,
+                        state.brush_training.oom_retry_used,
+                        count,
+                        initial_sfm_points,
+                    )
+                } else {
+                    brush_oom_fallback(
+                        quality,
+                        state.planner_enabled,
+                        state.brush_training.oom_retry_used,
+                        resolved,
+                        initial_sfm_points,
+                    )
                 };
-                state.brush_training.oom_retry_used = true;
-                state.brush_training.resolved = Some(downgraded);
-                if let Some(tracker) = &self.effectiveness {
-                    tracker.record_brush(downgraded, true);
+                let Some(mut downgraded) = fallback else {
+                    return Err(error);
+                };
+                if warm.is_some() && state.generation_policy.is_none() {
+                    downgraded.preset.total_steps = resolved.preset.total_steps;
+                    downgraded.preset.densification = resolved.preset.densification;
+                    downgraded.preset.max_splats = Some(
+                        downgraded
+                            .preset
+                            .max_splats
+                            .unwrap_or(10_000_000)
+                            .max(initial_sfm_points.min(u32::MAX as u64) as u32),
+                    );
                 }
+                state.brush_training.oom_retry_used = true;
+                state.brush_training.oom_retry_source_count = match &error {
+                    SplatError::EngineProcess(f) => f.last_splat_count,
+                    _ => None,
+                };
+                state.brush_training.resolved = Some(downgraded);
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::TrainingSplats,
@@ -2751,33 +4203,45 @@ impl PipelineRunner {
                     None,
                     true,
                     format!(
-                        "[BrushRetry] reason=OutOfMemory from={} to={}，复用现有 SfM 和训练数据重试一次",
+                        "[BrushRetry] reason=OutOfMemory from={} to={} lastReportedSplats={:?} maxSplats={:?}，复用现有 SfM 和训练数据重试一次",
                         resolved.profile.label(),
-                        downgraded.profile.label()
+                        downgraded.profile.label(),
+                        state.brush_training.oom_retry_source_count,
+                        downgraded.preset.max_splats,
                     ),
                     None,
                     None,
                     None,
                 );
                 self.log_brush_profile("BrushRetryProfile", &downgraded, EventLevel::Warning);
-                brush::train(
+                self.prepare_brush_observation(state);
+                let (retry_observer, retry_started) = track_process_start(self.process_observer(
+                    PipelineStage::TrainingSplats,
+                    PipelineEngine::Brush,
+                    Some(downgraded.preset.total_steps as u64),
+                    ObserverMode::Brush,
+                ));
+                let retried = brush::train(
                     &self.engines.brush,
                     dataset,
                     &paths.brush,
                     brush::BrushTrainingOptions {
+                        alpha_mode,
+                        warm,
                         preset: downgraded.preset,
+                        panorama: downgraded.panorama.is_some(),
                         log_path: paths.logs.join("brush-retry.log"),
                         gpu_launch_policy: &gpu_launch_policy,
                     },
                     &self.process_manager,
-                    Some(self.process_observer(
-                        PipelineStage::TrainingSplats,
-                        PipelineEngine::Brush,
-                        Some(downgraded.preset.total_steps as u64),
-                        ObserverMode::Brush,
-                    )),
+                    Some(retry_observer),
                 )
-                .await
+                .await;
+                if retry_started.load(Ordering::Relaxed) {
+                    state.brush_training.oom_retry_started = true;
+                    project_manager.write_state(&paths.state, state).await?;
+                }
+                retried.map_err(|retry_error| retry_error.with_previous_attempt(error))
             }
             Err(error) => Err(error),
         }
@@ -2790,6 +4254,16 @@ impl PipelineRunner {
         level: EventLevel,
     ) {
         let densification = resolved.preset.densification;
+        if let Some(snapshot) = resolved.panorama {
+            self.events.send(
+                PipelineStage::TrainingSplats, Some(PipelineEngine::Brush),
+                EventKind::Log, level, None, true,
+                format!("[PanoramaBrushRecipe] version={} quality={} automaticOptimization={} memoryMaxSplats={:?} initialPoints={} initialPointsOverride={} growthStart=0 shDegree=3",
+                    snapshot.recipe_version, snapshot.quality, snapshot.automatic_optimization,
+                    snapshot.memory_max_splats, snapshot.initial_points, snapshot.initial_points_override),
+                None, None, None,
+            );
+        }
         self.events.send(
             PipelineStage::TrainingSplats,
             Some(PipelineEngine::Brush),
@@ -2916,11 +4390,19 @@ impl PipelineRunner {
                     return Ok((initial_model, initial_report));
                 }
             };
-            let plan = plan_bridge_backfill(
-                &prepared.plan,
-                &registered,
-                initial_report.registered_images,
-            );
+            let frame_plan = prepared.plan.clone();
+            let registered_images = initial_report.registered_images;
+            let cancellation = self.process_manager.child_token();
+            let plan = crate::presets::spawn_pipeline_blocking(move || {
+                plan_bridge_backfill_cancellable(
+                    &frame_plan,
+                    &registered,
+                    registered_images,
+                    &cancellation,
+                )
+            })
+            .await
+            .map_err(|e| SplatError::Process(e.to_string()))??;
             state.bridge_backfill.plan = Some(plan.clone());
             state.bridge_backfill.initial_model = Some(relative_model_path(paths, &initial_model));
             if plan.selected_frame_indices.is_empty() {
@@ -2951,18 +4433,17 @@ impl PipelineRunner {
             plan
         };
 
-        let additional = bridge_plan
-            .selected_frame_indices
-            .iter()
-            .filter_map(|index| {
-                prepared
-                    .plan
-                    .candidate_frames
-                    .iter()
-                    .find(|frame| frame.source_frame_index == *index)
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
+        validate_manual_bridge_plan(&prepared.plan, &bridge_plan)?;
+        let work = paths.work.clone();
+        let panorama = state.panorama.is_some();
+        let plan = prepared.plan.clone();
+        let indices = bridge_plan.selected_frame_indices.clone();
+        let fps = prepared.video.as_ref().map(|v| v.fps);
+        let additional = crate::presets::spawn_pipeline_blocking(move || {
+            resolve_bridge_frames(&work, panorama, &plan, &indices, fps)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
         if additional.len() != bridge_plan.selected_frame_indices.len() {
             state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
             project_manager.write_state(&paths.state, state).await?;
@@ -3240,6 +4721,7 @@ impl PipelineRunner {
                 ObserverMode::BracketProgress,
             )),
             gpu_index,
+            None,
         )
         .await?;
 
@@ -3276,13 +4758,22 @@ impl PipelineRunner {
                 PipelineStage::ValidatingReconstruction,
                 PipelineEngine::Colmap,
                 Some(pair_count as u64),
-                ObserverMode::BracketProgress,
+                ObserverMode::Matching,
             )),
             gpu_index,
         )
         .await?;
 
         let bridge_sparse = paths.colmap.join("sparse-bridge");
+        let bridge_two_view = if state.generation_policy.is_some() {
+            if state.actual_transparency != Some(true) {
+                state.actual_transparency = None;
+            }
+            self.actual_transparency(paths, state, prepared.has_alpha)
+                .await?
+        } else {
+            false
+        };
         reset_directory(&bridge_sparse).await?;
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
@@ -3299,6 +4790,7 @@ impl PipelineRunner {
             input_model,
             &bridge_sparse,
             state.planner_enabled,
+            bridge_two_view,
             colmap_log.with_file_name("colmap-bridge-mapper.log"),
             &self.process_manager,
             Some(self.process_observer(
@@ -3331,154 +4823,236 @@ impl PipelineRunner {
         let events = self.events.clone();
         let mapper_count = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(std::sync::Mutex::new(RuntimeTracker::new()));
-        let matching_heartbeat_bucket = Arc::new(AtomicU64::new(0));
-        Arc::new(move |update| match update {
-            ProcessUpdate::LogOpened { .. } | ProcessUpdate::Exited { .. } => {}
-            ProcessUpdate::Started { process_id } => {
-                let mut tracker = runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                tracker.snapshot.process_id = process_id;
-                if mode != ObserverMode::Brush {
-                    tracker.snapshot.phase = "running".into();
-                }
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
-                events.send(
-                    stage,
-                    Some(engine),
-                    EventKind::Log,
-                    EventLevel::Info,
-                    None,
-                    true,
-                    format!("进程已启动 · PID {process_id}"),
-                    None,
-                    expected_total,
-                    None,
-                );
+        let matching_notice_elapsed = Arc::new(AtomicU64::new(0));
+        let process_active = Arc::new(AtomicBool::new(false));
+        let cancellation = self.process_manager.child_token();
+        let operation = Arc::new(std::sync::Mutex::new(None));
+        let acceleration = self.current_acceleration.clone();
+        let effectiveness = self.effectiveness.clone();
+        Arc::new(move |update| {
+            let mut scoped = events.clone();
+            if matches!(update, ProcessUpdate::Started { .. }) {
+                scoped = events.begin_process(stage);
+                *operation.lock().unwrap_or_else(|p| p.into_inner()) =
+                    scoped.bound_operation.clone();
+            } else {
+                scoped.bound_operation =
+                    operation.lock().unwrap_or_else(|p| p.into_inner()).clone();
             }
-            ProcessUpdate::Resources(sample) => {
-                let mut tracker = runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if tracker.snapshot.process_id != sample.process_id {
-                    return;
+            let events = scoped;
+            match update {
+                ProcessUpdate::LogOpened { .. } => {}
+                ProcessUpdate::Exited { .. } => {
+                    process_active.store(false, Ordering::Relaxed);
                 }
-                tracker.snapshot.resources = Some(sample);
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
-            }
-            ProcessUpdate::Heartbeat { elapsed_ms } => {
-                let mut tracker = runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
-                if mode == ObserverMode::Matching {
-                    let bucket = elapsed_ms / 10_000;
-                    if bucket > 0
-                        && matching_heartbeat_bucket.fetch_max(bucket, Ordering::Relaxed) < bucket
+                ProcessUpdate::Started { process_id } => {
+                    let mut tracker = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *tracker = RuntimeTracker::new();
+                    mapper_count.store(0, Ordering::Relaxed);
+                    matching_notice_elapsed.store(0, Ordering::Relaxed);
+                    process_active.store(true, Ordering::Relaxed);
+                    tracker.snapshot.process_id = process_id;
+                    if mode == ObserverMode::Brush {
+                        if let Some(metrics) = &effectiveness {
+                            metrics.brush_started();
+                        }
+                    }
+                    if mode != ObserverMode::Brush {
+                        tracker.snapshot.phase = "running".into();
+                    }
+                    events.send(
+                        stage,
+                        Some(engine),
+                        EventKind::Stage,
+                        EventLevel::Info,
+                        None,
+                        true,
+                        format!("进程已启动 · PID {process_id}"),
+                        None,
+                        expected_total,
+                        None,
+                    );
+                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                }
+                ProcessUpdate::Resources(sample) => {
+                    let mut tracker = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if tracker.snapshot.process_id != sample.process_id {
+                        return;
+                    }
+                    tracker.snapshot.resources = Some(sample);
+                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                }
+                ProcessUpdate::Heartbeat { elapsed_ms } => {
+                    let mut tracker = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let snapshot = tracker.refresh(Instant::now());
+                    let quiet_ms = snapshot.last_output_age_ms;
+                    events.runtime(stage, engine, snapshot);
+                    if mode == ObserverMode::Matching
+                        && process_active.load(Ordering::Relaxed)
+                        && !cancellation.is_cancelled()
+                        && matching_quiet_notice_due(&matching_notice_elapsed, elapsed_ms, quiet_ms)
                     {
+                        let message = format!(
+                            "图像匹配进程仍在运行，最近 {} 秒无新输出。此步骤可能耗时较长，请耐心等待",
+                            quiet_ms / 1000
+                        );
                         events.send(
                             stage,
-                            Some(engine),
-                            EventKind::Heartbeat,
+                            Some(PipelineEngine::System),
+                            EventKind::Log,
                             EventLevel::Info,
                             None,
                             true,
-                            format!("补拍图像匹配中 · 已用时 {}", format_duration(elapsed_ms)),
+                            message,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+                ProcessUpdate::Line { stream: _, line } => {
+                    if line.is_empty() {
+                        return;
+                    }
+                    matching_notice_elapsed.store(0, Ordering::Relaxed);
+                    let brush = mode == ObserverMode::Brush;
+                    let actual = {
+                        let mut tracker = runtime
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let actual = tracker.line(&line, Instant::now(), brush);
+                        if brush {
+                            if let Some(acceleration) = acceleration
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .as_ref()
+                            {
+                                tracker.enrich_device(acceleration);
+                            }
+                        }
+                        events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                        actual
+                    };
+                    if mode == ObserverMode::Matching {
+                        if let Some(activity) = matching_activity(&line) {
+                            events.send(
+                                stage,
+                                Some(engine),
+                                EventKind::Progress,
+                                EventLevel::Info,
+                                None,
+                                true,
+                                friendly_engine_line(&line),
+                                None,
+                                None,
+                                Some(activity),
+                            );
+                        }
+                    }
+                    let parsed = match mode {
+                        ObserverMode::Ffmpeg => parse_ffmpeg_frame(&line).map(|current| {
+                            (
+                                current,
+                                expected_total,
+                                format!("FFmpeg 已输出 {current} 帧"),
+                            )
+                        }),
+                        ObserverMode::BracketProgress => {
+                            parse_bracket_progress(&line).map(|(current, total)| {
+                                (current, Some(total), friendly_engine_line(&line))
+                            })
+                        }
+                        ObserverMode::Matching => {
+                            parse_matching_progress(&line).map(|(current, total)| {
+                                (current, Some(total), friendly_engine_line(&line))
+                            })
+                        }
+                        ObserverMode::Mapper => {
+                            parse_mapper_progress(&line, &mapper_count, expected_total)
+                        }
+                        ObserverMode::Brush => actual.map(|(current, total)| {
+                            (
+                                current,
+                                Some(total),
+                                format!("Brush 训练 · {current}/{total} 步"),
+                            )
+                        }),
+                    };
+                    if let Some((current, total, message)) = parsed {
+                        let progress = total
+                            .filter(|value| *value > 0)
+                            .filter(|_| {
+                                mode != ObserverMode::Matching && mode != ObserverMode::Mapper
+                            })
+                            .map(|value| current as f32 / value as f32);
+                        events.send(
+                            stage,
+                            Some(engine),
+                            EventKind::Progress,
+                            EventLevel::Info,
+                            progress.map(|value| {
+                                if brush {
+                                    value.min(0.99)
+                                } else {
+                                    value.min(0.999)
+                                }
+                            }),
+                            progress.is_none(),
+                            message,
+                            Some(current),
+                            total,
+                            Some(if brush {
+                                "steps"
+                            } else if mode == ObserverMode::Matching {
+                                matching_unit(&line)
+                            } else if mode == ObserverMode::Mapper {
+                                "registeredImages"
+                            } else {
+                                "images"
+                            }),
+                        );
+                    } else if mode == ObserverMode::Brush {
+                        events.send(
+                            stage,
+                            Some(engine),
+                            EventKind::Log,
+                            if line.contains(" WARN ") {
+                                EventLevel::Warning
+                            } else if line.contains(" ERROR ")
+                                || line.contains("panicked at")
+                                || line.starts_with("Error:")
+                            {
+                                EventLevel::Error
+                            } else {
+                                EventLevel::Info
+                            },
+                            None,
+                            true,
+                            friendly_engine_line(&line),
+                            None,
+                            expected_total,
+                            None,
+                        );
+                    } else if is_useful_line(&line) {
+                        events.send(
+                            stage,
+                            Some(engine),
+                            EventKind::Log,
+                            EventLevel::Info,
+                            None,
+                            true,
+                            friendly_engine_line(&line),
                             None,
                             expected_total,
                             None,
                         );
                     }
-                }
-            }
-            ProcessUpdate::Line { stream: _, line } => {
-                if line.is_empty() {
-                    return;
-                }
-                let brush = mode == ObserverMode::Brush;
-                let actual = {
-                    let mut tracker = runtime
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let actual = tracker.line(&line, Instant::now(), brush);
-                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
-                    actual
-                };
-                let parsed = match mode {
-                    ObserverMode::Ffmpeg => parse_ffmpeg_frame(&line).map(|current| {
-                        (
-                            current,
-                            expected_total,
-                            format!("FFmpeg 已输出 {current} 帧"),
-                        )
-                    }),
-                    ObserverMode::BracketProgress | ObserverMode::Matching => {
-                        parse_bracket_progress(&line).map(|(current, total)| {
-                            (current, Some(total), friendly_engine_line(&line))
-                        })
-                    }
-                    ObserverMode::Mapper => {
-                        parse_mapper_progress(&line, &mapper_count, expected_total)
-                    }
-                    ObserverMode::Brush => actual.map(|(current, total)| {
-                        (
-                            current,
-                            Some(total),
-                            format!("Brush 训练 · {current}/{total} 步"),
-                        )
-                    }),
-                };
-                if let Some((current, total, message)) = parsed {
-                    let progress = total
-                        .filter(|value| *value > 0)
-                        .map(|value| current as f32 / value as f32);
-                    events.send(
-                        stage,
-                        Some(engine),
-                        EventKind::Progress,
-                        EventLevel::Info,
-                        progress.map(|value| if brush { value.min(0.99) } else { value }),
-                        progress.is_none(),
-                        message,
-                        Some(current),
-                        total,
-                        Some(if brush { "steps" } else { "张" }),
-                    );
-                } else if mode == ObserverMode::Brush {
-                    events.send(
-                        stage,
-                        Some(engine),
-                        EventKind::Log,
-                        if line.contains(" WARN ") {
-                            EventLevel::Warning
-                        } else if line.contains(" ERROR ")
-                            || line.contains("panicked at")
-                            || line.starts_with("Error:")
-                        {
-                            EventLevel::Error
-                        } else {
-                            EventLevel::Info
-                        },
-                        None,
-                        true,
-                        friendly_engine_line(&line),
-                        None,
-                        expected_total,
-                        None,
-                    );
-                } else if is_useful_line(&line) {
-                    events.send(
-                        stage,
-                        Some(engine),
-                        EventKind::Log,
-                        EventLevel::Info,
-                        None,
-                        true,
-                        friendly_engine_line(&line),
-                        None,
-                        expected_total,
-                        None,
-                    );
                 }
             }
         })
@@ -3494,16 +5068,77 @@ enum ObserverMode {
     Brush,
 }
 
+fn matching_quiet_notice_due(last_notice: &AtomicU64, elapsed_ms: u64, quiet_ms: u64) -> bool {
+    if quiet_ms < 15_000 || elapsed_ms == 0 {
+        return false;
+    }
+    let previous = last_notice.load(Ordering::Relaxed);
+    (previous == 0 || elapsed_ms.saturating_sub(previous) >= 30_000)
+        && last_notice
+            .compare_exchange(previous, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
 fn parse_ffmpeg_frame(line: &str) -> Option<u64> {
     line.strip_prefix("frame=")?.trim().parse().ok()
 }
 
 fn parse_bracket_progress(line: &str) -> Option<(u64, u64)> {
+    if !line.contains("Processed file [") && !line.contains("Processed image [") {
+        return None;
+    }
+    parse_counter_brackets(line)
+}
+
+fn parse_matching_progress(line: &str) -> Option<(u64, u64)> {
+    if ![
+        "Matching block [",
+        "Matching image [",
+        "Processing image [",
+        "Indexing image [",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker))
+    {
+        return None;
+    }
+    parse_counter_brackets(line)
+}
+
+fn matching_unit(line: &str) -> &'static str {
+    if line.contains("Indexing image [") {
+        "matchingIndexImages"
+    } else if line.contains("Processing image [") || line.contains("Matching image [") {
+        "matchingImages"
+    } else {
+        "matchingBatches"
+    }
+}
+
+fn matching_activity(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("vocabulary tree")
+        || lower.contains("loop detection")
+        || lower.contains("loop closure")
+    {
+        Some("matchingLoop")
+    } else if lower.contains("generating sequential image pairs") {
+        Some("matchingSequential")
+    } else if lower.contains("matching local") || lower.contains("importing image pairs") {
+        Some("matchingLocal")
+    } else {
+        None
+    }
+}
+
+fn parse_counter_brackets(line: &str) -> Option<(u64, u64)> {
     let open = line.find('[')?;
     let close = line[open + 1..].find(']')? + open + 1;
     let value = &line[open + 1..close];
     let (current, total) = value.split_once('/')?;
-    Some((current.trim().parse().ok()?, total.trim().parse().ok()?))
+    let current = current.trim().parse().ok()?;
+    let total = total.trim().parse().ok()?;
+    (total > 0 && current <= total).then_some((current, total))
 }
 
 fn parse_mapper_progress(
@@ -3511,6 +5146,12 @@ fn parse_mapper_progress(
     counter: &AtomicU64,
     expected_total: Option<u64>,
 ) -> Option<(u64, Option<u64>, String)> {
+    if line.contains("Registering initial image pair")
+        || line.contains("Initializing with image pair")
+    {
+        counter.store(0, Ordering::Relaxed);
+        return Some((0, expected_total, friendly_engine_line(line)));
+    }
     let reported_count = value_after(line, "num_reg_frames=")
         .or_else(|| value_after(line, "num_reg_frames ="))
         .and_then(|value| value.parse::<u64>().ok());
@@ -3526,17 +5167,8 @@ fn parse_mapper_progress(
         return None;
     }
     if let Some(current) = reported_count {
-        counter.fetch_max(current, Ordering::Relaxed);
-        let current = counter.load(Ordering::Relaxed);
+        counter.store(current, Ordering::Relaxed);
         return Some((current, expected_total, format!("已注册 {current} 张图像")));
-    }
-    if line.contains("Registering image #") {
-        let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        return Some((
-            current,
-            expected_total,
-            format!("正在注册第 {current} 张图像"),
-        ));
     }
     None
 }
@@ -3554,7 +5186,16 @@ fn value_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
 fn is_useful_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     [
-        "bundle", "register", "triang", "elapsed", "warning", "error", "writing", "loading",
+        "bundle",
+        "register",
+        "triang",
+        "elapsed",
+        "warning",
+        "error",
+        "writing",
+        "loading",
+        "matching",
+        "loop detection",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -3586,9 +5227,23 @@ fn brush_oom_fallback(
     resolved: ResolvedBrushTrainingPreset,
     initial_sfm_points: u64,
 ) -> Option<ResolvedBrushTrainingPreset> {
-    (quality == Quality::High && planner_enabled && !retry_used)
+    ((quality == Quality::High || resolved.panorama.is_some()) && planner_enabled && !retry_used)
         .then(|| resolved.downgrade_after_oom(initial_sfm_points))
         .flatten()
+}
+
+fn track_process_start(observer: ProcessObserver) -> (ProcessObserver, Arc<AtomicBool>) {
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = started.clone();
+    (
+        Arc::new(move |update| {
+            if matches!(update, ProcessUpdate::Started { .. }) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            observer(update);
+        }),
+        started,
+    )
 }
 
 fn should_allow_two_view_tracks(
@@ -3907,6 +5562,77 @@ async fn validate_image_dimensions(
     .map_err(|error| SplatError::Process(format!("补拍画面校验失败：{error}")))?
 }
 
+/// Temporary #73 hook. Never archive the (potentially hard-linked) pictures,
+/// masks, final.ply or edits. Persist the reuse barrier BEFORE moving caches.
+async fn apply_temporary_png_focal_checkpoint(
+    manager: &ProjectManager,
+    paths: &ProjectPaths,
+    state: &mut PipelineStateFile,
+    checkpoint: &crate::video::temporary_png_focal_workaround::Checkpoint,
+) -> Result<bool> {
+    if state.temporary_png_focal.as_ref() == Some(checkpoint) {
+        return Ok(false);
+    }
+    let mut caches = Vec::new();
+    for (path, name) in [(&paths.colmap, "colmap"), (&paths.brush, "brush")] {
+        if path.exists() {
+            if tokio::fs::symlink_metadata(path)
+                .await?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(SplatError::InvalidPath(path.clone()));
+            }
+            if tokio::fs::read_dir(path)
+                .await?
+                .next_entry()
+                .await?
+                .is_some()
+            {
+                caches.push((path.clone(), name));
+            }
+        }
+    }
+    let invalidated = !caches.is_empty()
+        || state.features_complete
+        || state.matching_complete
+        || state.reconstruction_complete
+        || state.brush_complete;
+    state.features_complete = false;
+    state.matching_complete = false;
+    state.reconstruction_complete = false;
+    state.brush_complete = false;
+    state.brush_training = Default::default();
+    state.bridge_backfill = Default::default();
+    state.stage = PipelineStage::ExtractingFrames;
+    state.temporary_png_focal = None;
+    manager.write_state(&paths.state, state).await?;
+    if !caches.is_empty() {
+        let archive = paths
+            .work
+            .join("cache-archive")
+            .join(format!("temporary-png-focal-v1-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&archive).await?;
+        let mut moved = Vec::new();
+        for (source, name) in caches {
+            let destination = archive.join(name);
+            if let Err(error) = tokio::fs::rename(&source, &destination).await {
+                for (original, saved) in moved.into_iter().rev() {
+                    // State stays non-reusable even if rollback itself fails.
+                    let _ = tokio::fs::rename(saved, original).await;
+                }
+                return Err(SplatError::Process(format!(
+                    "Cannot archive temporary PNG focal cache: {error}"
+                )));
+            }
+            moved.push((source, destination));
+        }
+    }
+    state.temporary_png_focal = Some(checkpoint.clone());
+    manager.write_state(&paths.state, state).await?;
+    Ok(invalidated)
+}
+
 async fn archive_incompatible_colmap_input_cache(
     paths: &ProjectPaths,
     state: &PipelineStateFile,
@@ -4041,6 +5767,7 @@ async fn prepared_frames_from_checkpoint(
         estimated_frames: frames.estimated_frames,
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         minimum_frame_override_applied: frames.minimum_frame_override_applied,
     };
@@ -4116,8 +5843,11 @@ async fn prepared_frames_from_checkpoint(
             {
                 return Ok(None);
             }
-            let working_width = image_sequence.width;
-            let working_height = image_sequence.height;
+            let (working_width, working_height) = state
+                .panorama
+                .as_ref()
+                .map(|p| (p.sfm_width, p.sfm_height))
+                .unwrap_or((image_sequence.width, image_sequence.height));
             Ok(Some(PreparedFrames {
                 input_type: ProjectInputType::Images,
                 video: None,
@@ -4377,25 +6107,36 @@ fn validate_database_camera(database: &Path, camera: &ColmapCamera) -> Result<()
     .map_err(|error| SplatError::Process(format!("无法读取原项目 COLMAP 数据库：{error}")))?;
     let stored = connection
         .query_row(
-            "SELECT model, width, height FROM cameras WHERE camera_id = ?1",
+            "SELECT model, width, height, params FROM cameras WHERE camera_id = ?1",
             [camera.id],
             |row| {
                 Ok((
                     row.get::<_, i32>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| SplatError::Process(format!("校验原项目相机数据库失败：{error}")))?;
-    let Some((model, width, height)) = stored else {
+    let Some((model, width, height, params)) = stored else {
         return Err(SplatError::Process(format!(
             "原项目 COLMAP 数据库缺少相机 ID {}",
             camera.id
         )));
     };
-    if model != camera.model_id || width != camera.width as i64 || height != camera.height as i64 {
+    let (chunks, remainder) = params.as_chunks::<8>();
+    let stored_params = chunks
+        .iter()
+        .map(|bytes| f64::from_le_bytes(*bytes))
+        .collect::<Vec<_>>();
+    if model != camera.model_id
+        || width != camera.width as i64
+        || height != camera.height as i64
+        || !remainder.is_empty()
+        || stored_params != camera.params
+    {
         return Err(SplatError::Process(
             "原项目 COLMAP 数据库与最终稀疏模型的相机信息不一致".into(),
         ));
@@ -4510,11 +6251,80 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.sampling_fps = prepared.plan.sampling_fps;
         frames.selected_frames = prepared.plan.selected_frames.clone();
         frames.candidate_frames = prepared.plan.candidate_frames.clone();
+        frames.bridge_source_frames = prepared.plan.bridge_source_frames;
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
         frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
         frames.colmap_input_version = Some(COLMAP_INPUT_VERSION);
     }
+}
+
+fn validate_manual_bridge_plan(
+    plan: &FramePlan,
+    bridge: &crate::planner::bridge_backfill::BridgeBackfillPlan,
+) -> Result<()> {
+    if let Some(total) = plan.bridge_source_frames {
+        let initial = bridge.initial_input_images;
+        let budget = (initial / 5).min(total.saturating_sub(initial));
+        if initial > total
+            || bridge.available_budget != budget
+            || plan.rescue_max_frames != initial.saturating_add(budget)
+            || bridge.selected_frame_indices.len() as u64 > budget
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .any(|index| *index >= total)
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .collect::<HashSet<_>>()
+                .len()
+                != bridge.selected_frame_indices.len()
+        {
+            return Err(SplatError::Process(
+                "Invalid manual bridge checkpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bridge_frames(
+    work: &Path,
+    panorama: bool,
+    plan: &FramePlan,
+    indices: &[u64],
+    fps: Option<f64>,
+) -> Result<Vec<crate::video::PlannedFrame>> {
+    if let Some(total) = plan.bridge_source_frames {
+        if indices.iter().any(|index| *index >= total) {
+            return Err(SplatError::Process(
+                "Bridge frame index is out of range".into(),
+            ));
+        }
+        if panorama {
+            return crate::video::panorama::bridge_source_frames(work, total, indices);
+        }
+        let fps = fps
+            .filter(|fps| fps.is_finite() && *fps > 0.)
+            .ok_or_else(|| SplatError::Process("Invalid bridge source frame rate".into()))?;
+        return Ok(indices
+            .iter()
+            .map(|index| crate::video::PlannedFrame {
+                source_frame_index: *index,
+                timestamp_seconds: *index as f64 / fps,
+            })
+            .collect());
+    }
+    Ok(indices
+        .iter()
+        .filter_map(|index| {
+            plan.candidate_frames
+                .iter()
+                .find(|frame| frame.source_frame_index == *index)
+                .cloned()
+        })
+        .collect())
 }
 
 fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
@@ -4662,6 +6472,1062 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fine_budget_snapshot_resumes_without_rescanning_and_other_paths_are_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let missing = root.path().join("missing");
+        for (quality, version, panorama) in [
+            (Quality::Fast, 2, false),
+            (Quality::Balanced, 2, false),
+            (Quality::High, 1, false),
+            (Quality::High, 2, true),
+        ] {
+            let mut state = PipelineStateFile::created(quality);
+            state.generation_policy = Some(super::super::generation_policy::GenerationPolicy {
+                version,
+                ..Default::default()
+            });
+            runner
+                .prepare_fine_splat_budget(&mut state, quality, &missing, &missing, panorama)
+                .await
+                .unwrap();
+            assert!(state.brush_training.fine_splat_budget.is_none());
+        }
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(Default::default());
+        assert!(runner
+            .prepare_fine_splat_budget(&mut state, Quality::High, &missing, &missing, false)
+            .await
+            .is_err());
+        let budget = super::super::splat_budget::FineSplatBudget {
+            version: 1,
+            coefficient: 0.5,
+            registered_images: 90,
+            effective_pixels: 364_993_345,
+            sparse_points: 66_218,
+            tracked_points: 66_218,
+            observations: 191_175,
+            mean_track_length: 191_175. / 66_218.,
+            requested_max_splats: 2_220_679,
+        };
+        state.brush_training.fine_splat_budget = Some(budget);
+        let mut resumed: PipelineStateFile =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        runner
+            .prepare_fine_splat_budget(&mut resumed, Quality::High, &missing, &missing, false)
+            .await
+            .unwrap();
+        let mut restored = resumed.brush_training.fine_splat_budget.unwrap();
+        assert!((restored.mean_track_length - budget.mean_track_length).abs() < 1e-12);
+        // JSON float parsing may differ by one ULP; integer evidence and the
+        // recomputed ceiling, rather than exact float bits, must remain equal.
+        restored.mean_track_length = budget.mean_track_length;
+        assert_eq!(restored, budget);
+        let resolution =
+            resumed
+                .generation_policy
+                .unwrap()
+                .resolution(Quality::High, None, 2560, 3840, false);
+        let training = resumed
+            .generation_policy
+            .unwrap()
+            .training(
+                Quality::High,
+                None,
+                &resolution,
+                66_218,
+                3_000_000,
+                resumed.brush_training.fine_splat_budget.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(training.configured_max_splats, Some(2_220_679));
+        assert_eq!(training.preset.max_splats, Some(3_000_000));
+    }
+
+    #[tokio::test]
+    async fn manual_bridge_upgrade_archives_incompatible_cache_with_a_durable_barrier() {
+        for manual in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+            for dir in [
+                &paths.frames,
+                &paths.colmap_frames,
+                &paths.masks,
+                &paths.colmap,
+                &paths.brush,
+            ] {
+                tokio::fs::create_dir_all(dir).await.unwrap();
+                tokio::fs::write(dir.join("sentinel"), b"old")
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(paths.project.join("final.ply"), b"published")
+                .await
+                .unwrap();
+            tokio::fs::write(paths.project.join("edit.ply"), b"edited")
+                .await
+                .unwrap();
+            let manager = ProjectManager::with_root(root.path().into());
+            let runner =
+                PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+            let old = super::super::generation_policy::GenerationPolicy {
+                version: 2,
+                frame_sampling_ratio: manual.then_some(0.9),
+                ..Default::default()
+            };
+            let new = super::super::generation_policy::GenerationPolicy { version: 3, ..old };
+            let video = VideoInfo {
+                duration: 60.,
+                fps: 30.,
+                total_frames: 1800,
+                width: 1920,
+                height: 1080,
+                codec: "h264".into(),
+                rotation: 0,
+                pixel_format: "yuv420p".into(),
+                has_alpha: false,
+            };
+            let mut state = PipelineStateFile::created(Quality::Fast);
+            state.generation_policy = Some(old);
+            state.planner_enabled = true;
+            state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+            state.resolution_plan = Some(old.resolution(Quality::Fast, None, 1920, 1080, true));
+            state.frames = Some(FrameState::from(&old.frame_plan(&video, Quality::Fast)));
+            state.video = Some(video);
+            state.features_complete = true;
+            state.matching_complete = true;
+            state.reconstruction_complete = true;
+            if manual {
+                tokio::fs::write(paths.work.join("cache-archive"), b"blocked")
+                    .await
+                    .unwrap();
+                assert!(runner
+                    .prepare_failed_retry(&manager, &paths, &mut state, new)
+                    .await
+                    .is_err());
+                state = manager.read_state(&paths.state).await.unwrap();
+                assert!(!state.reconstruction_complete);
+                assert!(state
+                    .retry_cache_pending
+                    .iter()
+                    .any(|path| path == "colmap"));
+                assert!(paths.colmap.join("sentinel").exists());
+                tokio::fs::remove_file(paths.work.join("cache-archive"))
+                    .await
+                    .unwrap();
+            }
+            runner
+                .prepare_failed_retry(&manager, &paths, &mut state, new)
+                .await
+                .unwrap();
+            assert_eq!(paths.colmap.join("sentinel").exists(), !manual);
+            assert_eq!(paths.frames.join("sentinel").exists(), !manual);
+            assert_eq!(state.reconstruction_complete, !manual);
+            assert!(state.retry_cache_pending.is_empty());
+            assert_eq!(
+                std::fs::read(paths.project.join("final.ply")).unwrap(),
+                b"published"
+            );
+            assert_eq!(
+                std::fs::read(paths.project.join("edit.ply")).unwrap(),
+                b"edited"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_bridge_checkpoint_freezes_original_budget_across_partial_extraction() {
+        let mut plan = FramePlan {
+            estimated_frames: 10,
+            selected_frames: (0..100)
+                .step_by(10)
+                .map(|index| PlannedFrame {
+                    source_frame_index: index,
+                    timestamp_seconds: index as f64 / 30.,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        plan.use_manual_bridge_budget(1000);
+        let bridge = plan_bridge_backfill(&plan, &[0, 90].into_iter().collect(), 2);
+        validate_manual_bridge_plan(&plan, &bridge).unwrap();
+        let added = resolve_bridge_frames(
+            Path::new("unused"),
+            false,
+            &plan,
+            &bridge.selected_frame_indices,
+            Some(30.),
+        )
+        .unwrap();
+        assert_eq!(added.len(), 2);
+        assert!(
+            resolve_bridge_frames(Path::new("unused"), false, &plan, &[1000], Some(30.)).is_err()
+        );
+        let mut saved = FrameState::from(&plan);
+        saved.selected_frames.extend(added);
+        saved.extracted_frames = Some(12);
+        let saved: FrameState =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(saved.initial_extracted_frames, 10);
+        let resumed = FramePlan {
+            selected_frames: saved.selected_frames,
+            bridge_source_frames: saved.bridge_source_frames,
+            rescue_max_frames: saved.rescue_max_frames,
+            ..Default::default()
+        };
+        validate_manual_bridge_plan(&resumed, &bridge).unwrap();
+        assert_eq!(resumed.rescue_max_frames, 12);
+        let mut invalid = bridge.clone();
+        invalid.available_budget = 3;
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        invalid = bridge.clone();
+        invalid.selected_frame_indices[1] = invalid.selected_frame_indices[0];
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        let old: FrameState =
+            serde_json::from_str(r#"{"retentionRatio":0.5,"samplingFps":15,"estimatedFrames":10}"#)
+                .unwrap();
+        assert_eq!(old.bridge_source_frames, None);
+    }
+
+    #[test]
+    fn manual_bridge_metrics_distinguish_source_candidates_from_extracted_frames() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let video = VideoInfo {
+            duration: 60.,
+            fps: 30.,
+            total_frames: 1800,
+            width: 4096,
+            height: 2048,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        let policy = super::super::generation_policy::GenerationPolicy {
+            frame_sampling_ratio: Some(0.2),
+            ..Default::default()
+        };
+        let plan = policy.frame_plan(&video, Quality::High);
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.video = Some(video);
+        state.generation_policy = Some(policy);
+        state.frames = Some(FrameState::from(&plan));
+        runner.record_frame_metrics(&state, 360, Some(&plan));
+        let metrics = tracker.snapshot().frame_plan.unwrap();
+        assert_eq!(metrics.initial_selected_count, 360);
+        assert_eq!(metrics.candidate_count, 1800);
+        assert_eq!(metrics.configured_candidate_fps, None);
+        assert_eq!(plan.rescue_max_frames, 432);
+    }
+
+    #[tokio::test]
+    #[ignore = "Runs bundled FFmpeg/FFprobe on isolated synthetic video; no SfM or training"]
+    async fn native_manual_bridge_v3_extraction_and_rollback() {
+        use crate::process::ProcessSpec;
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let engines = EnginePaths::from_root(workspace.join("engines"));
+        assert!(engines.ffmpeg.is_file() && engines.ffprobe.is_file());
+        let root = workspace
+            .join(".cache/manual-bridge-v3")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let mut records = Vec::new();
+        for (name, panorama, alpha) in [
+            ("ordinary", false, false),
+            ("ordinary-alpha", false, true),
+            ("panorama-vfr", true, false),
+            ("panorama-vfr-alpha", true, true),
+        ] {
+            let work = root.join(name);
+            std::fs::create_dir_all(&work).unwrap();
+            let input = work.join("source.mov");
+            let mut filter = String::from("format=rgba");
+            if alpha {
+                filter.push_str(",colorchannelmixer=aa=0.5");
+            }
+            if panorama {
+                filter.push_str(",setpts=PTS+5/TB+0.2*floor(N/15)/TB");
+            }
+            let manager = ProcessManager::new();
+            let result = manager
+                .run(ProcessSpec {
+                    executable: engines.ffmpeg.clone(),
+                    args: vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-f".into(),
+                        "lavfi".into(),
+                        "-i".into(),
+                        "testsrc=size=128x64:rate=30:duration=4".into(),
+                        "-vf".into(),
+                        filter.into(),
+                        "-fps_mode".into(),
+                        "vfr".into(),
+                        "-c:v".into(),
+                        "qtrle".into(),
+                        "-pix_fmt".into(),
+                        "argb".into(),
+                        "-threads".into(),
+                        "1".into(),
+                        "-y".into(),
+                        input.as_os_str().to_owned(),
+                    ],
+                    working_directory: Some(work.clone()),
+                    log_path: Some(work.join("generate.log")),
+                    observer: None,
+                })
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.failure_detail());
+            let source_before = std::fs::read(&input).unwrap();
+            let mut video = probe_video(&engines.ffprobe, &input, None, &manager)
+                .await
+                .unwrap();
+            // Opaque case explicitly exercises the RGB/JPEG extraction path;
+            // Alpha cases exercise aligned RGBA, COLMAP images, and masks.
+            video.has_alpha = alpha;
+            let policy = super::super::generation_policy::GenerationPolicy {
+                frame_sampling_ratio: Some(if panorama { 0.3 } else { 0.5 }),
+                ..Default::default()
+            };
+            let runner =
+                PipelineRunner::new(engines.clone(), |_| {}).with_generation_policy(Some(policy));
+            let frames = work.join("frames");
+            let colmap = work.join("colmap_frames");
+            let masks = work.join("masks");
+            let prepared = runner
+                .prepare_frames(
+                    &input,
+                    Quality::Fast,
+                    &frames,
+                    &colmap,
+                    &masks,
+                    None,
+                    true,
+                    Some(video),
+                    panorama.then_some((128, 64)),
+                    panorama,
+                )
+                .await
+                .unwrap();
+            let base: Vec<_> = prepared
+                .plan
+                .selected_frames
+                .iter()
+                .map(|frame| {
+                    let file = frames.join(format!(
+                        "frame_{:010}.{}",
+                        frame.source_frame_index,
+                        if alpha { "png" } else { "jpg" }
+                    ));
+                    (file.clone(), std::fs::read(file).unwrap())
+                })
+                .collect();
+            let registered = [
+                prepared
+                    .plan
+                    .selected_frames
+                    .first()
+                    .unwrap()
+                    .source_frame_index,
+                prepared
+                    .plan
+                    .selected_frames
+                    .last()
+                    .unwrap()
+                    .source_frame_index,
+            ]
+            .into_iter()
+            .collect();
+            let bridge = plan_bridge_backfill(&prepared.plan, &registered, 2);
+            validate_manual_bridge_plan(&prepared.plan, &bridge).unwrap();
+            let added = resolve_bridge_frames(
+                &work,
+                panorama,
+                &prepared.plan,
+                &bridge.selected_frame_indices,
+                prepared.video.as_ref().map(|v| v.fps),
+            )
+            .unwrap();
+            assert!(!added.is_empty());
+            assert!(added.len() as u64 <= prepared.extracted_frames / 5);
+            if panorama {
+                let times: Vec<crate::video::panorama::FrameTime> = serde_json::from_slice(
+                    &std::fs::read(work.join("panorama-frame-times.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(times[0].timestamp_seconds >= 5.);
+                assert!(times
+                    .windows(2)
+                    .any(|p| p[1].timestamp_seconds - p[0].timestamp_seconds > 0.1));
+                for frame in &added {
+                    assert_eq!(
+                        frame.timestamp_seconds,
+                        times[frame.source_frame_index as usize].timestamp_seconds
+                    );
+                }
+            }
+            let cancelled = ProcessManager::new();
+            cancelled.cancel();
+            assert!(extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                None,
+                &cancelled,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            let output = extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                Some(work.join("bridge.log")),
+                &manager,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                output.frame_count,
+                prepared.extracted_frames + added.len() as u64
+            );
+            for (file, bytes) in &base {
+                assert_eq!(&std::fs::read(file).unwrap(), bytes);
+            }
+            let count = output.frame_count;
+            remove_bridge_outputs(&frames, &colmap, &masks, &added, alpha).await;
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), source_before);
+            records.push(
+                serde_json::json!({"case":name,"initial":prepared.extracted_frames,
+                "budget":prepared.plan.rescue_max_frames,"added":added.len(),"combined":count,
+                "sourceUnchanged":true,"cancelAndRollbackProtected":true}),
+            );
+        }
+        std::fs::write(
+            root.join("result.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+        eprintln!("Native manual bridge evidence: {}", root.display());
+    }
+
+    #[tokio::test]
+    async fn new_policy_retry_archives_only_incompatible_work_and_preserves_results() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        for dir in [
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+        ] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+            tokio::fs::write(dir.join("sentinel"), b"old-cache")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(paths.project.join("final.ply"), b"published")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.project.join("edit.ply"), b"edited")
+            .await
+            .unwrap();
+        let manager = ProjectManager::with_root(root.path().into());
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        state.brush_complete = true;
+        runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .unwrap();
+        assert!(state.generation_policy.is_some());
+        assert!(!state.features_complete && !state.matching_complete && !state.brush_complete);
+        assert!(!paths.colmap.join("sentinel").exists());
+        assert_eq!(
+            tokio::fs::read(paths.project.join("final.ply"))
+                .await
+                .unwrap(),
+            b"published"
+        );
+        assert_eq!(
+            tokio::fs::read(paths.project.join("edit.ply"))
+                .await
+                .unwrap(),
+            b"edited"
+        );
+        assert!(state.retry_cache_pending.is_empty());
+        // Same-policy retry keeps compatible SfM and clears only training.
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"compatible")
+            .await
+            .unwrap();
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            state.features_complete && state.matching_complete && state.reconstruction_complete
+        );
+        assert_eq!(
+            tokio::fs::read(paths.colmap.join("database.db"))
+                .await
+                .unwrap(),
+            b"compatible"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retry_archive_is_a_durable_barrier_and_alpha_requires_nonopaque_pixels() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.work.join("cache-archive"), b"blocked-directory")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"old")
+            .await
+            .unwrap();
+        let manager = ProjectManager::with_root(root.path().into());
+        let runner =
+            PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        assert!(runner
+            .prepare_failed_retry(&manager, &paths, &mut state, Default::default())
+            .await
+            .is_err());
+        let saved = manager.read_state(&paths.state).await.unwrap();
+        assert!(
+            !saved.features_complete
+                && !saved.reconstruction_complete
+                && !saved.retry_cache_pending.is_empty()
+        );
+        assert_eq!(
+            tokio::fs::read(paths.colmap.join("database.db"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        let mut image = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        image.save(paths.frames.join("frame.png")).unwrap();
+        state.actual_transparency = None;
+        assert!(!runner
+            .actual_transparency(&paths, &mut state, true)
+            .await
+            .unwrap());
+        image.get_pixel_mut(1, 1).0[3] = 254;
+        image.save(paths.frames.join("frame.png")).unwrap();
+        state.actual_transparency = None;
+        assert!(runner
+            .actual_transparency(&paths, &mut state, true)
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn image_matching_dispatch_preserves_video_and_quality_loop_policy() {
+        use crate::project::ImageMatchingStrategy::{Exhaustive, Sequential};
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            for planner in [false, true] {
+                assert_eq!(
+                    image_matching_policy(ProjectInputType::Images, Exhaustive, quality, planner),
+                    (false, false)
+                );
+                assert_eq!(
+                    image_matching_policy(ProjectInputType::Images, Sequential, quality, planner),
+                    (true, quality.loop_detection_enabled(planner))
+                );
+                for strategy in [Sequential, Exhaustive] {
+                    assert_eq!(
+                        image_matching_policy(ProjectInputType::Video, strategy, quality, planner),
+                        (true, quality.loop_detection_enabled(planner))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_matching_policy_uses_saved_state_not_new_runner_preference() {
+        use crate::project::ImageMatchingStrategy::{Exhaustive, Sequential};
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ProjectManager::for_diagnostics(directory.path().to_path_buf());
+        for strategy in [Sequential, Exhaustive] {
+            let mut state = PipelineStateFile::created_for(Quality::Fast, ProjectInputType::Images);
+            state.image_matching_strategy = strategy;
+            state.matching_complete = true;
+            let path = directory.path().join("state.json");
+            manager.write_state(&path, &state).await.unwrap();
+            let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+                .with_image_matching_strategy(if strategy == Sequential {
+                    Exhaustive
+                } else {
+                    Sequential
+                });
+            let restored = manager.read_state(&path).await.unwrap();
+            assert_ne!(
+                restored.image_matching_strategy,
+                runner.image_matching_strategy
+            );
+            assert_eq!(
+                image_matching_policy(
+                    restored.input_type,
+                    restored.image_matching_strategy,
+                    restored.preset,
+                    restored.planner_enabled
+                )
+                .0,
+                strategy == Sequential
+            );
+            assert!(restored.matching_complete);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires real ERP photos and bundled engines; isolated cache only"]
+    async fn bundled_panorama_images_full_pipeline() {
+        let input = PathBuf::from(
+            std::env::var_os("OOOSPLAT_PANORAMA_IMAGES").expect("Set ERP photo directory"),
+        );
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let cache = workspace.join(".cache/panorama-images-v1");
+        std::fs::create_dir_all(&cache).unwrap();
+        let root = tempfile::tempdir_in(&cache).unwrap().keep();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let captured = events.clone();
+        let runner = PipelineRunner::new(
+            default_engine_paths(Some(workspace.join("engines"))),
+            move |event| captured.lock().unwrap().push(event),
+        )
+        .with_video_projection(crate::video::panorama::VideoProjection::Equirectangular);
+        eprintln!("Real image pipeline outputs: {}", root.display());
+        let result = runner
+            .generate_for_diagnostics(&input, Quality::Fast, &root)
+            .await;
+        std::fs::write(
+            cache.join("events.json"),
+            serde_json::to_vec_pretty(&*events.lock().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let result = result.unwrap();
+        std::fs::write(
+            cache.join("result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            result.input_images >= 2 && result.registered_images >= 2 && result.splat_count > 0
+        );
+        let project = result.final_ply.parent().unwrap();
+        let state: PipelineStateFile =
+            serde_json::from_slice(&std::fs::read(project.join("state.json")).unwrap()).unwrap();
+        assert!(state.video.is_none());
+        assert_eq!(state.input_type, ProjectInputType::Images);
+        assert_eq!(
+            state
+                .panorama
+                .as_ref()
+                .unwrap()
+                .image_sources
+                .as_ref()
+                .unwrap()
+                .len() as u64,
+            result.input_images
+        );
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.unit.as_deref() == Some("panoramaImageFaces")));
+        eprintln!(
+            "Real ERP photos: {} input, {} registered, {} splats, {} ms; {}",
+            result.input_images,
+            result.registered_images,
+            result.splat_count,
+            result.duration_ms,
+            result.final_ply.display()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires OOOSPLAT_PANORAMA_VIDEO and bundled COLMAP/Brush; full real pipeline in isolated cache"]
+    async fn bundled_panorama_progress_full_pipeline() {
+        let input = PathBuf::from(
+            std::env::var_os("OOOSPLAT_PANORAMA_VIDEO").expect("Set a real stitched ERP video"),
+        );
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let root = tempfile::tempdir_in(workspace.join(".cache/panorama-v1"))
+            .unwrap()
+            .keep();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let output = captured.clone();
+        let runner = PipelineRunner::new(
+            default_engine_paths(Some(workspace.join("engines"))),
+            move |event| output.lock().unwrap().push(event),
+        )
+        .with_video_projection(crate::video::panorama::VideoProjection::Equirectangular);
+        let result = runner
+            .generate_for_diagnostics(&input, Quality::Fast, &root)
+            .await;
+        let events = captured.lock().unwrap();
+        std::fs::write(
+            workspace.join(".cache/panorama-v1/progress-e2e-events.json"),
+            serde_json::to_vec_pretty(&*events).unwrap(),
+        )
+        .unwrap();
+        let result = result.unwrap_or_else(|error| {
+            panic!("Real pipeline failed: {error}; outputs: {}", root.display())
+        });
+        std::fs::write(
+            workspace.join(".cache/panorama-v1/progress-e2e-result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].progress >= pair[0].progress));
+        assert!(events
+            .iter()
+            .filter(|event| event.stage != PipelineStage::Completed)
+            .all(|event| event.progress <= 99.9));
+        let mut active = None;
+        for event in events.iter() {
+            if event.kind == EventKind::Stage {
+                active = Some(event);
+            }
+            if event.kind == EventKind::Runtime {
+                let active = active.unwrap();
+                assert_eq!(event.stage, active.stage);
+                assert_eq!(event.substage, active.substage);
+                assert_eq!(
+                    event.operation.as_ref().unwrap().id,
+                    active.operation.as_ref().unwrap().id
+                );
+            }
+        }
+        for stage in [
+            PipelineStage::ExtractingFeatures,
+            PipelineStage::Matching,
+            PipelineStage::Reconstructing,
+            PipelineStage::TrainingSplats,
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.stage == stage && event.kind == EventKind::Runtime),
+                "Missing actual engine runtime for {stage:?}"
+            );
+        }
+        assert!(events
+            .iter()
+            .filter(|event| matches!(
+                event.stage,
+                PipelineStage::Matching | PipelineStage::Reconstructing
+            ) && event.kind == EventKind::Progress)
+            .all(|event| event.indeterminate && event.stage_progress.is_none()));
+        eprintln!(
+            "Real panorama pipeline: {} input frames, {} registered, {} splats, {} ms; PLY: {}",
+            result.input_images,
+            result.registered_images,
+            result.splat_count,
+            result.duration_ms,
+            result.final_ply.display()
+        );
+    }
+
+    /// Real engines, no telemetry/catalog writes. The fixture must be a completed
+    /// diagnostic project; only isolated copies/derived outputs are modified.
+    #[tokio::test]
+    #[ignore = "Requires OOOSPLAT_PANORAMA_TEST_PROJECT and the bundled GPU runtime"]
+    async fn bundled_panorama_cancel_and_resume() {
+        let source = PathBuf::from(
+            std::env::var_os("OOOSPLAT_PANORAMA_TEST_PROJECT")
+                .expect("Set a completed diagnostic project path"),
+        );
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let temporary = tempfile::tempdir_in(workspace.join(".cache/panorama-v1")).unwrap();
+        let project = temporary.path().join("resume-project");
+        let reuse_faces = std::env::var_os("OOOSPLAT_PANORAMA_RESUME_REUSE_FACES").is_some();
+        let original_face_batches = if reuse_faces {
+            std::fs::read_dir(source.join("work/panorama-training/images"))
+                .unwrap()
+                .count()
+        } else {
+            0
+        };
+        fn copy_readonly_tree(src: &Path, dst: &Path, reuse_faces: bool) {
+            std::fs::create_dir_all(dst).unwrap();
+            for e in std::fs::read_dir(src).unwrap() {
+                let e = e.unwrap();
+                let name = e.file_name();
+                if ["panorama-training", "brush", "final.ply", "edit.ply"]
+                    .iter()
+                    .any(|n| {
+                        name == std::ffi::OsStr::new(n)
+                            && !(*n == "panorama-training" && reuse_faces)
+                    })
+                {
+                    continue;
+                }
+                let dest = dst.join(&name);
+                if e.file_type().unwrap().is_dir() {
+                    copy_readonly_tree(&e.path(), &dest, reuse_faces);
+                } else {
+                    std::fs::copy(e.path(), dest).unwrap();
+                }
+            }
+        }
+        copy_readonly_tree(&source, &project, reuse_faces);
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), project.clone());
+        let manager = ProjectManager::for_diagnostics(temporary.path().into());
+        let mut metadata: ProjectMetadata =
+            serde_json::from_slice(&std::fs::read(&paths.metadata).unwrap()).unwrap();
+        metadata.id = paths.id;
+        metadata.status = ProjectStatus::Cancelled;
+        metadata.output = None;
+        let mut state = manager.read_state(&paths.state).await.unwrap();
+        state.brush_complete = false;
+        state.brush_training = Default::default();
+        state.stage = PipelineStage::ValidatingReconstruction;
+        manager.write_state(&paths.state, &state).await.unwrap();
+        manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await
+            .unwrap();
+        let sphere = paths.colmap.join("sparse/0/images.bin");
+        let before = crate::video::panorama::fingerprint(&sphere).unwrap();
+        let before_time = std::fs::metadata(&sphere).unwrap().modified().unwrap();
+        let cancel_handle = Arc::new(std::sync::Mutex::new(None::<ProcessManager>));
+        let observer = cancel_handle.clone();
+        let runner = PipelineRunner::new(
+            default_engine_paths(Some(workspace.join("engines"))),
+            move |event| {
+                if event.substage.as_deref() == Some("panoramaTrainingPreparation")
+                    && event.current == Some(12)
+                {
+                    observer.lock().unwrap().as_ref().unwrap().cancel();
+                }
+            },
+        );
+        *cancel_handle.lock().unwrap() = Some(runner.process_manager.clone());
+        let acceleration = runner.verify_pipeline_engines().await.unwrap();
+        let cancelled = runner
+            .execute_project(
+                manager.clone(),
+                paths.clone(),
+                &mut metadata,
+                state,
+                &acceleration,
+            )
+            .await;
+        assert!(matches!(cancelled, Err(SplatError::Cancelled)));
+        assert_eq!(metadata.status, ProjectStatus::Cancelled);
+        let cache = paths.work.join("panorama-training/images");
+        let count = std::fs::read_dir(&cache).unwrap().count();
+        assert_eq!(
+            count,
+            if reuse_faces {
+                original_face_batches
+            } else {
+                2
+            }
+        );
+        assert!(!std::fs::read_dir(&cache).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".partial")));
+        let first = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("front.png");
+        let face_time = std::fs::metadata(&first).unwrap().modified().unwrap();
+        let restored = manager.read_state(&paths.state).await.unwrap();
+        let image_input = restored.input_type == ProjectInputType::Images;
+        assert!(restored.reconstruction_complete);
+        assert!(!restored.brush_complete);
+        let cancelled_recipe = restored
+            .brush_training
+            .resolved
+            .expect("Recipe saved before preparing faces");
+        assert_eq!(cancelled_recipe.panorama.unwrap().recipe_version, 1);
+        assert_eq!(cancelled_recipe.preset.total_steps, 12_000);
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = messages.clone();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let observed = captured.clone();
+        let runner = PipelineRunner::new(
+            default_engine_paths(Some(workspace.join("engines"))),
+            move |event| {
+                observed.lock().unwrap().push(event.clone());
+                if event.message.contains("复用") {
+                    seen.lock().unwrap().push(event.message);
+                }
+            },
+        );
+        let result = runner
+            .execute_project(
+                manager,
+                paths.clone(),
+                &mut metadata,
+                restored,
+                &acceleration,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.registered_images, result.input_images);
+        assert!(result.splat_count > 0);
+        let completed: PipelineStateFile =
+            serde_json::from_slice(&std::fs::read(&paths.state).unwrap()).unwrap();
+        assert_eq!(
+            completed.brush_training.initial_resolved,
+            Some(cancelled_recipe)
+        );
+        assert_eq!(completed.brush_training.resolved, Some(cancelled_recipe));
+        assert_eq!(
+            crate::video::panorama::fingerprint(&sphere).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&sphere).unwrap().modified().unwrap(),
+            before_time
+        );
+        assert_eq!(
+            std::fs::metadata(first).unwrap().modified().unwrap(),
+            face_time
+        );
+        let seen = messages.lock().unwrap();
+        for text in [
+            "帧检查点",
+            "特征提取检查点",
+            if image_input {
+                "穷举匹配检查点"
+            } else {
+                "顺序匹配检查点"
+            },
+            "相机重建检查点",
+        ] {
+            assert!(seen.iter().any(|m| m.contains(text)), "{text}: {seen:?}");
+        }
+        let events = captured.lock().unwrap();
+        std::fs::write(
+            workspace.join(".cache/panorama-v1/last-resume-events.json"),
+            serde_json::to_vec_pretty(&*events).unwrap(),
+        )
+        .unwrap();
+        for pair in events.windows(2) {
+            assert!(
+                pair[1].progress >= pair[0].progress,
+                "Progress regressed: {:?} {} -> {:?} {}",
+                pair[0].kind,
+                pair[0].progress,
+                pair[1].kind,
+                pair[1].progress
+            );
+        }
+        let faces: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.unit.as_deref()
+                    == Some(if image_input {
+                        "panoramaImageFaces"
+                    } else {
+                        "panoramaFaces"
+                    })
+            })
+            .collect();
+        assert!(if image_input {
+            events.iter().any(|event| {
+                event.kind == EventKind::Log && event.message == "已校验并复用训练缓存"
+            })
+        } else {
+            faces.iter().any(|event| event.message.contains("复用"))
+        });
+        assert_eq!(
+            faces.last().unwrap().current,
+            Some(result.registered_images * 6)
+        );
+        assert_eq!(
+            faces.last().unwrap().total,
+            Some(result.registered_images * 6)
+        );
+        assert!(faces.iter().all(|event| event.progress < 66.0));
+        let validated = events
+            .iter()
+            .position(|event| {
+                event.substage.as_deref() == Some("panoramaTrainingValidation")
+                    && event
+                        .stage_progress
+                        .is_some_and(|progress| (progress - 600.0 / 38.0).abs() < 0.001)
+            })
+            .unwrap();
+        assert_eq!(events[validated].progress, 66.0);
+        assert!(events[validated].current.is_none() && events[validated].total.is_none());
+        assert!(events[validated + 1..]
+            .iter()
+            .any(|event| event.engine == Some(PipelineEngine::Brush)
+                && event.current.is_some()
+                && event.substage.as_deref() == Some("training")));
+        assert!(events
+            .iter()
+            .filter(|event| event.stage != PipelineStage::Completed)
+            .all(|event| event.progress < 100.0));
+        eprintln!("Real cancellation/resume verified: {} ERP frames, {} splats; sphere model and completed face batches unchanged",result.input_images,result.splat_count);
+    }
+
     #[test]
     fn reshoot_project_name_uses_the_short_suffix() {
         assert_eq!(reshoot_project_name("示例项目"), "示例项目_补拍");
@@ -4693,6 +7559,72 @@ mod tests {
                 source.resolution_policy_version
             );
         }
+    }
+
+    #[test]
+    fn missing_checkpoint_metrics_stay_unknown() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let state = PipelineStateFile::created(Quality::High);
+        runner.record_frame_metrics(&state, 30, None);
+        runner.record_brush_metrics(&state);
+        let snapshot = tracker.snapshot();
+        assert!(snapshot.frame_plan.is_none());
+        assert!(snapshot.initial_reconstruction.is_none());
+        assert!(snapshot.bridge.is_none());
+        assert!(snapshot.brush.is_none());
+        assert!(snapshot.final_result.is_none());
+    }
+
+    #[test]
+    fn restored_source_metrics_use_raw_input_and_only_the_new_reshoot_batch() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let mut state = PipelineStateFile::created_for(Quality::High, ProjectInputType::Images);
+        state.image_sequence = Some(ImageSequenceInfo {
+            width: 8192,
+            height: 4096,
+            image_count: 12,
+            has_alpha: false,
+            requires_large_sequence_confirmation: false,
+        });
+        state.frames = Some(FrameState {
+            extracted_frames: Some(112),
+            initial_extracted_frames: 112,
+            ..Default::default()
+        });
+        state.reshoot = Some(ReshootState {
+            source_image_count: 100,
+            reshoot_frame_count: 12,
+            supplemental_frames_complete: true,
+            ..Default::default()
+        });
+        runner.restore_source_metrics(&state);
+        let source = tracker.snapshot().frame_plan.unwrap();
+        assert_eq!((source.source_width, source.source_height), (8192, 4096));
+        assert_eq!(source.source_item_count, 12);
+        assert_eq!(source.initial_selected_count, 12);
+        assert_eq!(source.candidate_count, 12);
+        // Before preparation, confirmed source dimensions/counts are still available.
+        state.reshoot.as_mut().unwrap().supplemental_frames_complete = false;
+        runner.restore_source_metrics(&state);
+        assert_eq!(
+            tracker
+                .snapshot()
+                .frame_plan
+                .unwrap()
+                .initial_selected_count,
+            12
+        );
+        // Old snapshots missing source data cannot borrow combined training counts.
+        let empty = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(empty.clone());
+        state.image_sequence = None;
+        runner.restore_source_metrics(&state);
+        assert!(empty.snapshot().frame_plan.is_none());
     }
 
     #[tokio::test]
@@ -4893,14 +7825,14 @@ mod tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
-                "CREATE TABLE cameras (camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)",
+                "CREATE TABLE cameras (camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, params BLOB NOT NULL)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO cameras(camera_id, model, width, height) VALUES (1, 2, 1920, 1080)",
-                [],
+                "INSERT INTO cameras(camera_id, model, width, height, params) VALUES (1, 2, 1920, 1080, ?1)",
+                [vec![0_u8; 32]],
             )
             .unwrap();
         drop(connection);
@@ -4910,9 +7842,20 @@ mod tests {
             model: "SIMPLE_RADIAL".into(),
             width: 1920,
             height: 1080,
+            params: vec![0.0; 4],
         };
 
         validate_database_camera(&database, &camera).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for malformed in [vec![0_u8; 33], vec![0_u8; 31], vec![0_u8; 24], Vec::new()] {
+            connection
+                .execute("UPDATE cameras SET params = ?1", [&malformed])
+                .unwrap();
+            assert!(validate_database_camera(&database, &camera).is_err());
+        }
+        connection
+            .execute("UPDATE cameras SET params = ?1", [vec![0_u8; 32]])
+            .unwrap();
         assert!(validate_database_camera(
             &database,
             &ColmapCamera {
@@ -5162,6 +8105,151 @@ mod tests {
 
         assert!(!paths.project.join("final.ply").exists());
         assert!(paths.brush.join("final.ply.tmp").is_file());
+    }
+
+    fn png_focal_checkpoint_fixture() -> crate::video::temporary_png_focal_workaround::Checkpoint {
+        crate::video::temporary_png_focal_workaround::Checkpoint {
+            version: 1,
+            image_name: "frame_000001.png".into(),
+            sha256: "fixture".into(),
+            width: 8192,
+            height: 5464,
+            camera_params: [22728.66, 4096.0, 2732.0, 0.0],
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_png_focal_cache_barrier_preserves_images_and_published_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temp.path().to_path_buf());
+        let manager = ProjectManager::for_diagnostics(temp.path().to_path_buf());
+        for dir in [
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+        ] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+            tokio::fs::write(dir.join("sentinel"), b"original")
+                .await
+                .unwrap();
+        }
+        for name in ["final.ply", "edit.ply", "editing.json"] {
+            tokio::fs::write(paths.project.join(name), b"published")
+                .await
+                .unwrap();
+        }
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.frames = Some(FrameState {
+            extracted_frames: Some(2),
+            ..FrameState::default()
+        });
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+        state.brush_complete = true;
+        let checkpoint = png_focal_checkpoint_fixture();
+        assert!(
+            apply_temporary_png_focal_checkpoint(&manager, &paths, &mut state, &checkpoint)
+                .await
+                .unwrap()
+        );
+        let saved = manager.read_state(&paths.state).await.unwrap();
+        assert!(
+            !saved.features_complete
+                && !saved.matching_complete
+                && !saved.reconstruction_complete
+                && !saved.brush_complete
+        );
+        assert_eq!(saved.temporary_png_focal.as_ref(), Some(&checkpoint));
+        assert_eq!(saved.frames.unwrap().extracted_frames, Some(2));
+        assert!(!paths.colmap.exists() && !paths.brush.exists());
+        for dir in [&paths.frames, &paths.colmap_frames, &paths.masks] {
+            assert_eq!(
+                tokio::fs::read(dir.join("sentinel")).await.unwrap(),
+                b"original"
+            );
+        }
+        for name in ["final.ply", "edit.ply", "editing.json"] {
+            assert_eq!(
+                tokio::fs::read(paths.project.join(name)).await.unwrap(),
+                b"published"
+            );
+        }
+        let mut archives = tokio::fs::read_dir(paths.work.join("cache-archive"))
+            .await
+            .unwrap();
+        let archive = archives.next_entry().await.unwrap().unwrap().path();
+        assert!(archives.next_entry().await.unwrap().is_none());
+        for dir in ["colmap", "brush"] {
+            assert_eq!(
+                tokio::fs::read(archive.join(dir).join("sentinel"))
+                    .await
+                    .unwrap(),
+                b"original"
+            );
+        }
+        // Identical policy/input/params is a true no-op, even with new cached features.
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"new correct database")
+            .await
+            .unwrap();
+        state.features_complete = true;
+        assert!(
+            !apply_temporary_png_focal_checkpoint(&manager, &paths, &mut state, &checkpoint)
+                .await
+                .unwrap()
+        );
+        assert!(state.features_complete && paths.colmap.join("database.db").exists());
+        let mut changed = checkpoint.clone();
+        changed.sha256 = "changed".into();
+        assert!(
+            apply_temporary_png_focal_checkpoint(&manager, &paths, &mut state, &changed)
+                .await
+                .unwrap()
+        );
+        assert!(!state.features_complete);
+    }
+
+    #[tokio::test]
+    async fn temporary_png_focal_archive_failure_keeps_a_durable_reuse_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temp.path().to_path_buf());
+        let manager = ProjectManager::for_diagnostics(temp.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"old wrong database")
+            .await
+            .unwrap();
+        // A file where the archive directory should be forces a safe failure.
+        tokio::fs::write(paths.work.join("cache-archive"), b"blocked")
+            .await
+            .unwrap();
+        let mut state = PipelineStateFile::created_for(Quality::High, ProjectInputType::Images);
+        state.features_complete = true;
+        state.brush_complete = true;
+        let checkpoint = png_focal_checkpoint_fixture();
+        assert!(
+            apply_temporary_png_focal_checkpoint(&manager, &paths, &mut state, &checkpoint)
+                .await
+                .is_err()
+        );
+        let mut saved = manager.read_state(&paths.state).await.unwrap();
+        assert!(
+            !saved.features_complete
+                && !saved.brush_complete
+                && saved.temporary_png_focal.is_none()
+        );
+        assert!(paths.colmap.join("database.db").exists());
+        tokio::fs::remove_file(paths.work.join("cache-archive"))
+            .await
+            .unwrap();
+        // Retrying after the interruption cannot certify the old database.
+        apply_temporary_png_focal_checkpoint(&manager, &paths, &mut saved, &checkpoint)
+            .await
+            .unwrap();
+        assert!(!paths.colmap.join("database.db").exists());
+        assert_eq!(saved.temporary_png_focal, Some(checkpoint));
     }
 
     #[tokio::test]
@@ -5570,9 +8658,237 @@ mod tests {
             Some((23, 533))
         );
         assert_eq!(
-            parse_bracket_progress("Processing image [4/10]"),
+            parse_bracket_progress("Processed image [4/10]"),
             Some((4, 10))
         );
+        assert_eq!(parse_bracket_progress("Processing image [4/10]"), None);
+        assert_eq!(parse_bracket_progress("Matching block [4/10]"), None);
+        assert_eq!(parse_bracket_progress("bundle iteration [4/10]"), None);
+    }
+
+    #[test]
+    fn matching_silence_notice_has_a_15_second_threshold_and_30_second_limit() {
+        let last = AtomicU64::new(0);
+        assert!(!matching_quiet_notice_due(&last, 14_999, 14_999));
+        assert!(matching_quiet_notice_due(&last, 15_000, 15_000));
+        assert!(!matching_quiet_notice_due(&last, 15_000, 15_000));
+        assert!(!matching_quiet_notice_due(&last, 44_999, 44_999));
+        assert!(matching_quiet_notice_due(&last, 45_000, 45_000));
+        assert!(!matching_quiet_notice_due(&last, 99_000, 100));
+        last.store(0, Ordering::Relaxed); // An actual output line or fresh process resets silence.
+        assert!(!matching_quiet_notice_due(&last, 100_000, 14_999));
+        assert!(matching_quiet_notice_due(&last, 100_001, 15_000));
+    }
+
+    #[test]
+    fn matching_notices_are_system_logs_without_progress_and_stop_on_exit_or_cancel() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let out = received.clone();
+        let runner = PipelineRunner::new(default_engine_paths(None), move |e| {
+            out.lock().unwrap().push(e)
+        });
+        let cancelled = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let out = cancelled.clone();
+        let cancelled_runner = PipelineRunner::new(default_engine_paths(None), move |e| {
+            out.lock().unwrap().push(e)
+        });
+        let observer = runner.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            Some(86),
+            ObserverMode::Matching,
+        );
+        let cancelled_observer = cancelled_runner.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            Some(86),
+            ObserverMode::Matching,
+        );
+        observer(ProcessUpdate::Started { process_id: 42 });
+        cancelled_observer(ProcessUpdate::Started { process_id: 43 });
+        let initial_progress = received.lock().unwrap().last().unwrap().progress;
+        // One real quiet window tests the production Instant-based clock, not a mocked age.
+        std::thread::sleep(std::time::Duration::from_millis(15_025));
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 15_025 });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 16_000 });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 45_025 });
+        let notices = || {
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.message.starts_with("图像匹配进程仍在运行"))
+                .count()
+        };
+        assert_eq!(notices(), 2);
+        {
+            let events = received.lock().unwrap();
+            for event in events
+                .iter()
+                .filter(|e| e.message.starts_with("图像匹配进程仍在运行"))
+            {
+                assert_eq!(event.kind, EventKind::Log);
+                assert_eq!(event.engine, Some(PipelineEngine::System));
+                assert_eq!(event.progress, initial_progress);
+                assert!(event.stage_progress.is_none());
+                assert!(event.current.is_none() && event.total.is_none());
+            }
+        }
+        observer(ProcessUpdate::Exited {
+            executable: PathBuf::from("colmap"),
+            exit_code: Some(0),
+        });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 75_025 });
+        assert_eq!(notices(), 2);
+        cancelled_runner.process_manager.cancel();
+        cancelled_observer(ProcessUpdate::Heartbeat { elapsed_ms: 15_025 });
+        assert!(!cancelled
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.message.starts_with("图像匹配进程仍在运行")));
+        observer(ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stdout,
+            line: "Indexing image [1/86]".into(),
+        });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 90_000 });
+        assert_eq!(notices(), 2);
+    }
+
+    #[test]
+    #[ignore = "Requires OOOSPLAT_MATCHING_LOG, an existing real COLMAP matching log"]
+    fn replay_real_matching_log_keeps_index_counts_and_unknown_stage_percentage() {
+        let path = std::env::var_os("OOOSPLAT_MATCHING_LOG").expect("Set a real COLMAP log");
+        let source = std::fs::read_to_string(path).unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let out = captured.clone();
+        let runner = PipelineRunner::new(default_engine_paths(None), move |event| {
+            out.lock().unwrap().push(event)
+        });
+        let observer = runner.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            None,
+            ObserverMode::Matching,
+        );
+        observer(ProcessUpdate::Started { process_id: 42 });
+        let mut expected_index_lines = 0;
+        for line in source.lines().filter(|line| {
+            parse_matching_progress(line).is_some() || matching_activity(line).is_some()
+        }) {
+            expected_index_lines += usize::from(line.contains("Indexing image ["));
+            observer(ProcessUpdate::Line {
+                stream: crate::process::ProcessStream::Stderr,
+                line: line.into(),
+            });
+        }
+        let captured = captured.lock().unwrap();
+        let indices: Vec<_> = captured
+            .iter()
+            .filter(|e| e.unit.as_deref() == Some("matchingIndexImages"))
+            .collect();
+        assert!(expected_index_lines > 0);
+        assert_eq!(indices.len(), expected_index_lines);
+        assert!(indices
+            .iter()
+            .all(|e| e.current.is_some() && e.stage_progress.is_none() && e.indeterminate));
+        println!(
+            "Real matching replay: {} indexing lines retained; last count {:?}/{:?}",
+            indices.len(),
+            indices.last().unwrap().current,
+            indices.last().unwrap().total
+        );
+        if let Some(path) = std::env::var_os("OOOSPLAT_MATCHING_EVENTS") {
+            std::fs::write(path, serde_json::to_vec(&*captured).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn panorama_process_context_is_stable_and_matching_counts_do_not_estimate_completion() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let output = captured.clone();
+        let runner = PipelineRunner::new(default_engine_paths(None), move |event| {
+            output.lock().unwrap().push(event)
+        });
+        runner.events.panorama_phase.store(1, Ordering::Relaxed);
+        let old = runner.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            Some(100),
+            ObserverMode::Mapper,
+        );
+        old(ProcessUpdate::Started { process_id: 42 });
+        old(ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stdout,
+            line: "Registering image #50 (num_reg_frames=40)".into(),
+        });
+        old(ProcessUpdate::Heartbeat { elapsed_ms: 1000 });
+        {
+            let events = captured.lock().unwrap();
+            assert!(events
+                .iter()
+                .all(|event| event.substage.as_deref() == Some("panoramaReconstruction")));
+            let progress = events
+                .iter()
+                .find(|event| event.kind == EventKind::Progress)
+                .unwrap();
+            assert!(progress.indeterminate && progress.stage_progress.is_none());
+            assert_eq!(progress.current, Some(40));
+        }
+        let retry = runner.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            Some(100),
+            ObserverMode::Mapper,
+        );
+        retry(ProcessUpdate::Started { process_id: 43 });
+        let count = captured.lock().unwrap().len();
+        old(ProcessUpdate::Heartbeat { elapsed_ms: 2000 });
+        assert_eq!(captured.lock().unwrap().len(), count);
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .operation
+                .as_ref()
+                .unwrap()
+                .attempt,
+            2
+        );
+        let matching = runner.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            Some(100),
+            ObserverMode::Matching,
+        );
+        matching(ProcessUpdate::Started { process_id: 44 });
+        for line in [
+            "Generating sequential image pairs...",
+            "Generating image pairs with vocabulary tree...",
+            "Processing image [86/86]",
+            "Processing image [1/9]",
+        ] {
+            matching(ProcessUpdate::Line {
+                stream: crate::process::ProcessStream::Stdout,
+                line: line.into(),
+            });
+        }
+        let events = captured.lock().unwrap();
+        let progress: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.stage == PipelineStage::Matching && event.kind == EventKind::Progress
+            })
+            .collect();
+        assert_eq!(progress.len(), 4);
+        assert!(progress
+            .iter()
+            .all(|event| event.stage_progress.is_none() && event.indeterminate));
+        assert_eq!(progress[0].unit.as_deref(), Some("matchingSequential"));
+        assert_eq!(progress[1].unit.as_deref(), Some("matchingLoop"));
+        assert_eq!(progress[3].current, Some(1));
     }
 
     #[test]
@@ -5629,7 +8945,7 @@ mod tests {
     }
 
     #[test]
-    fn mapper_registration_count_only_moves_forward() {
+    fn mapper_registration_uses_the_current_model_count_not_an_accumulated_maximum() {
         let counter = AtomicU64::new(0);
         parse_mapper_progress("num_reg_frames=86", &counter, Some(100)).unwrap();
         parse_mapper_progress("num_reg_frames=91", &counter, Some(100)).unwrap();
@@ -5641,7 +8957,8 @@ mod tests {
             Some(100),
         )
         .unwrap();
-        assert_eq!(value.0, 91);
+        assert_eq!(value.0, 89);
+        assert!(parse_mapper_progress("Registering image #5", &counter, Some(100)).is_none());
     }
 
     #[test]
@@ -5748,10 +9065,29 @@ mod tests {
     }
 
     #[test]
+    fn panorama_oom_retry_is_all_quality_but_still_once_and_optimization_only() {
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            let r =
+                resolve_panorama_training_preset(quality, true, Some(8192), 512, 10_192).unwrap();
+            let retry = brush_oom_fallback(quality, true, false, r, 10_192).unwrap();
+            assert_eq!(retry.preset.max_splats, r.preset.max_splats.map(|n| n / 2));
+            assert!(brush_oom_fallback(quality, true, true, retry, 10_192).is_none());
+            assert!(brush_oom_fallback(quality, false, false, r, 10_192).is_none());
+            let fixed =
+                resolve_panorama_training_preset(quality, false, Some(8192), 512, 10_192).unwrap();
+            assert!(brush_oom_fallback(quality, true, false, fixed, 10_192).is_none());
+        }
+    }
+
+    #[test]
     fn event_sequence_is_strictly_increasing() {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = events.clone();
         let sink = EventSink {
+            context: Default::default(),
+            bound_operation: None,
+            panorama_phase: Arc::new(AtomicU64::new(0)),
+            panorama_images: Arc::new(AtomicBool::new(false)),
             emit: Arc::new(move |event| captured.lock().unwrap().push(event.sequence)),
             sequence: Arc::new(AtomicU64::new(0)),
             last_progress_milli_percent: Arc::new(AtomicU64::new(0)),
@@ -5769,6 +9105,10 @@ mod tests {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = events.clone();
         let sink = EventSink {
+            panorama_phase: Arc::new(AtomicU64::new(0)),
+            panorama_images: Arc::new(AtomicBool::new(false)),
+            context: Default::default(),
+            bound_operation: None,
             emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
             sequence: Arc::new(AtomicU64::new(0)),
             last_progress_milli_percent: Arc::new(AtomicU64::new(0)),
@@ -5788,5 +9128,72 @@ mod tests {
             *sink.last_stage.lock().unwrap(),
             Some(PipelineStage::TrainingSplats)
         );
+    }
+
+    #[test]
+    fn panorama_preparation_and_training_use_distinct_progress_ranges() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let sink = EventSink {
+            context: Default::default(),
+            bound_operation: None,
+            panorama_phase: Arc::new(AtomicU64::new(2)),
+            panorama_images: Arc::new(AtomicBool::new(false)),
+            emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
+            sequence: Arc::new(AtomicU64::new(0)),
+            last_progress_milli_percent: Arc::new(AtomicU64::new(0)),
+            last_stage: Arc::new(std::sync::Mutex::new(None)),
+            dispatch: Arc::new(std::sync::Mutex::new(())),
+            started: Instant::now(),
+        };
+        sink.stage(PipelineStage::TrainingSplats, 0.5, "faces");
+        sink.panorama_phase.store(3, Ordering::Relaxed);
+        sink.stage(PipelineStage::TrainingSplats, 1.0, "validated");
+        sink.panorama_phase.store(1, Ordering::Relaxed);
+        sink.stage(PipelineStage::TrainingSplats, 0.0, "training");
+        sink.stage(PipelineStage::TrainingSplats, 0.5, "training");
+        sink.stage(
+            PipelineStage::TrainingSplats,
+            0.1,
+            "late or restarted progress",
+        );
+        sink.stage(
+            PipelineStage::TrainingSplats,
+            0.513123,
+            "fractional progress",
+        );
+        sink.send(
+            PipelineStage::TrainingSplats,
+            Some(PipelineEngine::Brush),
+            EventKind::Log,
+            EventLevel::Info,
+            None,
+            true,
+            "log without progress",
+            None,
+            None,
+            None,
+        );
+        sink.stage(PipelineStage::Exporting, 1.0, "published");
+        sink.stage(PipelineStage::Completed, 1.0, "completed");
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.progress)
+                .collect::<Vec<_>>(),
+            [63.0, 66.0, 66.0, 82.0, 82.0, 82.42, 82.42, 99.9, 100.0]
+        );
+        assert_eq!(
+            events[0].substage.as_deref(),
+            Some("panoramaTrainingPreparation")
+        );
+        assert_eq!(
+            events[1].substage.as_deref(),
+            Some("panoramaTrainingValidation")
+        );
+        assert_eq!(events[2].substage.as_deref(), Some("training"));
+        assert!((events[1].stage_progress.unwrap() - 600.0 / 38.0).abs() < 0.001);
+        assert_eq!(events[2].stage_progress, events[1].stage_progress);
     }
 }

@@ -21,6 +21,8 @@ export interface GroundGridGeometry {
   bounds: BoundingBox;
 }
 
+const GRID_HALF_STEPS = 10;
+
 export function niceGridStep(span: number) {
   const raw = Math.max(span, 0.0001) / 12;
   const exponent = Math.floor(Math.log10(raw));
@@ -33,7 +35,7 @@ export function niceGridStep(span: number) {
 export function buildGroundGrid(modelBounds: BoundingBox): GroundGridGeometry {
   const span = Math.max(modelBounds.halfExtents.x * 2, modelBounds.halfExtents.y * 2, modelBounds.halfExtents.z * 2, 0.0001);
   const step = niceGridStep(span);
-  const halfSize = step * 10;
+  const halfSize = step * GRID_HALF_STEPS;
   const positions: Vec3[] = [];
   const colors: Color[] = [];
   const minor = new Color(0.18, 0.21, 0.27);
@@ -47,7 +49,7 @@ export function buildGroundGrid(modelBounds: BoundingBox): GroundGridGeometry {
     colors.push(color, color);
   };
 
-  for (let index = -10; index <= 10; index += 1) {
+  for (let index = -GRID_HALF_STEPS; index <= GRID_HALF_STEPS; index += 1) {
     if (index === 0) continue;
     const offset = index * step;
     const color = index % 5 === 0 ? major : minor;

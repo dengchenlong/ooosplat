@@ -1,7 +1,10 @@
 import type { TranslationKey } from "../i18n";
+import type { FailureContext } from "./pipelineError";
+import { classifiedSummary } from "./failureGuidance";
 
 // Keep operational details in the tooltip, not in the task-card layout.
-export function errorSummaryKey(message: string): TranslationKey | null {
+export function errorSummaryKey(message: string, context?: FailureContext): TranslationKey | null {
+  if (context?.classificationVersion != null) return classifiedSummary(context);
   if (/early eof|failed to load dataset|i\/?o error while loading dataset|图片读取不完整/i.test(message)) return "error.summaryDataset";
   if (/device.?lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡.*连接中断/i.test(message)) return "error.summaryDevice";
   if (/out of memory|\boom\b|显存不足|显存.*不够/i.test(message)) return /brush|gpu|vram|显存/i.test(message) ? "error.summaryGraphicsMemory" : "error.summaryMemory";

@@ -1,11 +1,31 @@
 import type { TaskDraft } from "./taskWorkspace";
+import { resolvedProjection } from './generationPreflight';
 
 export type DraftDisplayStatus = "standby" | "preparing" | "queued" | "running";
 
 export function draftIsRunnable(draft: TaskDraft): boolean {
   if (draft.running || draft.inputChecking || draft.error || !draft.inputPath) return false;
+  if (!draftProjectionReady(draft)) return false;
   if (draft.kind === "generation") return Boolean(draft.plan);
   return Boolean(draft.sourceProjectId && draft.reshootSource?.eligible && draft.reshootPlan?.compatible);
+}
+
+export function draftProjectionReady(draft: TaskDraft): boolean {
+  if (draft.kind === 'reshoot' && !draft.projectionDetection) return true;
+  const projection = resolvedProjection(draft);
+  if (draft.kind === 'reshoot' && draft.reshootSource?.projection && projection !== 'auto' && projection !== draft.reshootSource.projection) return false;
+  if (projection === 'equirectangular') return !!draft.projectionDetection?.supportedErp;
+  return projection !== 'auto' || !draft.projectionDetection?.requiresChoice;
+}
+
+export function firstQueueInputIssue(drafts: TaskDraft[]): { draft: TaskDraft; reason: 'checking' | 'analysis' | 'projection' } | null {
+  for (const draft of drafts) {
+    if (draft.running || !draft.inputPath) continue;
+    if (draft.inputChecking || draft.needsValidation) return { draft, reason: 'checking' };
+    if (draft.inputError || draft.error || (draft.kind === 'reshoot' ? !draft.reshootPlan?.compatible : !draft.plan)) return { draft, reason: 'analysis' };
+    if (!draftProjectionReady(draft)) return { draft, reason: 'projection' };
+  }
+  return null;
 }
 
 export function queuedDraftIds(

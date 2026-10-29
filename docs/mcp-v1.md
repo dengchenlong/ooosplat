@@ -21,7 +21,7 @@ MCP v1 lets a **local** AI Agent operate the running OOOSplat desktop app. It us
 
 Client configuration formats vary. The transport is **Streamable HTTP**, with a single `/mcp` endpoint. Use a native client that can connect to local HTTP endpoints. This version does not include a stdio bridge or change any client configuration automatically.
 
-No connection token is generated, displayed, stored or verified. Restarting or re-enabling MCP does not require updating the client configuration if the port stays the same. Authorization headers left in older configurations are ignored. Connections without Origin are supported for native clients; an Origin, when present, must match this server's loopback origin. Host and Origin are checked on every request. While enabled, local clients have access to the same seven tools and shared tasks; there is no per-Agent identity or permission isolation. Input directory authorization and signed log cursors remain enforced.
+No connection token is generated, displayed, stored or verified. Restarting or re-enabling MCP does not require updating the client configuration if the port stays the same. Authorization headers left in older configurations are ignored. Connections without Origin are supported for native clients; an Origin, when present, must match this server's loopback origin. Host and Origin are checked on every request. While enabled, local clients have access to the same tools and shared tasks; there is no per-Agent identity or permission isolation. Input directory authorization and signed log cursors remain enforced.
 
 `get_app_status` includes `authorized_input_roots`, the effective local input scopes for the current listener. The default scope follows the projects root when MCP settings are saved or the service is re-enabled. Running tasks retain their submitted configuration. The whole projects root is not implicitly granted by the default Inputs scope.
 
@@ -43,7 +43,8 @@ All tools have input/output JSON Schemas and structured results. MCP fields use 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `get_app_status` | `{}` | App/engine versions, capabilities, active task, start availability and recommended polling interval |
-| `create_generation_task` | Required `input_path`, `quality`, `client_request_id` | Persisted task; generation has not started |
+| `inspect_reshoot_input` | Required `source_project_id`, authorized `input_path`, `quality` | Read-only source/input analysis, projection, identities, warm-start availability |
+| `create_generation_task` | Required `input_path`, `quality`, `client_request_id`; optional paired `source_project_id`, `reshoot_options` | Persisted task; generation has not started |
 | `start_task` | Required `task_id` | `accepted`, `task_id`, `run_id`, status and revision |
 | `list_tasks` | Optional `cursor`, `limit` (default 50, maximum 100) | Tasks, `next_cursor`, `has_more` |
 | `get_task_status` | Required `task_id` | State, stage, progress, frozen/actual configuration, time, errors, run identities and local artifacts |
@@ -62,7 +63,7 @@ created → starting → running → completed / failed
                  cancelling → cancelled
 ```
 
-After an app restart, leftover active states become `interrupted`. No job is automatically restarted. Existing GUI resume creates a fresh run of the same task using its saved configuration and existing checkpoints. The seven MCP tools do not implicitly resume failed, cancelled, interrupted or completed tasks.
+After an app restart, leftover active states become `interrupted`. No job is automatically restarted. Existing GUI resume creates a fresh run of the same task using its saved configuration and existing checkpoints. MCP tools do not implicitly resume failed, cancelled, interrupted or completed tasks. New reshoots require explicit model-condition and fallback decisions; see [Reshoot v2](RESHOOT_V2.md). The nested `reshoot_options` uses the application's camelCase field names; outer MCP fields remain snake_case.
 
 `progress` is an observed stage percentage when actual counters are available; `estimated_progress` is the existing overall stage estimate. These are different measurements. `runtime` contains the latest existing engine runtime snapshot when available. ETA is an estimate based on observed training rate and becomes null when unavailable. `actual_configuration` contains resolved frame/resolution/Brush settings as the Runner saves checkpoints, without transferring large frame lists.
 
@@ -125,7 +126,7 @@ node node_modules/vitest/vitest.mjs run
 node node_modules/typescript/bin/tsc -b
 ```
 
-The official rmcp client integration test starts the real token-free HTTP transport, discovers and calls all seven tools, disconnects/reconnects and checks Host/Origin, path and cursor rejection paths, including compatibility with obsolete Authorization headers. Lifecycle tests use a deliberately controlled executor where noted; the early-engine-failure test uses the actual Runner. Existing Windows process tests exercise real descendant termination. These tests do **not** demonstrate GPU training or a complete COLMAP/Brush/PLY generation. GPU end-to-end generation and macOS/Linux runtime behavior require separate platform runs.
+The official rmcp client integration test starts the real token-free HTTP transport, discovers tools, calls the original generation tools, disconnects/reconnects and checks Host/Origin, path and cursor rejection paths, including compatibility with obsolete Authorization headers. The reshoot inspection tool is schema-checked separately, not a demonstrated MCP-to-GPU end-to-end run. Lifecycle tests use a deliberately controlled executor where noted; the early-engine-failure test uses the actual Runner. Existing Windows process tests exercise real descendant termination. These tests do **not** demonstrate GPU training or a complete COLMAP/Brush/PLY generation. GPU end-to-end generation and macOS/Linux runtime behavior require separate platform runs.
 
 ## 本次交付与验证记录
 

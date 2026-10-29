@@ -472,6 +472,19 @@ mod tests {
     }
 
     #[test]
+    fn virtual_bridge_candidates_are_not_estimated_as_extracted_images() {
+        let video = video();
+        let mut plan = FramePlan {
+            estimated_frames: 100,
+            rescue_max_frames: 120,
+            ..Default::default()
+        };
+        let before = estimate_runtime(&video, &plan, Quality::High, &[]);
+        plan.bridge_source_frames = Some(1_000_000_000);
+        assert_eq!(estimate_runtime(&video, &plan, Quality::High, &[]), before);
+    }
+
+    #[test]
     fn quality_and_frame_count_increase_the_estimate() {
         let fast =
             base_estimate_ms_with_brush(48, Quality::Fast, RuntimeInputKind::Video, 3_840, None);

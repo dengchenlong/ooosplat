@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SplatError {
+    #[error("{source}\n{detail}")]
+    Diagnostic {
+        source: Box<SplatError>,
+        detail: String,
+    },
     #[error("找不到本地处理引擎：{0}")]
     EngineMissing(String),
     #[error("本地处理引擎无法启动：{engine}（{detail}）")]
@@ -14,6 +19,8 @@ pub enum SplatError {
     Cancelled,
     #[error("外部进程执行失败：{0}")]
     Process(String),
+    #[error("{0}")]
+    EngineProcess(Box<crate::failure::EngineProcessFailure>),
     #[error("Brush 显存不足：{0}")]
     BrushOutOfMemory(String),
     #[error("Splat 训练期间显卡设备连接中断。请接通电源、关闭占用显卡的软件，并在 Windows 图形设置中将 brush_app.exe 设为高性能后重试。\n{0}")]
@@ -27,6 +34,24 @@ pub enum SplatError {
 }
 
 pub type Result<T> = std::result::Result<T, SplatError>;
+
+impl SplatError {
+    pub fn with_previous_attempt(self, previous: SplatError) -> Self {
+        match (self, previous) {
+            (Self::EngineProcess(mut current), Self::EngineProcess(previous)) => {
+                current.previous_attempts.push(*previous);
+                Self::EngineProcess(current)
+            }
+            (current, _) => current,
+        }
+    }
+
+    pub fn is_brush_oom(&self) -> bool {
+        matches!(self, Self::BrushOutOfMemory(_))
+            || matches!(self, Self::EngineProcess(failure)
+                if failure.classification.kind == Some("brush_out_of_memory"))
+    }
+}
 
 impl serde::Serialize for SplatError {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>

@@ -1,6 +1,6 @@
 [package]
 name = "ooo-splat"
-version = "0.6.0"
+version = "0.7.1"
 description = "Local video-to-Gaussian-Splatting pipeline for Windows, Apple Silicon macOS Alpha, and Ubuntu 24.04 Alpha"
 authors = ["ooolabdev"]
 license = "Apache-2.0"
@@ -39,13 +39,19 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+kamadak-exif = "=0.6.1"
+quick-xml = "=0.41.0"
+flate2 = "=1.1.9"
+crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+semver = "1"
+rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "=2.3.2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 thiserror = "2"

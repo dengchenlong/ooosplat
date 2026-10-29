@@ -176,7 +176,7 @@ describe("App live log", () => {
       current: null,
       total: null,
     }));
-    expect(container.querySelector(".stage-timeline li.active small")).toBeNull();
+    expect(container.querySelector(".stage-timeline li.active small")?.textContent).toBe('处理中');
   });
 
   it("shows the live training estimate below the process message without enabling the runtime panel", async () => {
@@ -213,8 +213,8 @@ describe("App live log", () => {
     expect(qualityList).not.toBeNull();
     expect(plannerSwitch?.getAttribute("aria-checked")).toBe("true");
     expect(plannerSwitch?.disabled).toBe(true);
-    expect(plannerSwitch?.textContent).toContain("自动优化（实验性）");
-    expect(plannerSwitch?.textContent).toContain("开启后，将优化重建与训练参数并自动补救，通常可缩短生成时长，提升（尤其是图片素材）细节表现");
+    expect(plannerSwitch?.textContent).toContain("自动重试");
+    expect(plannerSwitch?.textContent).toContain("若任务失败，允许自动依据当前设备性能，降低画质或改用更耗时的方案。");
   });
 
   it("keeps the outer task pane fixed while following fewer than 500 log lines", async () => {
@@ -264,7 +264,7 @@ describe("App live log", () => {
   it("shows plain-language progress with counts for the four processing stages", async () => {
     const cases = [
       ["extractingFeatures", "正在分析画面（8/20）"],
-      ["matching", "正在寻找画面之间的联系（9/20）"],
+      ["matching", "正在匹配图像：当前批次 9/20（非阶段完成进度）"],
       ["reconstructing", "正在还原拍摄场景（10/20）。此步骤可能耗时较长，请耐心等待"],
       ["trainingSplats", "正在生成高斯泼溅（11/20）。此步骤可能耗时较长，请耐心等待"],
     ] as const;
@@ -275,6 +275,7 @@ describe("App live log", () => {
           ...event(index + 1),
           stage,
           message: `technical detail for ${stage}`,
+          unit: stage === "matching" ? "matchingBatches" : "steps",
           current: index + 8,
           total: 20,
         });
@@ -298,7 +299,7 @@ describe("App live log", () => {
   it("keeps the latest count when a later technical log has no count", async () => {
     await act(async () => {
       useAppStore.getState().receiveEvent({
-        ...event(1), stage: "matching", message: "Matching pair batch", current: 12, total: 40,
+        ...event(1), stage: "matching", message: "Matching pair batch", current: 12, total: 40, unit: "matchingBatches",
       });
       useAppStore.getState().receiveEvent({
         ...event(2), stage: "matching", kind: "log", message: "Technical matcher detail", current: null, total: null,
@@ -306,7 +307,7 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在寻找画面之间的联系（12/40）");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在匹配图像：当前批次 12/40（非阶段完成进度）");
     expect(container.querySelector(".live-log")?.textContent).toContain("Technical matcher detail");
   });
 
@@ -324,6 +325,7 @@ describe("App live log", () => {
 
   it("does not invent a Splat training step from stage progress", async () => {
     await act(async () => {
+      useAppStore.getState().receiveEvent({ ...event(0), kind: "stage", current: null, total: null });
       useAppStore.getState().receiveEvent({
         ...event(1), stage: "trainingSplats", kind: "heartbeat", message: "Brush estimate", current: null, total: 30_000, stageProgress: 50,
       });

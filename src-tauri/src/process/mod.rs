@@ -232,8 +232,75 @@ pub struct ProcessSpec {
 pub struct ProcessOutput {
     pub success: bool,
     pub exit_code: Option<i32>,
+    pub termination: ProcessTermination,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Status of this invocation, never inferred from an earlier appended log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessTermination {
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_dumped: Option<bool>,
+}
+
+impl ProcessTermination {
+    fn from_status(status: std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Self {
+                exit_code: status.code(),
+                signal: status.signal(),
+                core_dumped: status.signal().map(|_| status.core_dumped()),
+                ..Self::default()
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            exit_code: status.code(),
+            windows_status: status.code().map(|code| format!("0x{:08X}", code as u32)),
+            ..Self::default()
+        }
+    }
+
+    pub fn abnormal(&self) -> bool {
+        self.signal.is_some()
+            || matches!(
+                self.windows_status.as_deref(),
+                // Known native exceptions; arbitrary nonzero/negative application
+                // exit codes are not proof of a crash or of its underlying cause.
+                Some(
+                    "0xC0000005"
+                        | "0xC000001D"
+                        | "0xC0000094"
+                        | "0xC0000096"
+                        | "0xC00000FD"
+                        | "0xC0000374"
+                        | "0xC0000409"
+                        | "0x80000003"
+                )
+            )
+    }
+}
+
+impl std::fmt::Display for ProcessTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit_code: {:?}", self.exit_code)?;
+        if let Some(status) = &self.windows_status {
+            write!(f, " ({status})")?;
+        }
+        if let Some(signal) = self.signal {
+            write!(f, "; signal: {signal}; core_dumped: {:?}", self.core_dumped)?;
+        }
+        Ok(())
+    }
 }
 
 impl ProcessOutput {
@@ -254,6 +321,7 @@ impl ProcessOutput {
 
 #[derive(Clone, Default)]
 pub struct ProcessManager {
+    output_capture_limit: Option<usize>,
     lifecycle: Option<ProcessObserver>,
     cancellation: CancellationToken,
 }
@@ -261,6 +329,7 @@ pub struct ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
+            output_capture_limit: None,
             cancellation: CancellationToken::new(),
             lifecycle: None,
         }
@@ -268,6 +337,13 @@ impl ProcessManager {
 
     pub fn with_lifecycle(mut self, observer: ProcessObserver) -> Self {
         self.lifecycle = Some(observer);
+        self
+    }
+
+    /// Streaming probes consume every observer event but retain only a bounded
+    /// diagnostic tail. Ordinary engine callers retain their existing behavior.
+    pub(crate) fn with_output_capture_limit(mut self, limit: usize) -> Self {
+        self.output_capture_limit = Some(limit);
         self
     }
 
@@ -291,6 +367,9 @@ impl ProcessManager {
         spec: ProcessSpec,
         environment: &[(OsString, OsString)],
     ) -> Result<ProcessOutput> {
+        if self.cancellation.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
         if !spec.executable.is_file() {
             return Err(SplatError::EngineMissing(
                 spec.executable.display().to_string(),
@@ -397,12 +476,14 @@ impl ProcessManager {
             ProcessStream::Stdout,
             spec.observer.clone(),
             log_file.clone(),
+            self.output_capture_limit,
         ));
         let stderr_task = tokio::spawn(pump_stream(
             child.stderr.take().expect("stderr is piped"),
             ProcessStream::Stderr,
             spec.observer.clone(),
             log_file.clone(),
+            self.output_capture_limit,
         ));
         let finished = Arc::new(AtomicBool::new(false));
         let resource_task = spec
@@ -480,6 +561,11 @@ impl ProcessManager {
         let stderr = stderr_task
             .await
             .map_err(|error| SplatError::Process(error.to_string()))??;
+        // A requested cancellation may race with wait() becoming ready. Do not
+        // turn our own process termination into a crash/failure diagnostic.
+        if self.cancellation.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
         if let Some(observer) = &self.lifecycle {
             observer(ProcessUpdate::Exited {
                 executable: spec.executable.clone(),
@@ -489,6 +575,7 @@ impl ProcessManager {
         let output = ProcessOutput {
             success: status.success(),
             exit_code: status.code(),
+            termination: ProcessTermination::from_status(status),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         };
@@ -498,8 +585,8 @@ impl ProcessManager {
                 .await
                 .write_all(
                     format!(
-                        "exit_code: {:?}\nelapsed_ms: {}\n\n",
-                        output.exit_code,
+                        "{}\nelapsed_ms: {}\n\n",
+                        output.termination,
                         started.elapsed().as_millis()
                     )
                     .as_bytes(),
@@ -516,9 +603,10 @@ async fn pump_stream<R: AsyncRead + Unpin>(
     stream: ProcessStream,
     observer: Option<ProcessObserver>,
     log: Option<Arc<Mutex<tokio::fs::File>>>,
+    capture_limit: Option<usize>,
 ) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::new(reader);
-    let mut collected = Vec::new();
+    let mut collected = std::collections::VecDeque::new();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -526,7 +614,11 @@ async fn pump_stream<R: AsyncRead + Unpin>(
         if read == 0 {
             break;
         }
-        collected.extend_from_slice(&line);
+        collected.extend(line.iter().copied());
+        if let Some(limit) = capture_limit {
+            let discard = collected.len().saturating_sub(limit);
+            collected.drain(..discard);
+        }
         if let Some(file) = &log {
             file.lock().await.write_all(&line).await?;
         }
@@ -537,7 +629,7 @@ async fn pump_stream<R: AsyncRead + Unpin>(
             });
         }
     }
-    Ok(collected)
+    Ok(collected.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -545,11 +637,96 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn isolated_windows_exit_status_preserves_signed_and_hex_codes() {
+        // Controlled helper exits, not a reproduction of COLMAP heap corruption.
+        for (code, status, abnormal) in [
+            (1, "0x00000001", false),
+            (101, "0x00000065", false),
+            (-1073740940, "0xC0000374", true),
+        ] {
+            let output = ProcessManager::new()
+                .run(ProcessSpec {
+                    executable: system_executable("cmd.exe"),
+                    args: vec!["/D".into(), "/C".into(), format!("exit /B {code}").into()],
+                    working_directory: None,
+                    log_path: None,
+                    observer: None,
+                })
+                .await
+                .unwrap();
+            assert!(!output.success);
+            assert_eq!(output.exit_code, Some(code));
+            assert_eq!(output.termination.exit_code, Some(code));
+            assert_eq!(output.termination.windows_status.as_deref(), Some(status));
+            assert_eq!(output.termination.abnormal(), abnormal);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_signal_exit_retains_signal_without_inventing_oom() {
+        let output = ProcessManager::new()
+            .run(ProcessSpec {
+                executable: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), "kill -TERM $$".into()],
+                working_directory: None,
+                log_path: None,
+                observer: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.termination.exit_code, None);
+        assert_eq!(output.termination.signal, Some(libc::SIGTERM));
+        assert_eq!(output.termination.core_dumped, Some(false));
+        assert!(output.termination.abnormal());
+    }
+
+    #[tokio::test]
+    async fn known_cancellation_does_not_launch_or_report_a_failure() {
+        let manager = ProcessManager::new();
+        manager.cancel();
+        assert!(matches!(
+            manager
+                .run(ProcessSpec {
+                    executable: PathBuf::from("must-not-be-launched"),
+                    args: vec![],
+                    working_directory: None,
+                    log_path: None,
+                    observer: None,
+                })
+                .await,
+            Err(SplatError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_capture_preserves_all_observer_lines() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = lines.clone();
+        let output = pump_stream(
+            &b"frame=0\nframe=1\nframe=2\n"[..],
+            ProcessStream::Stdout,
+            Some(Arc::new(move |update| {
+                if let ProcessUpdate::Line { line, .. } = update {
+                    seen.lock().unwrap().push(line);
+                }
+            })),
+            None,
+            Some(8),
+        )
+        .await;
+        assert_eq!(output.unwrap(), b"frame=2\n");
+        assert_eq!(lines.lock().unwrap().len(), 3);
+    }
+
     #[test]
     fn failure_detail_prefers_stderr_and_keeps_only_a_bounded_tail() {
         let output = ProcessOutput {
             success: false,
             exit_code: Some(1),
+            termination: ProcessTermination::default(),
             stdout: "less useful stdout".into(),
             stderr: format!("{}early eof", "x".repeat(5_000)),
         };
@@ -707,12 +884,14 @@ mod tests {
             ProcessStream::Stdout,
             Some(observer.clone()),
             Some(log.clone()),
+            None,
         ));
         let stderr_task = tokio::spawn(pump_stream(
             stderr_reader,
             ProcessStream::Stderr,
             Some(observer),
             Some(log.clone()),
+            None,
         ));
         stdout_writer
             .write_all(b"frame=1\nframe=2\n")

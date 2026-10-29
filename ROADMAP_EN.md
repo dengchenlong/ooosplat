@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Main development version: **0.6.0**. Latest published release: **0.5.0**. The current 0.6.0 work adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, corrected transparent-input handling, and further Auto Optimize, training densification, and preview stability improvements.
+Current `main` version identifier: **0.7.1**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
 
 ## Product Principles
 
@@ -19,28 +19,32 @@ Main development version: **0.6.0**. Latest published release: **0.5.0**. The cu
 - **P2 · Capability expansion**: New output formats, project import, and AI integrations.
 - **P3 · Longer-term exploration**: Adoption and additional capture or usage scenarios.
 
-## Planned Work
+## Planned Work and Validation
 
 | Priority | Item | Goal | GitHub Issue |
 | --- | --- | --- | --- |
 | P0 | Very large PLY preview stability and performance | Eliminate memory peaks and WebView2 OOM crashes when loading PLY files larger than 1 GB, and improve large-scale Gaussian loading, editing, and cleanup. | [#21](https://github.com/ooolabdev/ooosplat/issues/21) |
 | P0 | Performance optimization | Reduce time spent on media preparation, feature extraction, matching, reconstruction, and training while preserving result compatibility. | To be created |
 | P0 | Generation quality optimization | Improve camera registration, geometric completeness, visual detail, and edge quality with measurable optimization strategies. | To be created |
-| P0 | Better error guidance | Turn engine, media, disk, GPU, and reconstruction failures into clear actions and recovery guidance. | To be created |
+| P0 | Error guidance and fault validation | Extend native-fault and platform coverage beyond the implemented OOM, resource-limit, file-read, and crash classifications. Better classification does not fix the underlying hardware or engine fault. | To be created |
 | P0 | UI simplification | Reduce unnecessary information and interaction layers while unifying generation, history, preview, and editing workflows. | To be created |
 | P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. | To be created |
 | P1 | Telemetry data collection and learning | Active-user, Pipeline performance, and Failure distribution metrics already exist. Improve data quality, long-term samples, dashboards, and release comparisons. | To be created |
-| P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
-| P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |
+| P1 | Capture guidance improvements | Extend existing capture advice and image-order confirmation with examples of orbit paths, speed, overlap, and lighting. | To be created |
+| P1 | Panorama platform and large-scene acceptance | Check source diversity, long inputs, seams, directional coverage, and native-resolution training. Detailed now budgets 40× spherical sparse points without a fixed 10M cap; achieved counts, quality, and resource requirements still need measurement. | [Verification record](docs/PANORAMA_IMAGES_V1.md) |
+| P1 | Image GPS platform and dataset acceptance | Extend native validation beyond Windows x64 and add real panorama/reshoot GPS comparisons. Unverified paths do not enable georeferencing; survey-grade accuracy is not promised. | [Scope and validation](docs/IMAGE_GPS.md) |
+| P1 | Reshoot v2 cross-device and desktop acceptance | The native Ballintoy core flow passed. Real cross-device/lens inputs, repeated batches, and platform-specific desktop interactions still need acceptance; synthetic resizing does not substitute for captured data. | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) · [Validation notes](docs/RESHOOT_V2.md) |
+| P2 | AI masking and fine image matting Beta | Validate native person-exclusion and subject-Alpha inference, corrections, model distribution, and COLMAP/Brush semantics before enabling verified platforms. Not available on current main. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
-| P2 | Create projects and import PLY from “02 History” | Import an existing PLY directly as an OOOSplat project for preview and editing without running the generation pipeline. | To be created |
-| P3 | Panoramic video support | Explore a workflow for using panoramic video as input and producing usable Gaussian Splatting results. | To be created |
+| P3 | Panorama input expansion | Explore additional projections; dual-fisheye, stereo, VR180, cropped panoramas, and private originals remain unsupported. | To be created |
 
 ## Completed
 
+“Implemented · main” means integrated into the main source tree, not necessarily released or accepted on all platforms. See linked records for real-media, hardware, and platform limitations.
+
 | Status | Item | Delivery | GitHub Issue / PR |
 | --- | --- | --- | --- |
-| Completed | Ubuntu 24.04 Alpha | Provides an x86_64 `.deb` desktop package and CLI using system FFmpeg/FFprobe/CPU COLMAP and a pinned Brush runtime bundled with the package. | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
+| Completed | Ubuntu 24.04 Alpha | Provides an x86_64 `.deb` desktop package and CLI using system FFmpeg/FFprobe and bundled pinned COLMAP/Brush runtimes. COLMAP uses CUDA or CPU as supported. | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
 | Completed | Apple Silicon macOS Alpha | Provides an application-bundled FFmpeg, FFprobe, CPU COLMAP, and Brush workflow for macOS 15+ arm64. | [#4](https://github.com/ooolabdev/ooosplat/issues/4) / [PR #8](https://github.com/ooolabdev/ooosplat/pull/8) |
 | Completed | Embedded Gaussian preview and animation export | Supports `.ply` loading, camera navigation, whole-model transforms, animation preview, and Gaussian and portrait-video export. | [#3](https://github.com/ooolabdev/ooosplat/issues/3) |
 | Completed | Automatic COLMAP CUDA acceleration | Detects NVIDIA drivers and Compute Capability, enables GPU feature extraction and matching when supported, and otherwise falls back to CPU. | [#6](https://github.com/ooolabdev/ooosplat/issues/6) |
@@ -57,6 +61,23 @@ Main development version: **0.6.0**. Latest published release: **0.5.0**. The cu
 | Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
 | Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
 | Completed · 0.6.0 | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented in the 0.6.0 main development version |
+| Completed · 0.6.1 | Update notifications | Checks platform-compatible releases, shows dates and notes, supports copying download links and revisiting updates in Settings; installation remains manual. | [Feature notes](docs/update-notifications.md) |
+| Completed · 0.6.1 | Scene gizmos and edit saving | Adds translation axes, center-pivot rotation rings, inversion shortcuts, and saved views; separates edit saving from model export and improves preview sorting. | Implemented in 0.6.1 |
+| Implemented · main | External Gaussian and COLMAP project import | Imports standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from Completed; detects COLMAP, keeps external data read-only, and enables eligible reshoots. | Implemented on main |
+| Implemented · main | Multi-format model, landscape-video, and HTML export | Select PLY, compressed PLY, SPZ v4, or bundled SOG directly without an intermediate PLY; supports portrait/landscape video, offline HTML, cancellation, and safe publication. | [Export verification](docs/model-export-verification.md) |
+| Implemented · main | Panorama video and image input | Reconstructs standard full ERP spherically, then generates six-face training caches for registered images. Panorama-specific recipes and budgets retain source media, time/source mappings, and stage reuse. | [Video notes](docs/PANORAMA_VIDEO_V1.md) / [Image notes](docs/PANORAMA_IMAGES_V1.md) |
+| Implemented · main | Fast input detection and image-order confirmation | Lightweight ordinary/panorama detection is reused across quality changes. More than 100 images require order confirmation; sequential/exhaustive choices persist for resume, and the queue waits for answers. | Implemented on main |
+| Implemented · main | Preview navigation and camera fixes | Horizontal WASD has a device-local 0.1×–5.0× speed control and safe focus restoration after edits. Retains first-training-view locating and fixes zoom/pan scaling, orthographic clipping, and orbit roll. | [Navigation and verification](docs/PREVIEW_NAVIGATION.md) / [Controls validation](docs/PREVIEW_CONTROLS_VALIDATION.md) |
+| Implemented · main | On-demand preview rendering | Static views stop redrawing; interaction and animation run at up to 60 FPS. Resolution, detail, sorting updates, and 30 FPS video output are retained; no fixed GPU-usage reduction is promised. | [Preview validation](docs/PREVIEW_NAVIGATION.md) |
+| Implemented · main | Multi-pass progress and runtime monitoring | Isolates operations and late events, retains monitor state, separates registration counts, face preparation, and actual training iterations, and reports matching activity and silent periods. | Implemented on main |
+| Implemented · main | Temporary PNG/XMP focal workaround | Correctly parses rational XMP values and overrides initialization only for eligible ordinary PNGs with the confirmed affected runtime. Image bytes stay unchanged; incompatible caches are invalidated. | [#73](https://github.com/ooolabdev/ooosplat/issues/73) / [Scope and removal](docs/temporary-png-focal-workaround.md) |
+| Implemented · main | Generation defaults, automatic retries, and stepped sampling | Previous optimizations are standard; actual transparency controls two-view triangulation, and video uses preset FPS defaults or stepped ratios. Authorized GPU OOM retries once at 80% of trustworthy counts; reshoot fallbacks share the switch. Resume preserves saved settings. | [Generation policy](docs/GENERATION_POLICY.md) |
+| Implemented · main | Detailed source resolution and splat budgets | Removes VRAM tiers. Ordinary Detailed budgets use effective pixels and reconstruction tracks with coefficient 0.5; panoramas retain 40× spherical sparse points. Initialization points are not silently removed; filling the cap or improving PSNR is not guaranteed. | [Budget and validation](docs/FINE_SPLAT_BUDGET.md) |
+| Implemented · main | Reshoot v2 workflow | Supports multiple cameras, mixed-size ordinary inputs, and multi-batch ERP. Answers select reconstruction and initialization; old PLY initialization uses the normal full recipe. Derived results leave the source read-only, with preparation logs, published counts, and terminal-monitor cleanup. | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) / [Usage and validation](docs/RESHOOT_V2.md) |
+| Implemented · main | Image GPS assistance and georeferencing | Reads EXIF/XMP location metadata without pixel decoding; the validated Windows x64 path adds neighbor matching and soft position priors. Reliable inputs provide estimated north and metric scale, otherwise the original workflow is used. Coordinates remain local. | [Scope and validation](docs/IMAGE_GPS.md) |
+| Implemented · main | Engine health and failure diagnostics | Improves FFprobe preflight and hover health details; distinguishes Brush OOM, resource limits, read errors, and abnormal COLMAP termination. Retains attempt and exit information without blaming source media for an unexplained crash. | [#71](https://github.com/ooolabdev/ooosplat/issues/71) / [#72](https://github.com/ooolabdev/ooosplat/issues/72) |
+| Implemented · main | Telemetry completeness and actual GPU | Covers reshoot v2, known pre-failure data, last stages, and initial/final training configuration. Freezes actual Brush devices per attempt; consented diagnostics use the existing protocol without new database fields. | [Validation record](docs/TELEMETRY_COMPLETENESS_VALIDATION.md) |
+| Implemented · main | Export and cache gate removal | Removes estimated-memory export gates and the fixed 20 GiB panorama-cache cap. With confirmation, out-of-range SPZ exports center/uniformly scale only the export copy. Format checks and source protection remain; actual RAM and disk limits still apply. | [Export and verification](docs/model-export-verification.md) |
 
 ## Tracking and Contributions
 

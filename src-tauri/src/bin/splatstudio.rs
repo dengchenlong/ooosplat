@@ -2,15 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ooo_splat::{
-    engines::{ffmpeg::extract_uniform_frames, ffprobe::probe_video},
+    engines::{ffmpeg::extract_selected_frames, ffprobe::probe_video},
     error::{Result, SplatError},
     pipeline::runner::{default_engine_paths, PipelineRunner},
     presets::Quality,
     process::ProcessManager,
-    video::{
-        analyze_image_sequence, create_image_plan, prepare_image_sequence, FrameSelectionStrategy,
-        UniformRatioFrameSelection,
-    },
+    video::{analyze_image_sequence, create_image_plan, prepare_image_sequence},
 };
 
 #[derive(Debug, Parser)]
@@ -23,6 +20,25 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, clap::Args)]
+struct PolicyArgs {
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    auto_retry: bool,
+    /// Fraction of source frames for the first extraction (0.001..=1).
+    #[arg(long)]
+    frame_sampling_ratio: Option<f64>,
+}
+impl PolicyArgs {
+    fn policy(&self) -> Result<ooo_splat::pipeline::generation_policy::GenerationPolicy> {
+        ooo_splat::pipeline::generation_policy::GenerationPolicy {
+            auto_retry_enabled: self.auto_retry,
+            frame_sampling_ratio: self.frame_sampling_ratio,
+            ..Default::default()
+        }
+        .validate()
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Validate FFmpeg, FFprobe, CPU COLMAP and Brush.
@@ -31,12 +47,16 @@ enum Commands {
     Probe { input: PathBuf },
     /// Show the video frame plan or image-sequence plan.
     Plan {
+        #[command(flatten)]
+        policy: PolicyArgs,
         input: PathBuf,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
     },
     /// Prepare video frames or an image sequence and optional COLMAP masks.
     Extract {
+        #[command(flatten)]
+        policy: PolicyArgs,
         input: PathBuf,
         output: PathBuf,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
@@ -44,12 +64,16 @@ enum Commands {
     },
     /// Run the end-to-end pipeline after all fixed engine CLIs are verified.
     Generate {
+        #[command(flatten)]
+        policy: PolicyArgs,
         input: PathBuf,
         /// Override the remembered projects root (useful for diagnostics).
         #[arg(long)]
         projects_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
+        #[arg(long, value_enum, default_value_t = ooo_splat::video::panorama::VideoProjection::Auto)]
+        video_projection: ooo_splat::video::panorama::VideoProjection,
     },
 }
 
@@ -86,21 +110,28 @@ async fn execute(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&video)?);
             }
         }
-        Commands::Plan { input, quality } => {
+        Commands::Plan {
+            input,
+            quality,
+            policy,
+        } => {
+            let policy = policy.policy()?;
             let plan = if input.is_dir() {
                 create_image_plan(&analyze_image_sequence(&input)?, &quality.preset())
             } else {
                 let video =
                     probe_video(&engines.ffprobe, &input, None, &ProcessManager::new()).await?;
-                UniformRatioFrameSelection.create_plan(&video, &quality.preset())
+                policy.frame_plan(&video, quality)
             };
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
         Commands::Extract {
+            policy,
             input,
             output,
             quality,
         } => {
+            let policy = policy.policy()?;
             let masks = output
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
@@ -123,16 +154,22 @@ async fn execute(cli: Cli) -> Result<()> {
             ensure_engine(&engines.ffprobe)?;
             ensure_engine(&engines.ffmpeg)?;
             let video = probe_video(&engines.ffprobe, &input, None, &ProcessManager::new()).await?;
-            let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
-            let extraction = extract_uniform_frames(
+            let plan = policy.frame_plan(&video, quality);
+            let (w, h) = if video.rotation.rem_euclid(180) == 90 {
+                (video.height, video.width)
+            } else {
+                (video.width, video.height)
+            };
+            let resolution = policy.resolution(quality, None, w, h, true);
+            let extraction = extract_selected_frames(
                 &engines.ffmpeg,
                 &input,
                 &output,
                 &colmap_frames,
                 &masks,
-                &plan,
+                &plan.selected_frames,
                 video.has_alpha,
-                None,
+                Some((resolution.working_width, resolution.working_height)),
                 None,
                 &ProcessManager::new(),
                 None,
@@ -155,16 +192,20 @@ async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Commands::Generate {
+            policy,
             input,
             projects_root,
             quality,
+            video_projection,
         } => {
             let runner = PipelineRunner::new(engines, |event| {
                 eprintln!(
                     "{:>6.2}% {:?}: {}",
                     event.progress, event.stage, event.message
                 );
-            });
+            })
+            .with_video_projection(video_projection)
+            .with_generation_policy(Some(policy.policy()?));
             let result = match projects_root {
                 Some(root) => {
                     runner

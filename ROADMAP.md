@@ -4,7 +4,7 @@
 
 本路线图用于说明 OOOSplat 的产品方向和实施优先级。P0–P3 表示相对优先顺序，不代表版本号，也不承诺具体发布日期。
 
-main 开发版本：**0.6.0**；最新正式发布版本：**0.5.0**。0.6.0 当前重点加入本地 MCP v1、共享任务服务、COLMAP 4.2.1 跨平台运行时、透明素材输入修正，并继续改善自动优化、训练增密与预览稳定性。
+当前 `main` 版本标识：**0.7.1**。本页按源码实现更新；标注“main”的功能不代表已包含在同版本安装包中，发布范围以对应 Release 说明为准。
 
 ## 产品原则
 
@@ -19,28 +19,32 @@ main 开发版本：**0.6.0**；最新正式发布版本：**0.5.0**。0.6.0 当
 - **P2 · 能力扩展**：新增输出格式、项目导入和 AI 调用能力。
 - **P3 · 中长期探索**：推广与更多拍摄、使用场景。
 
-## 待开发
+## 待开发与验证
 
 | 优先级 | 事项 | 目标 | GitHub Issue |
 | --- | --- | --- | --- |
 | P0 | 超大 PLY 预览稳定性与性能 | 解决 WebView2 加载超过 1 GB PLY 时的内存峰值和 OOM 闪退，改善大规模 Gaussian 的加载、编辑与退出稳定性。 | [#21](https://github.com/ooolabdev/ooosplat/issues/21) |
 | P0 | 速度优化 | 缩短素材准备、特征提取、匹配、重建和训练的总体耗时，同时保持现有结果兼容性。 | 待创建 |
 | P0 | 生成质量优化 | 改善相机注册、几何完整性、细节表现和边缘质量，并建立可验证的优化策略。 | 待创建 |
-| P0 | 报错提示优化 | 将引擎、素材、磁盘、GPU 和重建错误转换为清晰、可执行的用户提示与恢复建议。 | 待创建 |
+| P0 | 报错提示与故障验证 | 在已有 OOM、资源限制、文件读取及进程崩溃分类基础上，继续验证原生故障与平台差异，完善恢复建议；分类修复不代表底层故障已解决。 | 待创建 |
 | P0 | UI 简化 | 减少不必要的信息与操作层级，统一生成、历史任务和预览编辑的交互。 | 待创建 |
 | P1 | 高斯泼溅生成 Benchmark | 建立可复现的素材集、硬件环境、质量指标和耗时指标，持续比较不同版本的速度、资源占用与结果质量。 | 待创建 |
 | P1 | 数据搜集与沉淀 | 已具备活跃用户、Pipeline performance 和 Failure distribution 数据，后续完善数据质量、长期样本、分析看板与版本对比。 | 待创建 |
-| P1 | 视频拍摄方法提示 UI | 在选择素材和开始生成前提供环绕路径、运动速度、重叠率、光照与常见问题提示。 | 待创建 |
-| P1 | 新版本自动提示 | 检测可用的新版本，向用户展示版本信息、更新说明和安全下载入口。 | 待创建 |
+| P1 | 拍摄指导完善 | 在现有拍摄建议和图片顺序确认基础上，补充环绕路径、速度、重叠率与光照示例。 | 待创建 |
+| P1 | 全景跨平台与大场景验收 | 验证不同来源、长视频、接缝、方向覆盖及原始分辨率训练。精细档已取消固定1,000万上限，按球面稀疏点数×40预算；实际点数、画质及资源需求仍需实测。 | [验证记录](docs/PANORAMA_IMAGES_V1.md) |
+| P1 | 图片 GPS 平台与素材验收 | 扩展 Windows x64 之外的原生验证，补齐真实全景与补拍 GPS 素材对照；未验证路径不启用地理定向，不承诺测绘精度。 | [范围与验证](docs/IMAGE_GPS.md) |
+| P1 | 补拍 v2 跨设备与桌面验收 | 原生 Ballintoy 核心流程已通过；继续验证真实跨设备／镜头素材、连续多批次补拍及各平台桌面交互，不以合成缩放替代实拍验收。 | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) · [验证记录](docs/RESHOOT_V2.md) |
+| P2 | AI 遮罩与精细抠图 Beta | 验证人物排除与主体 Alpha 的原生推理、人工纠正、模型分发及 COLMAP／Brush 语义；完成真实推理与平台验收后再开放，当前 main 未提供此功能。 | 待创建 |
 | P2 | 导出 Mesh | 将重建结果转换并导出为常见 Mesh 格式，明确纹理、坐标系与质量选项。 | 待创建 |
-| P2 | 在“02 历史任务”中新增项目并导入 PLY | 允许不经过生成流程直接导入已有 PLY，建立 OOOSplat 项目并进入预览和编辑。 | 待创建 |
-| P3 | 全景视频支持 | 探索将全景视频作为输入并生成可用 Gaussian Splatting 结果的工作流。 | 待创建 |
+| P3 | 全景输入扩展 | 探索更多投影；当前不支持双鱼眼、双目、VR180、裁切全景或私有原片。 | 待创建 |
 
 ## 已完成
 
+“已实现 · main”表示代码已接入主线；真实素材、硬件和平台验证限制见对应记录，不等同于已发布或全平台验收通过。
+
 | 状态 | 事项 | 交付 | GitHub Issue / PR |
 | --- | --- | --- | --- |
-| 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供 `.deb` 桌面安装包和 CLI，使用系统 FFmpeg/FFprobe/CPU COLMAP 与安装包内固定版本 Brush。 | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
+| 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供 `.deb` 桌面安装包和 CLI，使用系统 FFmpeg/FFprobe，以及随包交付的固定版本 COLMAP 和 Brush；COLMAP 按条件使用 CUDA 或 CPU。 | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
 | 已完成 | Apple Silicon macOS Alpha | 为 macOS 15+ arm64 提供随应用交付的 FFmpeg、FFprobe、CPU COLMAP 和 Brush 工作流。 | [#4](https://github.com/ooolabdev/ooosplat/issues/4) / [PR #8](https://github.com/ooolabdev/ooosplat/pull/8) |
 | 已完成 | 内嵌高斯泼溅预览与动画导出 | 支持 `.ply` 加载、相机浏览、整体 Transform、动画预览，以及 Gaussian 和竖屏视频导出。 | [#3](https://github.com/ooolabdev/ooosplat/issues/3) |
 | 已完成 | COLMAP CUDA 自动加速 | 自动检测 NVIDIA 驱动和 Compute Capability，满足要求时启用 GPU 特征提取与匹配，否则回退 CPU。 | [#6](https://github.com/ooolabdev/ooosplat/issues/6) |
@@ -57,6 +61,23 @@ main 开发版本：**0.6.0**；最新正式发布版本：**0.5.0**。0.6.0 当
 | 已完成 · 0.5.0 | Windows Brush GPU 稳定性与设备中断诊断 | 在单 NVIDIA 独显环境中稳定选择 Brush 训练设备，区分显存不足与设备中断，并提供更明确的恢复提示。 | 0.5.0 实现 |
 | 已完成 · 0.5.0 | Planner 匿名效果统计与预览修复 | 在不收集素材、路径和日志的前提下记录规划、重建、训练与结果指标；同时优化预览地面网格资源管理和 Transform 大范围缩放。 | 0.5.0 实现 |
 | 已完成 · 0.6.0 | 本地 MCP v1 与共享任务服务 | 提供免 token、仅监听 loopback 的七个 MCP 工具，用于查询应用、创建和启动生成任务、列出和查询任务、增量读取日志及按执行身份取消任务；GUI 与 Agent 共用任务状态、运行锁、进度和结果。 | 0.6.0 main 开发版实现 |
+| 已完成 · 0.6.1 | 版本更新提醒 | 自动检查平台适用版本，展示日期与说明，支持复制下载地址及从设置重新查看；由用户手动安装。 | [功能说明](docs/update-notifications.md) |
+| 已完成 · 0.6.1 | 场景操作轴与编辑保存改进 | 增加移动轴、中心旋转环、反选快捷键与视角恢复；区分保存编辑和模型导出，并改善预览排序。 | 0.6.1 实现 |
+| 已实现 · main | 外部 Gaussian 与 COLMAP 项目导入 | 从“已完成”导入标准/压缩 PLY、SOG、SPZ、SPLAT 和 KSPLAT；自动识别 COLMAP，外部数据保持只读，满足条件时可补拍。 | main 开发版实现 |
+| 已实现 · main | 多格式模型与横屏／HTML 导出 | 从导出菜单直接选择 PLY、压缩 PLY、SPZ v4 或单文件 SOG，不生成中转 PLY；支持横竖屏视频、离线 HTML、取消及安全发布。 | [导出验证](docs/model-export-verification.md) |
+| 已实现 · main | 全景视频与图片输入 | 标准完整 ERP 先球面重建，再为已注册画面生成六面训练缓存；使用全景专用配方与预算，保留原素材、时间／来源映射及断点复用。 | [视频说明](docs/PANORAMA_VIDEO_V1.md) / [图片说明](docs/PANORAMA_IMAGES_V1.md) |
+| 已实现 · main | 素材快速检测与图片顺序确认 | 轻量检测普通／全景素材，切换质量不重复检测；超过100张图片询问顺序，并保存顺序／穷举策略供续跑复用，队列等待确认。 | main 开发版实现 |
+| 已实现 · main | 预览导航与相机修复 | 水平 WASD 支持0.1×–5.0×本机调速，编辑后安全恢复焦点；保留首帧训练视角定位，修复缩放平移、正交裁剪及旋转侧倾。 | [导航与验证](docs/PREVIEW_NAVIGATION.md) / [控件验证](docs/PREVIEW_CONTROLS_VALIDATION.md) |
+| 已实现 · main | 按需预览渲染 | 静止画面停止重绘，交互与动画最高60 FPS；保留分辨率、细节、排序更新和30 FPS视频输出，不承诺固定 GPU 降幅。 | [预览验证](docs/PREVIEW_NAVIGATION.md) |
+| 已实现 · main | 多轮生成进度与运行监控 | 隔离操作和迟到事件，保持监控状态；区分注册计数、六面准备和真实训练步数，补充匹配活动与静默提示。 | main 开发版实现 |
+| 已实现 · main | PNG/XMP 焦距临时兼容 | 仅对已确认受影响运行库和符合条件的普通 PNG，正确解析 XMP 分数并覆盖初始焦距；保留图片字节并处理不兼容旧缓存。 | [#73](https://github.com/ooolabdev/ooosplat/issues/73) / [范围与移除方式](docs/temporary-png-focal-workaround.md) |
+| 已实现 · main | 默认生成、自动重试与分级抽帧 | 原优化策略成为默认；透明区域决定两视图三角化，视频按档位默认 FPS 或分级比例抽帧。授权后可在明确 OOM 时按可信点数80%重试一次，补拍方案回退使用同一开关；续跑沿用快照。 | [生成策略](docs/GENERATION_POLICY.md) |
+| 已实现 · main | 精细档原始分辨率与 Splat 预算 | 取消显存分档；普通精细档按有效像素和重建轨迹计算预算，系数0.5，全景独立保留球面稀疏点数×40；初始化点数不静默削减，不保证填满或提升 PSNR。 | [预算与验证](docs/FINE_SPLAT_BUDGET.md) |
+| 已实现 · main | 补拍 v2 工作流 | 支持多相机、跨尺寸普通素材及多批次 ERP；问答决定重建及初始化方式，旧 PLY 初始化使用正常完整配方。结果写入只读源项目之外的派生项目，补齐准备日志、发布数量和终态监控清理。 | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) / [使用与验证](docs/RESHOOT_V2.md) |
+| 已实现 · main | 图片 GPS 辅助与地理定向 | 轻量识别 EXIF／XMP 定位信息，在已验证 Windows x64 路径补充近邻匹配及软位置先验；可靠时输出估计北向与米制尺度，不足时回退原流程，坐标仅保存在本地。 | [范围与验证](docs/IMAGE_GPS.md) |
+| 已实现 · main | 引擎健康与失败诊断 | 完善 FFprobe 预检和悬停健康详情；区分 Brush OOM、资源限制、读取错误及 COLMAP 异常终止，保留各次执行与真实退出信息，不从崩溃猜测素材原因。 | [#71](https://github.com/ooolabdev/ooosplat/issues/71) / [#72](https://github.com/ooolabdev/ooosplat/issues/72) |
+| 已实现 · main | 统计完整性与实际 GPU | 补齐补拍 v2、失败前已知数据、最后阶段及初始／最终训练配置；逐次冻结 Brush 实际设备，诊断经用户同意沿用原协议上传，不新增数据库字段。 | [验证记录](docs/TELEMETRY_COMPLETENESS_VALIDATION.md) |
+| 已实现 · main | 导出与缓存限制调整 | 取消压缩导出估算内存门槛与全景固定20 GiB缓存门槛；SPZ越界经用户确认后仅居中／等比缩放导出副本，保留格式检查及原文件保护，仍受实际内存与磁盘限制。 | [导出与验证](docs/model-export-verification.md) |
 
 ## 跟踪与贡献
 

@@ -33,13 +33,38 @@ pub struct RuntimeSnapshot {
     pub resources: Option<ProcessResources>,
 }
 
-pub(super) struct RuntimeTracker {
+pub(crate) struct RuntimeTracker {
     pub snapshot: RuntimeSnapshot,
     last_output: Instant,
     previous_step: Option<(u64, Instant, u32)>,
 }
 
 impl RuntimeTracker {
+    /// Metadata may enrich an explicitly reported adapter, never choose the adapter.
+    pub fn enrich_device(&mut self, acceleration: &crate::engines::ColmapAccelerationStatus) {
+        let Some(device) = acceleration.device.as_ref().filter(|device| {
+            acceleration.detected_nvidia_device_count == 1
+                && self
+                    .snapshot
+                    .device
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&device.name))
+        }) else {
+            return;
+        };
+        if let Some(memory) = device.total_memory_mb.filter(|v| *v > 0) {
+            self.snapshot
+                .config
+                .insert("device_total_memory_mb".into(), memory.to_string());
+        }
+        if device.driver_version.chars().any(|c| c.is_ascii_digit()) {
+            self.snapshot
+                .config
+                .entry("device_driver_version".into())
+                .or_insert_with(|| device.driver_version.clone());
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             snapshot: RuntimeSnapshot {
@@ -97,10 +122,24 @@ impl RuntimeTracker {
         }
         if line.contains("GPU initialization completed") {
             self.snapshot.backend = field(line, "backend").map(str::to_owned);
-            self.snapshot.device = line
+            let device = line
                 .split_once("device=")
                 .and_then(|(_, rest)| rest.split_once(" type="))
                 .map(|(name, _)| name.to_owned());
+            if self.snapshot.device != device {
+                self.snapshot.config.remove("device_driver_version");
+                self.snapshot.config.remove("device_total_memory_mb");
+            }
+            self.snapshot.device = device;
+            // `driver=NVIDIA` is a vendor, not a driver version.
+            if let Some((_, driver)) = line.split_once(" driver_info=") {
+                if driver.chars().any(|c| c.is_ascii_digit()) {
+                    self.snapshot.config.insert(
+                        "device_driver_version".into(),
+                        driver.chars().take(256).collect(),
+                    );
+                }
+            }
             self.set_phase("loading");
         }
         if line.contains("Loading dataset") || line.contains("Loading initial splats") {
@@ -219,14 +258,121 @@ fn integer(line: &str, key: &str) -> Option<u64> {
     field(line, key)?.parse().ok()
 }
 
+pub(crate) fn brush_splat_count(line: &str) -> Option<u64> {
+    if let Some((_, rest)) = line.split_once("Refine iter ") {
+        let (iteration, tail) = rest.split_once(',')?;
+        iteration.trim().parse::<u64>().ok()?;
+        let (number, suffix) = tail.trim().split_once(' ')?;
+        return suffix
+            .starts_with("splats")
+            .then(|| number.parse().ok())
+            .flatten();
+    }
+    if line.contains("Initial splats initialized in") {
+        return line
+            .rsplit_once(": ")?
+            .1
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok();
+    }
+    None
+}
+
 fn finite(value: &str) -> Option<f64> {
     value.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn splat_counts_require_a_real_brush_report_not_a_budget_or_unrelated_number() {
+        assert_eq!(
+            super::brush_splat_count("INFO Initial splats initialized in 1ms: 10192"),
+            Some(10192)
+        );
+        assert_eq!(
+            super::brush_splat_count("INFO Refine iter 200, 244621 splats."),
+            Some(244621)
+        );
+        for line in [
+            "max_splats=10000000",
+            "read 244621 bytes",
+            "Refine iter broken, 12 splats.",
+            "Refine iter 200, NaN splats.",
+            "Refine iter 200, 100 images.",
+        ] {
+            assert_eq!(super::brush_splat_count(line), None);
+        }
+    }
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn hardware_metadata_cannot_select_an_adapter_or_resolve_ambiguous_cards() {
+        let acceleration = |count| {
+            serde_json::from_value(serde_json::json!({
+                "backend":"gpu", "detectionState":"ready", "reasonCode":"gpuReady",
+                "reason":"fixture", "detectedNvidiaDeviceCount": count,
+                "device": {"index":0,"name":"NVIDIA RTX","driverVersion":"616.92",
+                    "computeCapability":"8.6","totalMemoryMb":8192},
+                "requirements":{"minimumDriverVersion":"580","minimumComputeCapability":"7.5"}
+            }))
+            .unwrap()
+        };
+        let mut tracker = RuntimeTracker::new();
+        tracker.enrich_device(&acceleration(1));
+        assert!(tracker.snapshot.device.is_none());
+        assert!(tracker.snapshot.config.is_empty());
+        tracker.line("GPU initialization completed: backend=Vulkan device=Other GPU type=DiscreteGpu driver=unknown", Instant::now(), true);
+        tracker.enrich_device(&acceleration(1));
+        assert!(tracker.snapshot.config.is_empty());
+        tracker.line("GPU initialization completed: backend=Vulkan device=NVIDIA RTX type=DiscreteGpu driver=NVIDIA driver_info=620.00", Instant::now(), true);
+        tracker.enrich_device(&acceleration(2));
+        assert!(!tracker
+            .snapshot
+            .config
+            .contains_key("device_total_memory_mb"));
+        tracker.enrich_device(&acceleration(1));
+        assert_eq!(tracker.snapshot.config["device_total_memory_mb"], "8192");
+        assert_eq!(tracker.snapshot.config["device_driver_version"], "620.00");
+    }
+
+    #[test]
+    fn driver_version_is_from_the_actual_adapter_not_the_vendor() {
+        let mut tracker = RuntimeTracker::new();
+        let now = Instant::now();
+        tracker.line("GPU initialization completed in 0.4s: backend=Vulkan device=NVIDIA RTX type=DiscreteGpu driver=NVIDIA driver_info=616.92", now, true);
+        assert_eq!(tracker.snapshot.device.as_deref(), Some("NVIDIA RTX"));
+        assert_eq!(
+            tracker
+                .snapshot
+                .config
+                .get("device_driver_version")
+                .map(String::as_str),
+            Some("616.92")
+        );
+        let mut missing = RuntimeTracker::new();
+        missing.line("GPU initialization completed: backend=Vulkan device=NVIDIA RTX type=DiscreteGpu driver=NVIDIA driver_info=unknown", now, true);
+        assert!(!missing
+            .snapshot
+            .config
+            .contains_key("device_driver_version"));
+        tracker
+            .snapshot
+            .config
+            .insert("device_total_memory_mb".into(), "8192".into());
+        tracker.line("GPU initialization completed: backend=Vulkan device=AMD Actual type=DiscreteGpu driver=AMD driver_info=unknown", now, true);
+        assert!(!tracker
+            .snapshot
+            .config
+            .contains_key("device_driver_version"));
+        assert!(!tracker
+            .snapshot
+            .config
+            .contains_key("device_total_memory_mb"));
+    }
 
     #[test]
     fn reads_actual_progress_rate_lod_and_output_gap() {

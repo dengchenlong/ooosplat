@@ -3,6 +3,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   createGenerationDraft,
+  draftGenerationPolicy,
+  draftDisplayName,
   createReshootDraft,
   loadTaskWorkspace,
   nextGenerationOrdinal,
@@ -11,7 +13,33 @@ import {
 } from "./taskWorkspace";
 
 describe("task workspace persistence", () => {
+  it('uses policy v3 for new and restored custom-sampling drafts without changing user choices', () => {
+    const draft = { ...createGenerationDraft(1), frameSamplingRatio: .755, autoRetryEnabled: false };
+    expect(draftGenerationPolicy(draft)).toEqual({version:3,frameSamplingRatio:.755,autoRetryEnabled:false});
+    saveTaskWorkspace([draft], {kind:'draft',id:draft.id}, 2);
+    expect(draftGenerationPolicy(loadTaskWorkspace().drafts[0])).toEqual(draftGenerationPolicy(draft));
+  });
+  it('persists retry consent and manual base sampling independently of legacy optimization', () => {
+    const draft = { ...createGenerationDraft(1, false), autoRetryEnabled: false, frameSamplingRatio: .755 };
+    saveTaskWorkspace([draft], {kind:'draft',id:draft.id}, 2);
+    expect(loadTaskWorkspace().drafts[0]).toMatchObject({autoRetryEnabled:false,frameSamplingRatio:.755,plannerEnabled:false});
+    const stored = JSON.parse(localStorage.getItem(TASK_WORKSPACE_STORAGE_KEY)!);
+    delete stored.drafts[0].autoRetryEnabled; delete stored.drafts[0].frameSamplingRatio;
+    localStorage.setItem(TASK_WORKSPACE_STORAGE_KEY,JSON.stringify(stored));
+    expect(loadTaskWorkspace().drafts[0]).toMatchObject({autoRetryEnabled:true,frameSamplingRatio:null});
+  });
   beforeEach(() => localStorage.clear());
+
+  it("hides display ordinals without changing draft identities or recovery order", () => {
+    const drafts = [createGenerationDraft(1), createGenerationDraft(2)];
+    expect(drafts.map(draft => draftDisplayName(draft, '新任务', '补拍'))).toEqual(['新任务', '新任务']);
+    expect(draftDisplayName(drafts[0], 'New Task', 'Reshoot')).toBe('New Task');
+    expect(draftDisplayName({ ...drafts[0], inputPath: 'E:/media/clip.mp4' }, '新任务', '补拍')).toBe('clip.mp4');
+    saveTaskWorkspace(drafts, { kind: 'draft', id: drafts[1].id }, 3);
+    const restored = loadTaskWorkspace();
+    expect(restored.drafts.map(d => [d.id, d.ordinal])).toEqual(drafts.map(d => [d.id, d.ordinal]));
+    expect(restored.selected).toEqual({ kind: 'draft', id: drafts[1].id });
+  });
 
   it("creates a standby generation draft by default", () => {
     const workspace = loadTaskWorkspace();
@@ -30,6 +58,14 @@ describe("task workspace persistence", () => {
     expect(restored.plannerEnabled).toBe(false);
     expect(restored.plannerDefaultPending).toBe(false);
     expect(restored).toMatchObject({ error: null, errorAt: null });
+  });
+  it("persists the confirmed projection but not detection or preview data", () => {
+    const draft = { ...createGenerationDraft(1), videoProjection: "equirectangular" as const, inputPath: "capture.mp4", projectionDetection: { confirmedErp: false, requiresChoice: true, supportedErp: true, reason: "ERP", previewJpeg: [1,2,3] } };
+    saveTaskWorkspace([draft], { kind: "draft", id: draft.id }, 2);
+    const restored = loadTaskWorkspace().drafts[0];
+    expect(restored.videoProjection).toBe("equirectangular");
+    expect(restored.projectionDetection).toBeNull();
+    expect(restored.needsValidation).toBe(true);
   });
 
   it("marks legacy drafts for one-time planner default hydration", () => {

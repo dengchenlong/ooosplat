@@ -5,10 +5,15 @@ pub(super) fn output(name: &str) -> Value {
     let nullable_number = json!({"type":["number","null"]});
     let status = json!({"type":"string","enum":["created","starting","running","cancelling","completed","failed","cancelled","interrupted"]});
     let error = json!({"type":["object","null"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"failed_stage":{"type":["string","null"]},"engine":{"type":["string","null"]},"exit_code":{"type":["integer","null"]},"classification":{"type":["string","null"]},"classification_is_heuristic":{"type":"boolean"},"failure_id":nullable_id,"log_sources":{"type":"array","items":{"type":"string"}}}});
-    let task = json!({"type":"object","required":["task_id","run_id","project_id","status","stage","revision","source","quality","input_path","error","result"],"properties":{
+    let mut task = json!({"type":"object","required":["task_id","run_id","project_id","status","stage","revision","source","quality","input_path","error","result"],"properties":{
         "task_id":id,"run_id":nullable_id,"project_id":nullable_id,"project_path":{"type":["string","null"]},"input_path":{"type":"string"},"projects_root":{"type":"string"},"quality":{"type":"string","enum":["fast","balanced","high"]},"source":{"type":["string","null"],"enum":["gui","mcp",null]},"configuration_inferred":{"type":"boolean"},"project_deleted":{"type":"boolean"},"input_type":{"type":"string","enum":["video","images"]},"task_kind":{"type":"string"},"status":status,"stage":{"type":["string","null"]},"revision":{"type":"integer","minimum":1},"sequence":{"type":"integer","minimum":0},"created_at":{"type":"string","format":"date-time"},"updated_at":{"type":"string","format":"date-time"},"elapsed_ms":{"type":"integer","minimum":0},"planner_enabled":{"type":"boolean"},"configuration":{"type":"object"},"actual_configuration":{"type":["object","null"]},"progress":{"type":["number","null"],"description":"Last observed actual stage percentage, never an estimated overall percentage."},"estimated_progress":{"type":["number","null"],"description":"Estimated overall percentage from existing stage mapping."},"current":{"type":["integer","null"]},"total":{"type":["integer","null"]},"unit":{"type":["string","null"]},"eta_seconds":nullable_number,"error":error,"result":{"type":["object","null"],"properties":{"final_ply":{"type":"string"},"file_size":{"type":"integer"},"splat_count":{"type":"integer"}}},"runs":{"type":"array","items":{"type":"object","properties":{"run_id":id,"kind":{"type":"string"},"started_at":{"type":"string"},"ended_at":{"type":["string","null"]},"log_sources":{"type":"array","items":{"type":"string"}}}}}
     }});
+    task["properties"]["generation_policy"] = json!({"type":["object","null"]});
+    task["properties"]["automatically_retried"] = json!({"type":"boolean"});
     match name {
+        "inspect_reshoot_input" => {
+            json!({"type":"object","required":["source","input"],"properties":{"source":{"type":"object"},"input":{"type":"object"}}})
+        }
         "create_generation_task" | "get_task_status" | "cancel_task" => task,
         "start_task" => {
             json!({"type":"object","required":["accepted","task_id","run_id","status","revision"],"properties":{"accepted":{"type":"boolean"},"task_id":id,"run_id":nullable_id,"status":status,"revision":{"type":"integer"}}})

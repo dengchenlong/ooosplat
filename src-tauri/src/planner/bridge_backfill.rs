@@ -7,6 +7,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::{Result, SplatError},
@@ -99,6 +100,39 @@ pub fn plan_bridge_backfill(
     registered_source_indices: &BTreeSet<u64>,
     initial_registered_images: u64,
 ) -> BridgeBackfillPlan {
+    plan_bridge_backfill_inner(
+        frame_plan,
+        registered_source_indices,
+        initial_registered_images,
+        None,
+    )
+}
+
+pub fn plan_bridge_backfill_cancellable(
+    frame_plan: &FramePlan,
+    registered_source_indices: &BTreeSet<u64>,
+    initial_registered_images: u64,
+    cancellation: &CancellationToken,
+) -> Result<BridgeBackfillPlan> {
+    let plan = plan_bridge_backfill_inner(
+        frame_plan,
+        registered_source_indices,
+        initial_registered_images,
+        Some(cancellation),
+    );
+    if cancellation.is_cancelled() {
+        Err(SplatError::Cancelled)
+    } else {
+        Ok(plan)
+    }
+}
+
+fn plan_bridge_backfill_inner(
+    frame_plan: &FramePlan,
+    registered_source_indices: &BTreeSet<u64>,
+    initial_registered_images: u64,
+    cancellation: Option<&CancellationToken>,
+) -> BridgeBackfillPlan {
     let initial_input_images = frame_plan.selected_frames.len() as u64;
     let initial_registration_ratio = if initial_input_images == 0 {
         0.0
@@ -115,23 +149,22 @@ pub fn plan_bridge_backfill(
         available_budget,
         ..BridgeBackfillPlan::default()
     };
-    if initial_registration_ratio >= bridge_trigger_ratio() || available_budget == 0 {
+    if initial_registration_ratio >= bridge_trigger_ratio()
+        || available_budget == 0
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
+    {
         return output;
     }
 
     let mut selected = frame_plan.selected_frames.clone();
     selected.sort_by_key(|frame| frame.source_frame_index);
-    let already_selected = selected
+    let mut excluded = selected
         .iter()
         .map(|frame| frame.source_frame_index)
-        .collect::<HashSet<_>>();
-    let candidates = frame_plan
-        .candidate_frames
-        .iter()
-        .filter(|frame| !already_selected.contains(&frame.source_frame_index))
-        .cloned()
-        .collect::<Vec<_>>();
-    if candidates.is_empty() || registered_source_indices.is_empty() {
+        .collect::<BTreeSet<_>>();
+    if (frame_plan.candidate_frames.is_empty() && frame_plan.bridge_source_frames.is_none())
+        || registered_source_indices.is_empty()
+    {
         return output;
     }
 
@@ -140,17 +173,17 @@ pub fn plan_bridge_backfill(
         .iter()
         .filter(|gap| gap.kind == GapKind::Internal)
         .count() as u64;
-    let mut chosen = HashSet::new();
     while output.selected_frame_indices.len() < available_budget as usize {
-        let Some((gap_index, candidate)) = largest_actionable_gap(&gaps, &candidates, &chosen)
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let Some((gap_index, candidate)) = largest_actionable_gap(&gaps, frame_plan, &excluded)
         else {
             break;
         };
         let gap = gaps.swap_remove(gap_index);
-        chosen.insert(candidate.source_frame_index);
-        output
-            .selected_frame_indices
-            .push(candidate.source_frame_index);
+        excluded.insert(candidate);
+        output.selected_frame_indices.push(candidate);
         if gap.kind == GapKind::Edge {
             output.edge_extension_count += 1;
         } else {
@@ -159,22 +192,22 @@ pub fn plan_bridge_backfill(
         output.selection_trace.push(BridgeBackfillSelection {
             gap_start_frame_index: gap.start,
             gap_end_frame_index: gap.end,
-            selected_frame_index: candidate.source_frame_index,
+            selected_frame_index: candidate,
             edge_extension: gap.kind == GapKind::Edge,
         });
         for child in [
             Gap {
                 start: gap.start,
-                end: candidate.source_frame_index,
+                end: candidate,
                 kind: gap.kind,
             },
             Gap {
-                start: candidate.source_frame_index,
+                start: candidate,
                 end: gap.end,
                 kind: gap.kind,
             },
         ] {
-            if child.span() > 1 && has_candidate(child, &candidates, &chosen) {
+            if child.span() > 1 && candidate_for_gap(child, frame_plan, &excluded).is_some() {
                 gaps.push(child);
             }
         }
@@ -240,13 +273,13 @@ fn initial_gaps(selected: &[PlannedFrame], registered: &BTreeSet<u64>) -> Vec<Ga
 
 fn largest_actionable_gap(
     gaps: &[Gap],
-    candidates: &[PlannedFrame],
-    chosen: &HashSet<u64>,
-) -> Option<(usize, PlannedFrame)> {
+    plan: &FramePlan,
+    excluded: &BTreeSet<u64>,
+) -> Option<(usize, u64)> {
     gaps.iter()
         .enumerate()
         .filter_map(|(index, gap)| {
-            midpoint_candidate(*gap, candidates, chosen).map(|c| (index, *gap, c))
+            candidate_for_gap(*gap, plan, excluded).map(|c| (index, *gap, c))
         })
         .max_by(
             |(_, left_gap, left_candidate), (_, right_gap, right_candidate)| {
@@ -254,14 +287,37 @@ fn largest_actionable_gap(
                     .cmp(&gap_priority(*right_gap))
                     .then_with(|| left_gap.span().cmp(&right_gap.span()))
                     .then_with(|| right_gap.start.cmp(&left_gap.start))
-                    .then_with(|| {
-                        right_candidate
-                            .source_frame_index
-                            .cmp(&left_candidate.source_frame_index)
-                    })
+                    .then_with(|| right_candidate.cmp(left_candidate))
             },
         )
         .map(|(index, _, candidate)| (index, candidate))
+}
+
+fn candidate_for_gap(gap: Gap, plan: &FramePlan, excluded: &BTreeSet<u64>) -> Option<u64> {
+    if let Some(total) = plan.bridge_source_frames {
+        let start = gap.start.checked_add(1)?;
+        let end = gap.end.checked_sub(1)?.min(total.checked_sub(1)?);
+        if start > end {
+            return None;
+        }
+        let middle = (gap.start + gap.span() / 2).clamp(start, end);
+        // Visit only the occupied run around the midpoint, never materialize or
+        // scan the complete source range. Integer distances avoid f64 ties on
+        // very long inputs; equal distances prefer the lower source index.
+        let lower = (start..=middle).rev().find(|i| !excluded.contains(i));
+        let upper = middle
+            .checked_add(1)
+            .and_then(|next| (next..=end).find(|i| !excluded.contains(i)));
+        [lower, upper].into_iter().flatten().min_by_key(|index| {
+            (
+                (u128::from(*index) * 2).abs_diff(u128::from(gap.start) + u128::from(gap.end)),
+                *index,
+            )
+        })
+    } else {
+        midpoint_candidate(gap, &plan.candidate_frames, excluded)
+            .map(|frame| frame.source_frame_index)
+    }
 }
 
 fn gap_priority(gap: Gap) -> u8 {
@@ -274,7 +330,7 @@ fn gap_priority(gap: Gap) -> u8 {
 fn midpoint_candidate(
     gap: Gap,
     candidates: &[PlannedFrame],
-    chosen: &HashSet<u64>,
+    excluded: &BTreeSet<u64>,
 ) -> Option<PlannedFrame> {
     let midpoint = gap.start as f64 + gap.span() as f64 / 2.0;
     candidates
@@ -282,7 +338,7 @@ fn midpoint_candidate(
         .filter(|frame| {
             frame.source_frame_index > gap.start
                 && frame.source_frame_index < gap.end
-                && !chosen.contains(&frame.source_frame_index)
+                && !excluded.contains(&frame.source_frame_index)
         })
         .min_by(|left, right| {
             let left_distance = (left.source_frame_index as f64 - midpoint).abs();
@@ -293,14 +349,6 @@ fn midpoint_candidate(
                 .then_with(|| left.source_frame_index.cmp(&right.source_frame_index))
         })
         .cloned()
-}
-
-fn has_candidate(gap: Gap, candidates: &[PlannedFrame], chosen: &HashSet<u64>) -> bool {
-    candidates.iter().any(|frame| {
-        frame.source_frame_index > gap.start
-            && frame.source_frame_index < gap.end
-            && !chosen.contains(&frame.source_frame_index)
-    })
 }
 
 pub fn read_registered_source_indices(model: &Path) -> Result<BTreeSet<u64>> {
@@ -407,6 +455,83 @@ mod tests {
             estimated_frames: selected.len() as u64,
             ..FramePlan::default()
         }
+    }
+
+    #[test]
+    fn cancelled_manual_bridge_never_returns_a_partial_attempt_as_success() {
+        let mut frames = plan(&[0, 20, 40, 60, 80], &[], 5);
+        frames.use_manual_bridge_budget(100);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            plan_bridge_backfill_cancellable(
+                &frames,
+                &[0, 80].into_iter().collect(),
+                2,
+                &cancelled
+            ),
+            Err(SplatError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn manual_bridge_searches_source_outside_old_pool_with_twenty_percent_budget() {
+        let mut frames = plan(&[0, 2, 4, 6, 8], &[0, 2, 4, 6, 8], 5);
+        frames.use_manual_bridge_budget(10);
+        let registered = [0, 8].into_iter().collect();
+        let output = plan_bridge_backfill(&frames, &registered, 2);
+        assert_eq!(output.available_budget, 1);
+        assert_eq!(output.selected_frame_indices, vec![3]);
+        assert_eq!(output.internal_bridge_count, 1);
+        assert!(!frames
+            .candidate_frames
+            .iter()
+            .any(|f| f.source_frame_index == 3));
+        assert_eq!(output, plan_bridge_backfill(&frames, &registered, 2));
+        assert!(plan_bridge_backfill(&frames, &BTreeSet::new(), 0)
+            .selected_frame_indices
+            .is_empty());
+        assert!(
+            plan_bridge_backfill(&frames, &[0, 2, 4, 6].into_iter().collect(), 4)
+                .selected_frame_indices
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_candidates_keep_gap_priority_and_do_not_force_fill_budget() {
+        let mut frames = plan(&[0, 20, 40, 60, 80], &[], 5);
+        frames.use_manual_bridge_budget(100);
+        let output = plan_bridge_backfill(&frames, &[20, 60].into_iter().collect(), 2);
+        assert_eq!(output.selected_frame_indices, vec![39]);
+        assert_eq!(output.edge_extension_count, 0);
+
+        let selected: Vec<_> = (0..=180).step_by(20).collect();
+        let mut frames = plan(&selected, &[], 10);
+        frames.use_manual_bridge_budget(200);
+        let output = plan_bridge_backfill(
+            &frames,
+            &[0, 20, 80, 100, 140, 160, 180].into_iter().collect(),
+            7,
+        );
+        assert_eq!(output.selected_frame_indices, vec![50, 119]);
+        assert_eq!(output.available_budget, 2);
+
+        let mut frames = plan(&(0..10).collect::<Vec<_>>(), &[], 10);
+        frames.use_manual_bridge_budget(100);
+        let output = plan_bridge_backfill(&frames, &[0, 9].into_iter().collect(), 2);
+        assert_eq!(output.available_budget, 2);
+        assert!(output.selected_frame_indices.is_empty());
+    }
+
+    #[test]
+    fn virtual_source_range_is_not_materialized_and_large_indices_are_exact() {
+        let mut frames = plan(&[0, 100, 200, 300, u64::MAX - 1], &[], 5);
+        frames.use_manual_bridge_budget(u64::MAX);
+        let output = plan_bridge_backfill(&frames, &[0, u64::MAX - 1].into_iter().collect(), 2);
+        assert_eq!(output.selected_frame_indices, vec![(u64::MAX - 1) / 2]);
+        assert!(frames.candidate_frames.is_empty());
+        assert_eq!(frames.candidate_count(), u64::MAX);
     }
 
     #[test]

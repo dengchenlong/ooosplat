@@ -78,6 +78,7 @@ pub struct ReportReceipt {
 struct FailureSnapshot {
     report: DiagnosticReport,
     private: Vec<String>,
+    actual_device: Option<crate::pipeline::brush_execution::BrushDeviceSnapshot>,
 }
 struct Draft {
     report: DiagnosticReport,
@@ -110,6 +111,9 @@ fn blank_environment() -> Environment {
 }
 fn reason(kind: Option<&str>) -> &'static str {
     match kind {
+        Some("brush_out_of_memory") => "GPU memory was exhausted during training.",
+        Some("brush_resource_limit") => "A required GPU resource exceeded the device or graphics backend limit; this does not necessarily mean GPU memory was exhausted.",
+        Some("colmap_crash") => "The COLMAP process terminated abnormally. The underlying cause is not yet known.",
         Some("mapper_source") => "The images could not be connected into a reconstruction.",
         Some("mapper_storage") => "The reconstruction files could not be read.",
         Some("brush_dataset") => {
@@ -154,6 +158,22 @@ impl DiagnosticService {
         message: &str,
         project_id: Option<Uuid>,
         paths: &[PathBuf],
+    ) -> Uuid {
+        self.capture_with_executions(stage, engine, kind, message, project_id, paths, &[], None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn capture_with_executions(
+        &self,
+        stage: Option<PipelineStage>,
+        engine: Option<PipelineEngine>,
+        kind: Option<&str>,
+        message: &str,
+        project_id: Option<Uuid>,
+        paths: &[PathBuf],
+        executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
+        current: Option<usize>,
     ) -> Uuid {
         let mut private_paths = paths.to_vec();
         let mut private_names = Vec::new();
@@ -206,6 +226,44 @@ impl DiagnosticService {
         let mut private = redact::private_values(&private_paths);
         private.extend(private_names.into_iter().filter(|v| !v.is_empty()));
         let id = Uuid::new_v4();
+        let actual_device = current
+            .and_then(|i| executions.get(i))
+            .and_then(|e| e.device.clone());
+        let mut detail = redact::sanitize(message, &private);
+        // The structured error starts with the final failure's root cause.
+        // Keep its beginning, reserving separate space for the most recent attempts.
+        let mut detail_budget = if executions.is_empty() {
+            16 * 1024
+        } else {
+            12 * 1024
+        };
+        detail_budget = detail_budget.min(detail.len());
+        while !detail.is_char_boundary(detail_budget) {
+            detail_budget -= 1;
+        }
+        detail.truncate(detail_budget);
+        if !executions.is_empty() {
+            let mut summaries = Vec::new();
+            let mut bytes = 0;
+            for (index, execution) in executions.iter().enumerate().rev() {
+                let summary = redact::bounded(
+                    &redact::sanitize(&execution.diagnostic_summary(index), &private),
+                    1024,
+                );
+                if bytes + summary.len() + 1 > 3800 {
+                    break;
+                }
+                bytes += summary.len() + 1;
+                summaries.push(summary);
+            }
+            let omitted = executions.len() - summaries.len();
+            summaries.reverse();
+            detail.push_str(&format!(
+                "\n\nBrush executions ({} earlier entries omitted):\n{}",
+                omitted,
+                summaries.join("\n")
+            ));
+        }
         let report = DiagnosticReport {
             schema_version: 1,
             report_id: id,
@@ -215,15 +273,20 @@ impl DiagnosticService {
             engine,
             error_code: kind.unwrap_or("pipeline_failed").into(),
             reason: reason(kind).into(),
-            detail: redact::bounded(&redact::sanitize(message, &private), 16 * 1024),
+            detail: redact::bounded(&detail, 16 * 1024),
             log_tail: redact::bounded(&redact::sanitize(&log, &private), LOG_BYTES),
             logs_truncated,
             environment: blank_environment(),
         };
         let mut reports = self.reports.lock().unwrap_or_else(|v| v.into_inner());
-        reports
-            .failures
-            .insert(id, FailureSnapshot { report, private });
+        reports.failures.insert(
+            id,
+            FailureSnapshot {
+                report,
+                private,
+                actual_device,
+            },
+        );
         id
     }
 
@@ -272,22 +335,26 @@ impl DiagnosticService {
                 .take()
                 .map(|v| redact::sanitize(&v, &snapshot.private));
         }
-        // Never infer the actual training GPU from a preferred adapter. Only explicit log records qualify.
-        report.environment.actual_device = report.log_tail.lines().find_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if !["using adapter", "selected adapter", "using device"]
-                .iter()
-                .any(|v| lower.contains(v))
-            {
-                return None;
-            }
+        // Only frozen evidence from this execution qualifies. Neither the current
+        // hardware inventory nor an old/truncated log can select a training GPU.
+        report.environment.actual_device = None;
+        if let Some(device) = snapshot.actual_device {
+            let name = redact::sanitize(&device.name, &snapshot.private);
             report
                 .environment
                 .gpus
-                .iter()
-                .find(|gpu| !gpu.name.is_empty() && line.contains(&gpu.name))
-                .map(|gpu| gpu.name.clone())
-        });
+                .retain(|gpu| !gpu.name.eq_ignore_ascii_case(&name));
+            report.environment.gpus.truncate(15);
+            report.environment.gpus.push(hardware::GpuInfo {
+                name: name.clone(),
+                driver_version: device
+                    .driver_version
+                    .map(|v| redact::sanitize(&v, &snapshot.private)),
+                total_memory_mb: device.total_memory_mb,
+                compute_capability: None,
+            });
+            report.environment.actual_device = Some(name);
+        }
         if serde_json::to_vec(&report)
             .map_err(|_| error("report_failed"))?
             .len()
@@ -430,6 +497,156 @@ pub async fn send_error_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_details_keep_the_root_cause_and_latest_attempts_in_order() {
+        use crate::pipeline::{brush_execution::BrushExecutionSnapshot, runtime::RuntimeTracker};
+        let service = DiagnosticService::default();
+        let execution = BrushExecutionSnapshot::new(&RuntimeTracker::new().snapshot, None);
+        let executions = vec![execution; 100];
+        let message = format!(
+            "GPU OOM ROOT CAUSE\n{}",
+            "Earlier context 文本\n".repeat(2000)
+        );
+        let id = service
+            .capture_with_executions(
+                Some(PipelineStage::TrainingSplats),
+                Some(PipelineEngine::Brush),
+                Some("brush_out_of_memory"),
+                &message,
+                None,
+                &[],
+                &executions,
+                Some(99),
+            )
+            .await;
+        let report = service
+            .prepare_with(id, || async { blank_environment() })
+            .await
+            .unwrap()
+            .report;
+        assert!(report.detail.starts_with("GPU OOM ROOT CAUSE"));
+        assert!(report.detail.len() <= 16 * 1024);
+        assert!(report.detail.contains("earlier entries omitted"));
+        let previous = report.detail.find("Brush attempt 99:").unwrap();
+        let last = report.detail.find("Brush attempt 100:").unwrap();
+        assert!(previous < last);
+        assert!(!report.detail.contains("Brush attempt 1:"));
+        assert!(report.environment.actual_device.is_none());
+        // Bounded upload does not mutate the caller's complete local history.
+        assert_eq!(executions.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn execution_snapshots_fill_existing_fields_without_borrowing_a_previous_gpu() {
+        use crate::pipeline::{brush_execution::BrushExecutionSnapshot, runtime::RuntimeTracker};
+        let service = DiagnosticService::default();
+        let mut runtime = RuntimeTracker::new();
+        runtime.snapshot.process_id = 123;
+        runtime.line("GPU initialization completed: backend=Vulkan device=NVIDIA Actual type=DiscreteGpu driver=NVIDIA driver_info=616.92", std::time::Instant::now(), true);
+        runtime
+            .snapshot
+            .config
+            .insert("device_total_memory_mb".into(), "8192".into());
+        runtime
+            .snapshot
+            .config
+            .insert("max_splats".into(), "2000000".into());
+        runtime
+            .snapshot
+            .config
+            .insert("directory".into(), "C:/private/GPU-secret-uuid".into());
+        let mut first = BrushExecutionSnapshot::new(&runtime.snapshot, None);
+        first.finish(Some(101));
+        let unknown = BrushExecutionSnapshot::new(&RuntimeTracker::new().snapshot, None);
+        for current in [Some(0), Some(1), None] {
+            let id = service
+                .capture_with_executions(
+                    Some(PipelineStage::TrainingSplats),
+                    Some(PipelineEngine::Brush),
+                    Some("brush_out_of_memory"),
+                    "GPU OOM root cause",
+                    None,
+                    &[],
+                    &[first.clone(), unknown.clone()],
+                    current,
+                )
+                .await;
+            let draft = service
+                .prepare_with(id, || async {
+                    let mut env = blank_environment();
+                    env.actual_device = Some("wrong preferred GPU".into());
+                    env
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                draft.report.environment.actual_device.as_deref(),
+                if current == Some(0) {
+                    Some("NVIDIA Actual")
+                } else {
+                    None
+                }
+            );
+            if current == Some(0) {
+                let gpu = &draft.report.environment.gpus[0];
+                assert_eq!(gpu.total_memory_mb, Some(8192));
+                assert_eq!(gpu.driver_version.as_deref(), Some("616.92"));
+            }
+            let value = serde_json::to_value(&draft.report).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 12);
+            assert_eq!(value["environment"].as_object().unwrap().len(), 3);
+            assert!(draft.report.detail.contains("GPU OOM root cause"));
+            assert!(draft.report.detail.contains("Brush attempt 1"));
+            assert!(draft.report.detail.contains("Brush attempt 2"));
+            assert!(!value.to_string().contains("GPU-secret-uuid"));
+            assert!(!value.to_string().contains("C:/private"));
+        }
+        // A log line, even explicit-looking, cannot fill a missing execution snapshot.
+        let id = service.capture(None, None, None, "failed", None, &[]).await;
+        service
+            .reports
+            .lock()
+            .unwrap()
+            .failures
+            .get_mut(&id)
+            .unwrap()
+            .report
+            .log_tail = "using adapter: NVIDIA Actual".into();
+        assert!(service
+            .prepare_with(id, || async { blank_environment() })
+            .await
+            .unwrap()
+            .report
+            .environment
+            .actual_device
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn new_reports_use_the_same_root_classification_without_a_wire_schema_change() {
+        let service = DiagnosticService::default();
+        for (kind, phrase) in [
+            ("brush_out_of_memory", "GPU memory was exhausted"),
+            (
+                "brush_resource_limit",
+                "does not necessarily mean GPU memory was exhausted",
+            ),
+            ("colmap_crash", "underlying cause is not yet known"),
+        ] {
+            let id = service.capture(None, None, Some(kind), "exit_code: Some(-1073740940) (0xC0000374)\nFailed to read counts\nAn IO error happened", None, &[]).await;
+            let reports = service.reports.lock().unwrap();
+            let report = &reports.failures[&id].report;
+            assert_eq!(report.error_code, kind);
+            assert!(report.reason.contains(phrase));
+            assert!(report.detail.contains("-1073740940"));
+            assert!(report.detail.contains("0xC0000374"));
+            let json = serde_json::to_value(report).unwrap();
+            assert_eq!(json["schemaVersion"], 1);
+            assert_eq!(json.as_object().unwrap().len(), 12);
+            assert!(!json.as_object().unwrap().contains_key("termination"));
+        }
+    }
 
     #[test]
     fn diagnostic_default_uses_the_existing_telemetry_address() {
@@ -679,7 +896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_explicit_engine_logs_identify_the_actual_gpu() {
+    async fn only_frozen_execution_evidence_identifies_the_actual_gpu() {
         let service = DiagnosticService::default();
         let id = service
             .capture(
@@ -691,6 +908,18 @@ mod tests {
                 &[],
             )
             .await;
+        service
+            .reports
+            .lock()
+            .unwrap()
+            .failures
+            .get_mut(&id)
+            .unwrap()
+            .actual_device = Some(crate::pipeline::brush_execution::BrushDeviceSnapshot {
+            name: "Intel GPU".into(),
+            total_memory_mb: None,
+            driver_version: Some("32.0.1".into()),
+        });
         service
             .reports
             .lock()

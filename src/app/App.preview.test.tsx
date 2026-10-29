@@ -7,9 +7,11 @@ import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import { LanguageProvider } from "../i18n";
 import type { ProjectSummary } from "../types/pipeline";
+import packageMetadata from '../../package.json';
 
 const mocks = vi.hoisted(() => ({
   cancelPipeline: vi.fn(),
+  checkAppUpdate: vi.fn(),
   estimateProjectRuntime: vi.fn(),
   exportPly: vi.fn(),
   prepareGaussianPreview: vi.fn(),
@@ -28,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   setTelemetryConsent: vi.fn(),
   selectVideo: vi.fn(),
   selectImageSequence: vi.fn(),
+  selectGaussianImportSource: vi.fn(),
   probeAndPlan: vi.fn(),
   confirmLargeImageSequence: vi.fn(),
   confirmSmallImageSequence: vi.fn(),
@@ -40,6 +43,8 @@ const mocks = vi.hoisted(() => ({
   classifyDroppedInput: vi.fn(),
   onInputDragDrop: vi.fn(),
 }));
+
+vi.mock("../lib/updates", () => ({ checkAppUpdate: mocks.checkAppUpdate, copyUpdateText: vi.fn() }));
 
 vi.mock("../lib/backend", () => ({
   cancelPipeline: mocks.cancelPipeline,
@@ -72,6 +77,7 @@ vi.mock("../lib/backend", () => ({
   revealFile: mocks.revealFile,
   selectProjectsRoot: vi.fn(),
   selectImageSequence: mocks.selectImageSequence,
+  selectGaussianImportSource: mocks.selectGaussianImportSource,
   selectVideo: mocks.selectVideo,
   setProjectsRoot: vi.fn(),
   setTelemetryConsent: mocks.setTelemetryConsent,
@@ -128,6 +134,7 @@ describe("App preview workspace", () => {
       window.cancelAnimationFrame = (handle) => window.clearTimeout(handle);
     }
     useGaussianTransformStore.getState().close();
+    mocks.checkAppUpdate.mockReset().mockResolvedValue(null);
     mocks.getSharedTasks.mockReset().mockResolvedValue([]);
     mocks.onTaskUpdate.mockReset().mockResolvedValue(() => undefined);
     useAppStore.setState({
@@ -137,6 +144,7 @@ describe("App preview workspace", () => {
     });
     mocks.prepareGaussianPreview.mockReset();
     mocks.classifyDroppedInput.mockReset().mockResolvedValue({ inputType: "video" });
+    mocks.selectGaussianImportSource.mockReset().mockResolvedValue(null);
     mocks.onInputDragDrop.mockReset().mockResolvedValue(() => undefined);
     mocks.cancelPipeline.mockReset().mockResolvedValue(undefined);
     mocks.estimateProjectRuntime.mockReset().mockResolvedValue({
@@ -198,6 +206,7 @@ describe("App preview workspace", () => {
       sourceImageCount: 100,
       eligible: true,
       reason: null,
+      imported: false,
     });
     mocks.probeReshootInput.mockReset();
     mocks.startReshootPipeline.mockReset();
@@ -234,9 +243,37 @@ describe("App preview workspace", () => {
     window.localStorage.clear();
   });
 
+  it("exposes the specific failed engine and its diagnostics", async () => {
+    await act(async () => {
+      useAppStore.setState({ engines: [{
+        kind: "ffprobe", path: "E:\\engines\\ffprobe.exe", exists: true,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "exit code -1073741515\nMissing runtime dependency",
+      }, {
+        kind: "ffmpeg", path: "E:\\engines\\ffmpeg.exe", exists: false,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "Executable not found",
+      }] });
+    });
+    const { checkEngines } = await import('../lib/backend');
+    const previousChecks = vi.mocked(checkEngines).mock.calls.length;
+    const details = container.querySelector<HTMLElement>(".engine-diagnostics")!;
+    const trigger = details.querySelector<HTMLButtonElement>(".engine-summary")!;
+    expect(trigger.textContent).toBe("2 个引擎异常");
+    expect(trigger.textContent).not.toMatch(/ffmpeg|ffprobe|colmap|brush/i);
+    expect(details.querySelector(".engine-diagnostics-panel")).toBeNull();
+    await act(async () => { trigger.focus(); });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(details.textContent).toContain("FFprobe");
+    expect(details.textContent).toContain("E:\\engines\\ffprobe.exe");
+    expect(details.querySelector('.engine-item-flags')?.textContent).toContain("可启动否");
+    expect(details.textContent).toContain("Missing runtime dependency");
+    expect(vi.mocked(checkEngines).mock.calls.length).toBe(previousChecks);
+  });
+
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
-    expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.6.0");
+    expect(container.querySelector(".version-tag")?.textContent).toBe(`LOCAL / ${packageMetadata.version}`);
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
@@ -254,6 +291,44 @@ describe("App preview workspace", () => {
     expect(tooltip?.textContent).toContain("AI 生成图片容易出现");
   });
 
+  it('accepts a portrait MOV as ordinary video without a panorama warning or extra confirmation', async () => {
+    mocks.selectVideo.mockResolvedValueOnce('E:/Download/LocalSend/IMG_8023.MOV');
+    mocks.probeAndPlan.mockResolvedValueOnce({
+      inputType: 'video', video: { duration: 10, width: 1920, height: 1080, rotation: -90 }, imageSequence: null,
+      plan: { estimatedFrames: 60 }, projectionDetection: { sourceIdentity: 'phone-mov', confirmedErp: false, requiresChoice: false, supportedErp: false, unsupported: false, reason: '', previewJpeg: [] },
+    });
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.media-source-status')?.textContent).toContain('将按普通视频处理');
+    expect(container.querySelector('.media-source-warning, .video-type-select')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startPipeline).toHaveBeenCalledWith('E:/Download/LocalSend/IMG_8023.MOV', 'balanced', 'E:\\Projects', true, expect.any(String), 'auto', 'phone-mov', 'exhaustive', { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
+  });
+
+  it("requires an inline choice for ambiguous ERP and never opens a projection dialog", async () => {
+    mocks.selectVideo.mockResolvedValueOnce("E:/panorama.mp4");
+    mocks.probeAndPlan.mockResolvedValueOnce({ inputType: "video", video: { duration: 10, width: 3840, height: 1920 }, imageSequence: null, plan: { estimatedFrames: 60 }, projectionDetection: { sourceIdentity: 'source-A', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: "2:1", previewJpeg: [] } });
+    await act(async () => container.querySelector<HTMLButtonElement>(".input-picker > .path-picker")!.click()); await flush();
+    const select = container.querySelector<HTMLSelectElement>('.video-type-select')!;
+    expect(select.value).toBe('');
+    expect(container.querySelector<HTMLButtonElement>(".primary-action")!.disabled).toBe(true);
+    expect(container.querySelector(".panorama-preview")).toBeNull();
+    await act(async () => { select.value = 'equirectangular'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(container.querySelector('.media-source-status')?.textContent).toContain('已选择完整全景视频');
+    expect(container.querySelector('.media-source-status')?.textContent).not.toContain('已识别完整 ERP 元数据');
+    expect(container.querySelector<HTMLButtonElement>(".primary-action")!.disabled).toBe(false);
+    // The choice remains editable, and only the final choice is submitted.
+    await act(async () => { select.value = 'perspective'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>(".primary-action")!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startPipeline.mock.calls[0].slice(5, 8)).toEqual(['perspective', 'source-A', 'exhaustive']);
+  });
+
   it("keeps settings available and persists the runtime monitor preference locally", async () => {
     const settingsButton = container.querySelector<HTMLButtonElement>(".settings-action:not(.language-action)")!;
     expect(settingsButton).not.toBeNull();
@@ -262,6 +337,223 @@ describe("App preview workspace", () => {
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("界面");
     await act(async () => container.querySelector<HTMLButtonElement>(".settings-switch")!.click());
     expect(window.localStorage.getItem("ooo-splat-ui-preferences-v1")).toContain('"showRuntimePanel":true');
+  });
+
+  it('requires inline choices for all drafts before enabling the queue without starting any task', async () => {
+    const probe = { inputType: 'video', video: { duration: 10, width: 3840, height: 1920 }, imageSequence: null, plan: { estimatedFrames: 60 }, projectionDetection: { sourceIdentity: 'first', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '2:1', previewJpeg: [] } };
+    mocks.probeAndPlan.mockResolvedValueOnce(probe).mockResolvedValueOnce({ ...probe, projectionDetection: { ...probe.projectionDetection, sourceIdentity: 'second' } });
+    mocks.selectVideo.mockResolvedValueOnce('E:/first.mp4').mockResolvedValueOnce('E:/second.mp4');
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.group-add-action')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(container.querySelector('.queue-input-notice')?.textContent).toContain('first.mp4');
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    const choose = async (value: string) => { await act(async () => { const select = container.querySelector<HTMLSelectElement>('.video-type-select')!; select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }); };
+    await choose('equirectangular');
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.queue-input-notice')?.textContent).toContain('second.mp4');
+    await choose('perspective');
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('true');
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+    const saved = JSON.parse(localStorage.getItem('ooo-splat-task-workspace-v1')!);
+    expect(saved.drafts.filter((d: { projectionAnswer?: unknown }) => d.projectionAnswer).map((d: { projectionAnswer: { projection: string } }) => d.projectionAnswer.projection)).toEqual(['equirectangular', 'perspective']);
+  });
+
+  it('disables the queue for new ambiguous input and requires manual re-enabling after choosing', async () => {
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('true');
+    mocks.selectVideo.mockResolvedValueOnce('E:/later.mp4');
+    mocks.probeAndPlan.mockResolvedValueOnce({ inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 }, projectionDetection: { sourceIdentity: 'later', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '', previewJpeg: [] } });
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.queue-input-notice')?.textContent).toContain('later.mp4');
+    await act(async () => { const select = container.querySelector<HTMLSelectElement>('.video-type-select')!; select.value = 'perspective'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+    expect(mocks.cancelPipeline).not.toHaveBeenCalled();
+  });
+
+  it('automatically starts confirmed ERP without a projection question', async () => {
+    mocks.selectVideo.mockResolvedValueOnce('E:/confirmed.mp4');
+    mocks.probeAndPlan.mockResolvedValueOnce({ inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 }, projectionDetection: { sourceIdentity: 'confirmed', confirmedErp: true, requiresChoice: false, supportedErp: true, reason: '', previewJpeg: [] } });
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline.mock.calls.at(-1)?.slice(5, 8)).toEqual(['equirectangular', 'confirmed', 'exhaustive']);
+  });
+
+  it('replans manual base sampling from cached metadata, resets on quality change, and does not replan retry consent', async () => {
+    const video = { duration:60,width:1920,height:1080,fps:30,totalFrames:1800,hasAlpha:false };
+    const projectionDetection = {sourceIdentity:'sampling-input',confirmedErp:false,requiresChoice:false,supportedErp:false,reason:'',previewJpeg:[]};
+    mocks.selectVideo.mockResolvedValueOnce('E:/sampling.mp4');
+    const metadata = {inputType:'video',video,projectionDetection,imageSequence:null,plan:{estimatedFrames:480}};
+    mocks.probeAndPlan.mockResolvedValue(metadata);
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('26.7%');
+    const slider = container.querySelector<HTMLInputElement>('.frame-sampling-control input')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(slider,'8');
+      slider.dispatchEvent(new Event('input',{bubbles:true}));
+      slider.dispatchEvent(new Event('change',{bubbles:true}));
+    }); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('70.0%');
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[3]).toMatchObject({video,projectionDetection});
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[5]).toEqual({version:3,autoRetryEnabled:true,frameSamplingRatio:.7});
+    const calls = mocks.probeAndPlan.mock.calls.length;
+    await act(async () => container.querySelector<HTMLButtonElement>('.planner-switch')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(calls);
+    await act(async () => container.querySelectorAll<HTMLButtonElement>('.quality-option')[2].click()); await flush();
+    expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('40.0%');
+    expect(mocks.probeAndPlan.mock.calls.at(-1)?.[5]).toEqual({version:3,autoRetryEnabled:false,frameSamplingRatio:null});
+  });
+
+  it.each(['perspective', 'equirectangular'] as const)('replans quality without redetecting %s or resetting the chosen type', async projection => {
+    const video = { duration: 10, width: 200, height: 100 };
+    const projectionDetection = { sourceIdentity: 'same-source', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '', previewJpeg: [] };
+    const probe = { inputType: 'video', video, projectionDetection, imageSequence: null, plan: { estimatedFrames: 20 } };
+    mocks.selectVideo.mockResolvedValueOnce('E:/clip.mp4');
+    mocks.probeAndPlan.mockResolvedValueOnce(probe);
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => { const select = container.querySelector<HTMLSelectElement>('.video-type-select')!; select.value = projection; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    let finish!: (value: unknown) => void;
+    mocks.probeAndPlan.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
+    expect(container.querySelector('.media-source-status.checking')).toBeNull();
+    expect(container.querySelector<HTMLSelectElement>('.video-type-select')?.value).toBe(projection);
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(true);
+    // A rapid second change is folded into the pending plan, never another source probe.
+    await act(async () => container.querySelectorAll<HTMLButtonElement>('.quality-option')[2].click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(2);
+    mocks.probeAndPlan.mockResolvedValueOnce({ ...probe, plan: { estimatedFrames: 80 } });
+    await act(async () => finish(probe)); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'high', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
+    expect(container.querySelector<HTMLSelectElement>('.video-type-select')?.value).toBe(projection);
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('.quality-option.selected')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(3);
+    mocks.probeAndPlan.mockResolvedValueOnce(probe);
+    await act(async () => container.querySelector<HTMLButtonElement>('.planner-switch')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(3);
+    expect(container.querySelector('.planner-switch')?.getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('finishes the initial video detection once and plans with the latest quality', async () => {
+    const video = { duration: 10, width: 200, height: 100 };
+    const projectionDetection = { sourceIdentity: 'initial', confirmedErp: true, requiresChoice: false, supportedErp: true, reason: '', previewJpeg: [] };
+    const probe = { inputType: 'video', video, projectionDetection, imageSequence: null, plan: { estimatedFrames: 20 } };
+    let finish!: (value: unknown) => void;
+    mocks.selectVideo.mockResolvedValueOnce('E:/clip.mp4');
+    mocks.probeAndPlan.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click()); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.media-source-status.checking')).not.toBeNull();
+    mocks.probeAndPlan.mockResolvedValueOnce(probe);
+    await act(async () => finish(probe)); await flush();
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/clip.mp4', 'fast', true, { inputType: 'video', video, imageSequence: null, projectionDetection }, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
+    expect(container.querySelector('.media-source-status.checking')).toBeNull();
+    expect(container.querySelector('.media-source-status')?.textContent).toContain('已识别完整 ERP');
+  });
+
+  it('shows an empty prompt and loading, ignores late analysis and invalidates changed-source choices', async () => {
+    expect(container.querySelector('.source-input-card .path-picker strong')?.textContent).toBe('请输入视频文件或图片文件夹');
+    expect(container.querySelector('.input-picker > .path-picker.media-path > svg')).toBeNull();
+    expect(container.querySelector('.input-picker-toggle > svg')).not.toBeNull();
+    const probe = { inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 }, projectionDetection: { sourceIdentity: 'A', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '', previewJpeg: [] } };
+    let first!: (value: unknown) => void, second!: (value: unknown) => void;
+    mocks.probeAndPlan.mockImplementationOnce(() => new Promise(resolve => { first = resolve; })).mockImplementationOnce(() => new Promise(resolve => { second = resolve; }));
+    mocks.selectVideo.mockResolvedValueOnce('E:/first.mp4').mockResolvedValueOnce('E:/second.mp4');
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.source-input-card .checking')?.textContent).toBe('正在检测视频类型…');
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')!.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => first({ ...probe, projectionDetection: { ...probe.projectionDetection, confirmedErp: true, requiresChoice: false } })); await flush();
+    expect(container.querySelector('.checking')).not.toBeNull();
+    expect(container.querySelector('.media-source-status')?.textContent).not.toContain('已识别');
+    await act(async () => second(probe)); await flush();
+    await act(async () => { const select = container.querySelector<HTMLSelectElement>('.video-type-select')!; select.value = 'equirectangular'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    mocks.probeAndPlan.mockResolvedValueOnce({ ...probe, projectionDetection: { ...probe.projectionDetection, sourceIdentity: 'B' } });
+    await act(async () => container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click()); await flush();
+    expect(container.querySelector<HTMLSelectElement>('.video-type-select')!.value).toBe('');
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')!.disabled).toBe(true);
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-start an unconfirmed input when it finishes analysis after the current task', async () => {
+    const probe = { inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 } };
+    let finishAnalysis!: (value: unknown) => void;
+    mocks.probeAndPlan.mockResolvedValueOnce(probe).mockImplementationOnce(() => new Promise(resolve => { finishAnalysis = resolve; }));
+    mocks.selectVideo.mockResolvedValueOnce('E:/running.mp4').mockResolvedValueOnce('E:/unknown.mp4');
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    let finishRun!: (value: unknown) => void;
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(resolve => { finishRun = resolve; }));
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    const workspaceTaskId = mocks.startPipeline.mock.calls[0][4];
+    mocks.getProjectOverview.mockResolvedValue({ projectsRoot: 'E:/Projects', projects: [{ ...project, workspaceTaskId }] });
+    await act(async () => container.querySelectorAll<HTMLElement>('.draft-row')[1].click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('true');
+    await act(async () => finishRun({ projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly, fileSize: 10, splatCount: 10, inputImages: 6, registeredImages: 6, registeredRatio: 1, points3d: 10, durationMs: 1, completedAt: project.completedAt, warning: null, logsDirectory: 'E:/logs' })); await flush();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    await act(async () => finishAnalysis({ ...probe, projectionDetection: { sourceIdentity: 'unknown', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '', previewJpeg: [] } })); await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.video-type-select')).not.toBeNull();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.cancelPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each(['completed', 'failed'] as const)('shows saved panorama processing in the %s project media box', async status => {
+    await act(async () => useAppStore.getState().setProjects([{ ...project, status }]));
+    mocks.getProjectTaskDetail.mockResolvedValueOnce({ project: { ...project, status }, inputType: 'video', videoProjection: 'equirectangular', sourcePath: 'E:/old.mp4', projectsRoot: 'E:/Projects', plannerEnabled: true, stage: 'trainingSplats', progress: 60, logs: [] });
+    const group = status === 'completed' ? '#completed-task-group-content' : '#unfinished-task-group-content';
+    await act(async () => container.querySelector<HTMLElement>(`${group} .project-row`)!.click()); await flush();
+    expect(container.querySelector('.source-input-card.readonly .media-source-status')?.textContent).toContain('本任务按全景视频处理');
+    expect(container.querySelector('.source-input-card select')).toBeNull();
+    expect(mocks.probeAndPlan).not.toHaveBeenCalled();
+  });
+
+  it('rejects image-order answers if the draft changes while confirmation is open', async () => {
+    const probe = { inputType: 'images', video: null, imageSequence: { imageCount: 101, width: 200, height: 100, requiresLargeSequenceConfirmation: false }, plan: { estimatedFrames: 101 }, projectionDetection: null };
+    mocks.selectVideo.mockResolvedValueOnce('E:/photos');
+    mocks.probeAndPlan.mockResolvedValue(probe);
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLInputElement>('.preflight-accept input')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')!.click()); await flush();
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+    expect(container.querySelector('.inline-error')?.textContent).toContain('素材或任务配置已变化');
+  });
+
+  it('waits for in-flight analysis when a running task finishes during queue activation', async () => {
+    const probe = { inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 } };
+    let finishAnalysis!: (value: unknown) => void;
+    mocks.probeAndPlan.mockResolvedValueOnce(probe).mockImplementationOnce(() => new Promise(resolve => { finishAnalysis = resolve; }));
+    mocks.selectVideo.mockResolvedValueOnce('E:/running.mp4').mockResolvedValueOnce('E:/next.mp4');
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    let finishRun!: (value: unknown) => void;
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(resolve => { finishRun = resolve; })).mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    const workspaceTaskId = mocks.startPipeline.mock.calls[0][4];
+    mocks.getProjectOverview.mockResolvedValue({ projectsRoot: 'E:/Projects', projects: [{ ...project, workspaceTaskId }] });
+    await act(async () => container.querySelectorAll<HTMLElement>('.draft-row')[1].click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    await act(async () => finishRun({ projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly, fileSize: 10, splatCount: 10, inputImages: 6, registeredImages: 6, registeredRatio: 1, points3d: 10, durationMs: 1, completedAt: project.completedAt, warning: null, logsDirectory: 'E:/logs' })); await flush();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    await act(async () => finishAnalysis(probe)); await flush(); await flush();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(2);
+    expect(mocks.startPipeline.mock.calls[1][0]).toBe('E:/next.mp4');
   });
 
   it("adds, selects, and deletes independent standby drafts while retaining one", async () => {
@@ -287,6 +579,92 @@ describe("App preview workspace", () => {
     await act(async () => remove[1].click());
     await act(async () => container.querySelector<HTMLButtonElement>(".draft-row .danger-link")?.click());
     expect(container.querySelectorAll(".draft-row")).toHaveLength(1);
+  });
+
+  it("offers file and folder imports from the completed group", async () => {
+    const heading = container.querySelector<HTMLElement>(".completed-task-group .group-heading")!;
+    const toggle = heading.querySelector<HTMLButtonElement>(".group-toggle")!;
+    const add = container.querySelector<HTMLButtonElement>(".completed-import-actions .group-add-action")!;
+    const count = heading.querySelector<HTMLElement>(".group-count")!;
+    expect(add.textContent).toContain("导入");
+    expect(heading.children[0]).toBe(toggle);
+    expect(heading.children[1]).toBe(add.parentElement);
+    expect(heading.children[2]).toBe(count);
+    await act(async () => add.click());
+    const actions = container.querySelectorAll<HTMLButtonElement>(".completed-import-menu button");
+    expect(Array.from(actions, button => button.textContent)).toEqual(["导入文件", "导入文件夹"]);
+    await act(async () => actions[0].click());
+    expect(mocks.selectGaussianImportSource).toHaveBeenCalledWith("file");
+  });
+
+  it("uses the completed-project layout for imported models and hides irrelevant detail sections", async () => {
+    const importedProject: ProjectSummary = {
+      ...project,
+      id: "33333333-3333-3333-3333-333333333333",
+      name: "WuKong",
+      taskKind: "import",
+      durationMs: null,
+      quality: null,
+      modelFormat: "ply",
+      registeredRatio: null,
+      points3d: 618_770,
+    };
+    mocks.getProjectTaskDetail.mockResolvedValueOnce({
+      project: importedProject,
+      inputType: null,
+      sourcePath: "E:\\GaussianSplatting\\WuKong\\wukong_final.ply",
+      projectsRoot: "E:\\Projects",
+      plannerEnabled: null,
+      estimatedFrames: null,
+      stage: null,
+      progress: null,
+      inputImages: null,
+      registeredImages: null,
+      video: null,
+      imageSequence: null,
+      sourceProjectId: null,
+      logs: [],
+      imported: {
+        sourceModelPath: "E:\\GaussianSplatting\\WuKong\\wukong_final.ply",
+        format: "ply",
+        sourceAvailable: true,
+        colmapRoot: "E:\\GaussianSplatting\\WuKong",
+        sparseModelPath: "E:\\GaussianSplatting\\WuKong",
+        databaseAvailable: false,
+        imagesAvailable: false,
+        reshootEligible: false,
+        reshootReason: "缺少 database.db",
+      },
+    });
+    await act(async () => useAppStore.getState().setProjects([importedProject]));
+    await flush();
+
+    const row = container.querySelector<HTMLElement>("#completed-task-group-content .project-row")!;
+    expect(Array.from(row.querySelectorAll(".project-stats dt"), node => node.textContent)).toEqual(["PLY", "生成日期", "耗时", "档位"]);
+    expect(Array.from(row.querySelectorAll(".project-stats dd"), node => node.textContent).slice(2)).toEqual(["/", "/"]);
+    expect(row.querySelector(".project-stats")?.textContent).not.toContain("Gaussian 模型");
+
+    await act(async () => row.click());
+    await flush();
+    const detail = container.querySelector<HTMLElement>(".project-detail-page")!;
+    expect(detail.querySelector(".project-detail-stats")?.children).toHaveLength(4);
+    expect(detail.querySelector(".project-configuration-detail")).not.toBeNull();
+    expect(detail.querySelector(".path-picker")?.textContent).toContain("wukong_final.ply");
+    expect(detail.querySelectorAll(".form-section")).toHaveLength(1);
+    expect(detail.textContent).not.toContain("COLMAP");
+    expect(detail.querySelector(".quality-settings")).toBeNull();
+    expect(detail.querySelector(".acceleration-status")).toBeNull();
+    expect(detail.querySelector(".live-process")).toBeNull();
+  });
+
+  it("sorts completed projects newest first so a fresh import appears at the top", async () => {
+    const oldest = { ...project, id: "00000000-0000-0000-0000-000000000001", name: "Old", completedAt: "2026-10-15T08:00:00Z" };
+    const generated = { ...project, id: "00000000-0000-0000-0000-000000000002", name: "Generated", completedAt: "2026-10-16T08:00:00Z" };
+    const imported = { ...project, id: "00000000-0000-0000-0000-000000000003", name: "Imported", taskKind: "import" as const, quality: null, completedAt: "2026-10-17T08:00:00Z" };
+    await act(async () => useAppStore.getState().setProjects([generated, oldest, imported]));
+    await flush();
+
+    expect(Array.from(container.querySelectorAll("#completed-task-group-content .project-title-line strong"), node => node.textContent)).toEqual(["Imported", "Generated", "Old"]);
   });
 
   it("keeps auto-run session-only and uses a non-button drag indicator", async () => {
@@ -392,7 +770,7 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(mocks.classifyDroppedInput).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov");
-    expect(mocks.probeAndPlan).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov", "balanced", true);
+    expect(mocks.probeAndPlan).toHaveBeenCalledWith("E:\\素材\\测试 clip.mov", "balanced", true, undefined, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     expect(container.querySelector(".draft-row .project-path")?.textContent).toContain("测试 clip.mov");
   });
 
@@ -498,7 +876,7 @@ describe("App preview workspace", () => {
     await act(async () => planner.click());
     await flush();
     expect(planner.getAttribute("aria-checked")).toBe("false");
-    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith("E:\\Media\\next.mp4", "balanced", false);
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith("E:\\Media\\next.mp4", "balanced", true, undefined, expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
     await act(async () => container.querySelector<HTMLButtonElement>(".group-add-action")?.click());
     expect(container.querySelector<HTMLButtonElement>(".planner-switch")?.getAttribute("aria-checked")).toBe("true");
 
@@ -691,15 +1069,17 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".reshoot-workflow-dialog")).toBeNull();
     expect(container.querySelector(".reshoot-task-page")).not.toBeNull();
     expect(container.querySelector(".reshoot-source-summary")).toBeNull();
-    expect(container.querySelectorAll(".reshoot-task-page .quality-option:disabled")).toHaveLength(3);
-    expect(container.querySelector(".reshoot-task-page .locked-setting")?.textContent).toContain("继承源任务 · 不可修改");
-    expect(container.querySelector(".reshoot-task-page .locked-quality-settings .quality-option.selected")).not.toBeNull();
-    expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.disabled).toBe(true);
+    expect(container.querySelector('.reshoot-capture-tips')).toBeNull();
+    expect(container.querySelector('.reshoot-task-page')?.textContent).not.toContain('让补拍画面与原素材保持足够重叠，缓慢移动并避免模糊和大量运动物体。');
+    expect(container.querySelectorAll(".reshoot-task-page .quality-option:disabled")).toHaveLength(0);
+    expect(container.querySelector(".reshoot-task-page .locked-setting")).toBeNull();
+    expect(container.querySelector(".reshoot-task-page .quality-option.selected")).not.toBeNull();
+    expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.disabled).toBe(false);
     expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")?.getAttribute("aria-checked")).toBe("true");
     expect(container.querySelector(".reshoot-task-page .planner-switch em")).toBeNull();
   });
 
-  it("shows automatic optimization as locked off when the source task disabled it", async () => {
+  it("defaults automatic retry to enabled independently of legacy source optimization", async () => {
     mocks.inspectReshootSource.mockResolvedValueOnce({
       projectId: project.id,
       projectName: project.name,
@@ -718,12 +1098,76 @@ describe("App preview workspace", () => {
     await flush();
 
     const planner = container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch");
-    expect(planner?.disabled).toBe(true);
-    expect(planner?.getAttribute("aria-checked")).toBe("false");
+    expect(planner?.disabled).toBe(false);
+    expect(planner?.getAttribute("aria-checked")).toBe("true");
     expect(planner?.textContent).not.toContain("继承源任务");
   });
 
-  it("probes Alpha reshoot media and blocks a mismatched camera resolution", async () => {
+  it("lets imported projects choose the reshoot quality and automatic optimization", async () => {
+    const importedProject: ProjectSummary = {
+      ...project,
+      taskKind: "import",
+      quality: null,
+      modelFormat: "spz",
+      reshootEligible: true,
+    };
+    mocks.inspectReshootSource.mockResolvedValueOnce({
+      projectId: importedProject.id,
+      projectName: importedProject.name,
+      quality: "balanced",
+      plannerEnabled: true,
+      cameraId: 1,
+      cameraModel: "SIMPLE_RADIAL",
+      width: 1920,
+      height: 1080,
+      sourceImageCount: 100,
+      eligible: true,
+      reason: null,
+      imported: true,
+    });
+    await act(async () => useAppStore.setState({ projects: [importedProject] }));
+    await act(async () => container.querySelector<HTMLButtonElement>(".reshoot-link")?.click());
+    await flush();
+
+    const qualityButtons = container.querySelectorAll<HTMLButtonElement>(".reshoot-task-page .quality-option");
+    expect(Array.from(qualityButtons).every(button => !button.disabled)).toBe(true);
+    expect(container.querySelector(".reshoot-task-page .locked-setting")).toBeNull();
+    await act(async () => qualityButtons[2].click());
+    expect(qualityButtons[2].getAttribute("aria-checked")).toBe("true");
+    const planner = container.querySelector<HTMLButtonElement>(".reshoot-task-page .planner-switch")!;
+    expect(planner.disabled).toBe(false);
+    await act(async () => planner.click());
+    expect(planner.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it.each([false, true].flatMap(allowFallback => ['same', 'different', 'unsure'].map(cameraRelation => ({ allowFallback, cameraRelation }))))('starts reshoot after both answers (Auto Optimize=$allowFallback, camera=$cameraRelation)', async ({ allowFallback, cameraRelation }) => {
+    mocks.inspectReshootSource.mockResolvedValue({ projectId:project.id,projectName:project.name,quality:'balanced',plannerEnabled:true,cameraId:1,cameraModel:'SIMPLE_RADIAL',width:1920,height:1080,sourceImageCount:100,eligible:true,reason:null,sourceIdentity:'source-v1',projection:'perspective',warmAvailable:true });
+    mocks.selectVideo.mockResolvedValue('E:/new-camera.mov');
+    mocks.probeReshootInput.mockResolvedValue({ inputType:'video',imageCount:null,duration:12,preparedWidth:1280,preparedHeight:1920,estimatedFrames:30,hasAlpha:false,maskCount:0,compatible:true,incompatibilityReason:null,sourceIdentity:'input-v1',estimate:{estimatedMs:1000,lowerBoundMs:500,upperBoundMs:2000,confidence:'low',sampleCount:0,basis:''} });
+    mocks.startReshootPipeline.mockImplementation(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-link')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .input-picker > .path-picker')!.click()); await flush();
+    if (!allowFallback) await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .planner-switch')!.click());
+    expect(container.querySelector<HTMLButtonElement>('.reshoot-task-page .planner-switch')?.getAttribute('aria-checked')).toBe(String(allowFallback));
+    await act(async () => container.querySelector<HTMLButtonElement>('.reshoot-task-page .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    expect(container.querySelectorAll('.preflight-dialog input:checked')).toHaveLength(0);
+    await act(async () => container.querySelector<HTMLInputElement>('.preflight-dialog input[value="good"]')!.click());
+    expect(container.querySelector('.preflight-dialog input[type="checkbox"]')).toBeNull();
+    expect(container.querySelector('.preflight-dialog')?.textContent).not.toContain('补拍方案');
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+    expect(container.querySelector('.preflight-dialog h2')?.textContent).toBe('补拍素材与原素材的拍摄设置相同吗？');
+    expect(container.querySelector('.preflight-dialog input:checked')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')?.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLInputElement>(`.preflight-dialog input[value="${cameraRelation}"]`)!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer .primary-action')!.click()); await flush();
+    expect(mocks.startReshootPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startReshootPipeline).toHaveBeenCalledWith(expect.objectContaining({plannerEnabled:true,generationPolicy:expect.objectContaining({autoRetryEnabled:allowFallback}),reshootOptions:expect.objectContaining({condition:'good',cameraRelation,allowFallback,sourceIdentity:'source-v1',inputIdentity:'input-v1',projection:'perspective'})}));
+  });
+
+  it("probes Alpha reshoot media and preserves a backend incompatibility refusal", async () => {
     mocks.selectVideo.mockResolvedValue("E:\\Capture\\reshoot.mov");
     mocks.probeReshootInput.mockResolvedValue({
       inputType: "video",
@@ -742,10 +1186,12 @@ describe("App preview workspace", () => {
     await act(async () => { reshootButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
     const videoButton = container.querySelector<HTMLButtonElement>(".reshoot-task-page .input-picker > .path-picker");
+    expect(videoButton?.classList.contains("media-path")).toBe(true);
+    expect(videoButton?.querySelector("svg")).toBeNull();
     await act(async () => { videoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
 
-    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video");
+    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video", "balanced", true, { version: 3, autoRetryEnabled: true, frameSamplingRatio: null }, undefined);
     expect(container.querySelector(".reshoot-plan.incompatible")?.textContent).toContain("1080 × 1920");
     expect(container.querySelector<HTMLButtonElement>(".reshoot-task-page .primary-action")?.disabled).toBe(true);
   });
@@ -807,6 +1253,27 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".preview-workspace")).not.toBeNull();
   });
 
+  it("defers a late startup update until preview closes without remounting the viewer", async () => {
+    let resolve!: (value: unknown) => void;
+    mocks.checkAppUpdate.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await act(async () => root.render(<LanguageProvider><App /></LanguageProvider>));
+    await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>(".preview-link")!.click());
+    await flush();
+    const viewer = container.querySelector(".preview-workspace");
+    await act(async () => resolve({ currentVersion: "0.6.0", status: "updateAvailable", checkedAt: "2026-10-11T08:00:00Z", fromCache: true,
+      release: { version: "0.6.1", publishedAt: "2026-10-11T08:00:00Z", notes: { "zh-CN": ["更新"], en: ["Update"] },
+        downloads: { github: "https://github.com/ooolabdev/ooosplat/releases/tag/0.6.1", quark: null, quarkCode: null } } }));
+    expect(container.querySelector(".preview-workspace")).toBe(viewer);
+    expect(container.querySelector(".update-notice-dialog")).toBeNull();
+    const back = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "返回任务")!;
+    await act(async () => back.click());
+    await flush();
+    expect(container.querySelector(".update-notice-dialog")).not.toBeNull();
+  });
+
   it("keeps the reshoot entry away from unfinished projects", async () => {
     const unfinished = { ...project, status: "cancelled" as const, finalPly: null, completedAt: null };
     await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
@@ -825,7 +1292,7 @@ describe("App preview workspace", () => {
     expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("Task List");
     expect(container.textContent).toContain("Start Generation");
-    expect(container.textContent).toContain("Checking bundled engines");
+    expect(container.textContent).toContain("Checking engines");
     expect(languageButton?.textContent).toContain("中文");
     expect(languageButton?.title).toBe("中英文切换 / Switch language");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
@@ -934,8 +1401,13 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(container.querySelector(".live-process")).toBeNull();
-    expect(container.querySelector(".inline-error")?.textContent).toContain("Unable to read the selected media");
+    expect(container.querySelector(".source-analysis-error")?.textContent).toContain("Unable to read the selected media");
+    expect(container.querySelector(".inline-error")).toBeNull();
     expect(container.textContent).not.toContain("old completed log");
+    mocks.probeAndPlan.mockResolvedValueOnce({ inputType: 'video', video: { duration: 1, width: 1920, height: 1080 }, imageSequence: null, plan: { estimatedFrames: 6 } });
+    await act(async () => container.querySelector<HTMLButtonElement>('.media-retry')!.click()); await flush();
+    expect(container.querySelector('.source-analysis-error')).toBeNull();
+    expect(container.querySelector('.media-source-status')?.textContent).toContain('将按普通视频处理');
   });
 
   it("offers to continue an unfinished project from its checkpoint", async () => {
@@ -993,6 +1465,27 @@ describe("App preview workspace", () => {
     await act(async () => { dialog?.querySelector<HTMLButtonElement>("button.primary")?.click(); });
     await flush();
     expect(mocks.resumePipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["brush_out_of_memory", "trainingSplats", "brush", "训练显存不足", "Not enough GPU memory for training"],
+    ["brush_resource_limit", "trainingSplats", "brush", "GPU 资源超出限制", "GPU resource limit exceeded"],
+    ["colmap_crash", "reconstructing", "colmap", "COLMAP 进程异常终止", "COLMAP terminated abnormally"],
+    ["mapper_storage", "reconstructing", "colmap", "重建文件访问失败", "Reconstruction file access failed"],
+    ["brush_dataset", "trainingSplats", "brush", "训练数据读取失败", "Training data could not be read"],
+    [undefined, "reconstructing", "colmap", "任务未能完成", "The task could not finish"],
+  ])("shows versioned %s guidance without inferring a different cause from raw logs", async (failureKind, failedStage, engine, zh, en) => {
+    const message = "wgpu error: Out of Memory\nAn IO error happened\nFailed to create any sparse model";
+    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message, failedStage, engine, failureKind, classificationVersion: 1, projectId: project.id });
+    await act(async () => useAppStore.setState({ projects: [{ ...project, status: "failed", finalPly: null, completedAt: null }] }));
+    await act(async () => [...container.querySelectorAll("button")].find(button => button.textContent === "继续任务")?.click());
+    await flush();
+    expect(container.querySelector(".failure-guidance-dialog h2")?.textContent).toBe(zh);
+    expect(container.querySelector(".inline-error .compact-error")?.textContent).toBe(zh);
+    expect(container.querySelector(".failure-guidance-dialog pre")?.textContent).toBe(message);
+    expect(container.querySelector(".failure-guidance-dialog")?.textContent).not.toContain("重新拍摄时缓慢");
+    await act(async () => container.querySelector<HTMLButtonElement>(".language-action")?.click());
+    expect(container.querySelector(".failure-guidance-dialog h2")?.textContent).toBe(en);
   });
 
   it("classifies Brush dataset read errors separately and translates the open dialog", async () => {
@@ -1303,6 +1796,30 @@ describe("App preview workspace", () => {
     expect(mocks.releaseGaussianPreview).toHaveBeenCalledTimes(3);
   });
 
+  it('publishes image type before hardware planning, blocks the queue, and reuses metadata on quality change',async()=>{
+    const projectionDetection={sourceIdentity:'photos-A',confirmedErp:false,requiresChoice:true,supportedErp:true,reason:'',previewJpeg:[]};
+    const metadata={inputType:'images',video:null,imageSequence:{imageCount:94,width:4096,height:2048,hasAlpha:false,requiresLargeSequenceConfirmation:false},projectionDetection};
+    let finish!:(v:unknown)=>void;
+    mocks.selectImageSequence.mockResolvedValueOnce('E:/Ballintoy/Input');
+    mocks.probeAndPlan.mockImplementationOnce((_p,_q,_enabled,_cached,onAnalyzed)=>{onAnalyzed(metadata);return new Promise(resolve=>{finish=resolve;});});
+    await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择输入素材类型"]')!.click());
+    await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.input-picker-menu button')].find(b=>b.textContent?.includes('图片'))!.click());
+    await act(async()=>container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click());await flush();
+    expect(container.querySelector('.media-source-status.checking')).toBeNull();
+    expect(container.querySelector<HTMLSelectElement>('select.video-type-select')?.getAttribute('aria-label')).toBe('请选择图片类型');
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(true);
+    await act(async()=>finish({...metadata,plan:{estimatedFrames:94}}));await flush();
+    await act(async()=>container.querySelector<HTMLButtonElement>('.queue-toggle')!.click());await flush();
+    expect(container.querySelector('.queue-input-notice')?.textContent).toBe('请先为「Input」选择图片类型，再开启自动执行。');
+    await act(async()=>{const select=container.querySelector<HTMLSelectElement>('select.video-type-select')!;select.value='equirectangular';select.dispatchEvent(new Event('change',{bubbles:true}));});
+    mocks.probeAndPlan.mockResolvedValueOnce({...metadata,plan:{estimatedFrames:94}});
+    await act(async()=>container.querySelector<HTMLButtonElement>('.quality-option:not(.selected)')!.click());await flush();
+    expect(mocks.probeAndPlan).toHaveBeenLastCalledWith('E:/Ballintoy/Input','fast',true,metadata,expect.any(Function), { version: 3, autoRetryEnabled: true, frameSamplingRatio: null });
+    expect(container.querySelector<HTMLSelectElement>('select.video-type-select')?.value).toBe('equirectangular');
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')?.disabled).toBe(false);
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+  });
+
   it("selects the input type on the left before opening the matching picker", async () => {
     mocks.selectImageSequence.mockResolvedValueOnce("E:\\Photos\\object");
     mocks.probeAndPlan.mockResolvedValueOnce({
@@ -1349,7 +1866,7 @@ describe("App preview workspace", () => {
     expect(container.querySelectorAll(".input-picker")).toHaveLength(1);
   });
 
-  it("requires confirmation before exhaustive matching more than 500 images", async () => {
+  it("requires one image-order question, not a second large-sequence warning, above 500 images", async () => {
     mocks.selectImageSequence.mockResolvedValueOnce("E:\\Photos\\large");
     mocks.probeAndPlan.mockResolvedValueOnce({
         inputType: "images",
@@ -1375,11 +1892,73 @@ describe("App preview workspace", () => {
     await act(async () => generate?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     await flush();
 
-    expect(mocks.confirmLargeImageSequence).toHaveBeenCalledWith(501);
+    expect(container.querySelector('.preflight-dialog')?.textContent).toContain('501');
+    expect(container.querySelector('.preflight-dialog')?.textContent).toContain('确认图片顺序');
+    expect(container.querySelector('.preflight-dialog')?.textContent).toContain('1/1');
+    expect(container.querySelectorAll('.preflight-dialog input[type="radio"]')).toHaveLength(2);
+    expect(mocks.confirmLargeImageSequence).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer > button')!.click());
     expect(mocks.startPipeline).not.toHaveBeenCalled();
   });
 
-  it("warns for fewer than 30 images, supports cancellation, and stops when the dialog fails", async () => {
+  it.each([
+    [100, 'perspective', 'exhaustive'],
+    [101, 'perspective', 'sequential'],
+    [500, 'equirectangular', 'exhaustive'],
+    [501, 'equirectangular', 'sequential'],
+  ] as const)('passes the confirmed strategy for %i %s images (%s)', async (count, projection, strategy) => {
+    mocks.selectVideo.mockResolvedValueOnce('E:/photos');
+    mocks.probeAndPlan.mockResolvedValueOnce({ inputType: 'images', video: null, imageSequence: { imageCount: count, width: 200, height: 100, hasAlpha: false, requiresLargeSequenceConfirmation: count > 500 }, plan: { estimatedFrames: count }, projectionDetection: { sourceIdentity: 'photos-identity', confirmedErp: projection === 'equirectangular', requiresChoice: false, supportedErp: projection === 'equirectangular', reason: '', previewJpeg: [] } });
+    mocks.startPipeline.mockImplementation(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => { container.querySelector<HTMLButtonElement>('.primary-action')!.click(); container.querySelector<HTMLButtonElement>('.primary-action')!.click(); }); await flush();
+    if (count > 100) {
+      const submit = container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')!;
+      expect(submit.disabled).toBe(true);
+      expect(container.querySelector('.preflight-dialog input:checked')).toBeNull();
+      expect(mocks.startPipeline).not.toHaveBeenCalled();
+      await act(async () => container.querySelector<HTMLInputElement>(`input[value="${strategy}"]`)!.click());
+      await act(async () => { submit.click(); submit.click(); }); await flush();
+    } else expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startPipeline.mock.calls[0][7]).toBe(strategy);
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+  });
+
+  it.each(['cancel', 'sequential', 'exhaustive'] as const)('waits on queued image order without skipping (%s)', async answer => {
+    const video = { inputType: 'video', video: { duration: 1, width: 200, height: 100 }, imageSequence: null, plan: { estimatedFrames: 6 } };
+    const images = { inputType: 'images', video: null, imageSequence: { imageCount: 101, width: 200, height: 100, hasAlpha: false, requiresLargeSequenceConfirmation: false }, plan: { estimatedFrames: 101 } };
+    mocks.probeAndPlan.mockResolvedValueOnce(video).mockResolvedValueOnce(images).mockResolvedValueOnce(video);
+    mocks.selectVideo.mockResolvedValueOnce('E:/running.mp4').mockResolvedValueOnce('E:/photos').mockResolvedValueOnce('E:/later.mp4');
+    let finishRun!: (result: unknown) => void;
+    mocks.startPipeline.mockImplementationOnce(() => new Promise(resolve => { finishRun = resolve; })).mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click()); await flush();
+    const workspaceTaskId = mocks.startPipeline.mock.calls[0][4];
+    mocks.getProjectOverview.mockResolvedValue({ projectsRoot: 'E:/Projects', projects: [{ ...project, workspaceTaskId }] });
+    await act(async () => container.querySelectorAll<HTMLElement>('.draft-row')[1].click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.group-add-action')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.input-picker > .path-picker')!.click()); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click()); await flush();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    await act(async () => finishRun({ projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly, fileSize: 10, splatCount: 10, inputImages: 6, registeredImages: 6, registeredRatio: 1, points3d: 10, durationMs: 1, completedAt: project.completedAt, warning: null, logsDirectory: 'E:/logs' })); await flush();
+    expect(container.querySelector('.preflight-dialog')?.textContent).toContain('确认图片顺序');
+    expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    if (answer === 'cancel') {
+      await act(async () => container.querySelector<HTMLElement>('.preflight-dialog')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))); await flush();
+      expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+      expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
+    } else {
+      await act(async () => container.querySelector<HTMLInputElement>(`input[value="${answer}"]`)!.click());
+      await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')!.click()); await flush();
+      expect(mocks.startPipeline).toHaveBeenCalledTimes(2);
+      expect(mocks.startPipeline.mock.calls[1][0]).toBe('E:/photos');
+      expect(mocks.startPipeline.mock.calls[1][7]).toBe(answer);
+    }
+  });
+
+  it("warns for fewer than 30 images, cancels the queue, and starts only after explicit confirmation", async () => {
     mocks.selectImageSequence.mockResolvedValueOnce("E:\\Photos\\small");
     mocks.probeAndPlan.mockResolvedValueOnce({
       inputType: "images",
@@ -1408,16 +1987,17 @@ describe("App preview workspace", () => {
     await act(async () => container.querySelector<HTMLButtonElement>(".queue-toggle")?.click());
     await act(async () => container.querySelector<HTMLButtonElement>(".primary-action")?.click());
     await flush();
-    expect(mocks.confirmSmallImageSequence).toHaveBeenLastCalledWith(29);
+    expect(container.querySelector('.preflight-dialog')?.textContent).toContain('29');
     expect(mocks.startPipeline).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog footer > button')!.click()); await flush();
     expect(container.querySelector<HTMLButtonElement>(".queue-toggle")?.getAttribute("aria-checked")).toBe("false");
 
     await act(async () => container.querySelector<HTMLButtonElement>(".primary-action")?.click());
     await flush();
-    expect(container.querySelector(".inline-error")?.textContent).toContain("dialog failed");
+    expect(container.querySelector('.preflight-dialog')).not.toBeNull();
     expect(mocks.startPipeline).not.toHaveBeenCalled();
-
-    await act(async () => container.querySelector<HTMLButtonElement>(".primary-action")?.click());
+    await act(async () => container.querySelector<HTMLInputElement>('.preflight-accept input')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.preflight-dialog .primary-action')!.click());
     await flush();
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
   });
@@ -1443,7 +2023,31 @@ describe("App preview workspace", () => {
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
   });
 
-  it("shows completed-project statistics without a duplicate detail action bar", async () => {
+  it('hides the reshoot plan and inherited-setting badge in a running legacy project detail', async () => {
+    const running: ProjectSummary = { ...project, id: '22222222-2222-2222-2222-222222222222', status: 'running', finalPly: null };
+    mocks.getProjectTaskDetail.mockResolvedValue({
+      project: running, inputType: 'video', sourcePath: 'E:/new-captures.mov', projectsRoot: 'E:/Projects',
+      plannerEnabled: true, estimatedFrames: 90, stage: 'trainingSplats', progress: 65, video: null, imageSequence: null,
+      sourceProjectId: project.id, logs: [], reshootRecipe: {
+        options: { condition: 'appearance', allowFallback: true, sourceIdentity: 'source', inputIdentity: 'input', projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+        initial: { reconstruction: 'incremental', training: 'cold' }, actual: { reconstruction: 'incremental', training: 'cold' },
+      },
+    });
+    await act(async () => useAppStore.getState().setProjects([running]));
+    await flush();
+    await act(async () => container.querySelector<HTMLElement>('#unfinished-task-group-content .project-row')!.click());
+    await flush();
+    const configuration = container.querySelector('.unfinished-task-detail .project-configuration-detail')!;
+    expect(configuration).not.toBeNull();
+    expect(configuration.textContent).toContain('new-captures.mov');
+    for (const caption of ['补拍方案', '整体结构正常，但生成效果不满意', '增量重建', '允许失败后']) expect(configuration.textContent).not.toContain(caption);
+    expect(configuration.querySelector('.locked-setting')).toBeNull();
+    expect(configuration.querySelectorAll('.quality-option:disabled')).toHaveLength(3);
+    expect(configuration.querySelector<HTMLButtonElement>('.planner-switch')?.disabled).toBe(true);
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("shows completed-project statistics without plan details or a duplicate action bar (reshoot: %s)", async reshoot => {
     mocks.getProjectTaskDetail.mockResolvedValueOnce({
       project,
       inputType: "video",
@@ -1457,7 +2061,11 @@ describe("App preview workspace", () => {
       registeredImages: 90,
       video: { duration: 3, width: 2560, height: 3840, fps: 30, totalFrames: 90, codec: "h264", rotation: 0, hasAlpha: true, pixelFormat: "rgba" },
       imageSequence: null,
-      sourceProjectId: null,
+      sourceProjectId: reshoot ? 'original-project' : null,
+      reshootRecipe: reshoot ? {
+        options: { condition: 'appearance', allowFallback: true, sourceIdentity: 'source', inputIdentity: 'input', projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+        initial: { reconstruction: 'incremental', training: 'cold' }, actual: { reconstruction: 'incremental', training: 'cold' },
+      } : null,
       logs: [],
     });
     await act(async () => useAppStore.getState().setColmapAcceleration({
@@ -1481,6 +2089,7 @@ describe("App preview workspace", () => {
     expect(detail?.querySelector(".locked-quality-settings [aria-checked=true]")?.textContent).toContain("均衡");
     expect(detail?.querySelector<HTMLButtonElement>(".planner-switch")?.disabled).toBe(true);
     expect(detail?.querySelector(".locked-setting")).toBeNull();
+    for (const caption of ['补拍方案', '整体结构正常，但生成效果不满意', '增量重建', '允许失败后']) expect(detail?.querySelector('.project-configuration-detail')?.textContent).not.toContain(caption);
     expect(detail?.textContent).toContain("COLMAP GPU 加速开启");
     expect(detail?.textContent).not.toContain("COLMAP GPU 加速已开启");
     expect(detail?.textContent).toContain("已自动提取透明画面和 COLMAP Mask · rgba");
@@ -1544,6 +2153,14 @@ describe("App preview workspace", () => {
     });
     await flush();
     expect(container.querySelector(".project-quality-warning")?.textContent).toContain("62.0%");
+  });
+
+  it("does not treat imported COLMAP provenance as this task's registration rate", async () => {
+    await act(async () => {
+      useAppStore.getState().setProjects([{ ...project, taskKind: "import", registeredRatio: 0 }]);
+    });
+    await flush();
+    expect(container.querySelector(".project-quality-warning")).toBeNull();
   });
 
   it("summarizes long errors in both task panes and reveals their full detail on hover", async () => {

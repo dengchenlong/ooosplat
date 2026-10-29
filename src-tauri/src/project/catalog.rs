@@ -152,8 +152,12 @@ pub struct ProjectSummary {
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
-    pub quality: crate::presets::Quality,
+    pub quality: Option<crate::presets::Quality>,
     pub source_name: String,
+    pub model_format: Option<crate::project::ImportedGaussianFormat>,
+    pub source_available: Option<bool>,
+    pub reshoot_eligible: Option<bool>,
+    pub reshoot_reason: Option<String>,
     pub registered_ratio: Option<f64>,
     pub points_3d: Option<u64>,
     pub failure_message: Option<String>,
@@ -173,16 +177,34 @@ struct CompletionSnapshot {
     marked_complete: bool,
 }
 
-async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> CompletionSnapshot {
-    let direct = root.join("final.ply");
-    let legacy = root.join("output").join("final.ply");
-    let path = if direct.is_file() {
-        Some(direct)
-    } else if legacy.is_file() {
-        Some(legacy)
-    } else {
-        None
+fn imported_source_matches(metadata: &ProjectMetadata) -> bool {
+    let Some(imported) = &metadata.imported else {
+        return true;
     };
+    let Ok(file) = imported.source_model_path.metadata() else {
+        return false;
+    };
+    if imported.canonical_model_path.is_some() {
+        return true;
+    }
+    let modified_ms = file
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64);
+    file.len() == imported.source_fingerprint.file_size
+        && modified_ms == imported.source_fingerprint.modified_ms
+}
+
+async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> CompletionSnapshot {
+    let path = project_model_path(root, metadata)
+        .filter(|path| path.is_file())
+        .filter(|_| match metadata.imported.as_ref() {
+            Some(imported) if imported.canonical_model_path.is_none() => {
+                imported_source_matches(metadata)
+            }
+            _ => true,
+        });
     let state_completed = match tokio::fs::read(root.join("state.json")).await {
         Ok(bytes) => serde_json::from_slice::<crate::project::PipelineStateFile>(&bytes)
             .is_ok_and(|state| state.stage == PipelineStage::Completed),
@@ -202,6 +224,22 @@ async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> Complet
         info,
         marked_complete,
     }
+}
+
+pub fn project_model_path(root: &Path, metadata: &ProjectMetadata) -> Option<PathBuf> {
+    if let Some(imported) = &metadata.imported {
+        return imported
+            .canonical_model_path
+            .as_ref()
+            .map(|path| root.join(path))
+            .or_else(|| Some(imported.source_model_path.clone()));
+    }
+    let direct = root.join("final.ply");
+    let legacy = root.join("output").join("final.ply");
+    direct
+        .is_file()
+        .then_some(direct)
+        .or_else(|| legacy.is_file().then_some(legacy))
 }
 
 pub(crate) async fn project_is_durably_completed(root: &Path, metadata: &ProjectMetadata) -> bool {
@@ -384,18 +422,35 @@ pub async fn registered_final_ply_for_project(
     if !project_is_durably_completed(&root, &metadata).await {
         return Err(SplatError::Process("只有已完成的项目可以预览".into()));
     }
-    if metadata.model != "final.ply" {
+    if metadata.imported.is_none() && metadata.model != "final.ply" {
         return Err(SplatError::Process("项目模型路径无效".into()));
     }
-    let direct = root.join("final.ply");
-    let legacy = root.join("output").join("final.ply");
-    let path = if direct.is_file() {
-        direct
-    } else if legacy.is_file() {
-        legacy
-    } else {
-        return Err(SplatError::Process("项目缺少 final.ply".into()));
-    };
+    let path = project_model_path(&root, &metadata)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            if metadata.imported.is_some() {
+                SplatError::Process("外部 Gaussian 源文件不可用，请重新定位后再试".into())
+            } else {
+                SplatError::Process("项目缺少 final.ply".into())
+            }
+        })?;
+    if let Some(imported) = &metadata.imported {
+        if imported.canonical_model_path.is_none() {
+            let file = path.metadata()?;
+            let modified_ms = file
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_millis() as u64);
+            if file.len() != imported.source_fingerprint.file_size
+                || modified_ms != imported.source_fingerprint.modified_ms
+            {
+                return Err(SplatError::Process(
+                    "外部 Gaussian 文件已发生变化。为避免把旧编辑应用到不同的 Gaussian 顺序，请重新定位原文件或作为新项目导入。".into(),
+                ));
+            }
+        }
+    }
     Ok((root, std::fs::canonicalize(path)?, metadata))
 }
 
@@ -468,17 +523,21 @@ async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
     summarize_project_metadata(project, metadata).await
 }
 
-async fn summarize_project_metadata(
+pub(crate) async fn summarize_project_metadata(
     project: &Path,
     mut metadata: ProjectMetadata,
 ) -> Result<ProjectSummary> {
     let completion = completion_snapshot(project, &metadata).await;
     let final_ply = completion.path;
-    let completion_inconsistent = completion.marked_complete && completion.info.is_none();
+    let imported_project = metadata.imported.is_some();
+    let completion_inconsistent =
+        completion.marked_complete && completion.info.is_none() && !imported_project;
     if completion.marked_complete && completion.info.is_some() {
         metadata.status = ProjectStatus::Completed;
     } else if completion_inconsistent {
         metadata.status = ProjectStatus::Interrupted;
+    } else if imported_project {
+        metadata.status = ProjectStatus::Completed;
     }
     let info = completion.info;
     let completed_at = metadata.completed_at.or_else(|| {
@@ -494,10 +553,16 @@ async fn summarize_project_metadata(
         .unwrap_or("视频")
         .to_string();
     let output = metadata.output.as_ref();
+    let source_available = metadata
+        .imported
+        .as_ref()
+        .map(|_| imported_source_matches(&metadata));
     Ok(ProjectSummary {
         id: metadata.id,
         workspace_task_id: metadata.workspace_task_id,
-        task_kind: if metadata.reshoot.is_some() {
+        task_kind: if imported_project {
+            "import"
+        } else if metadata.reshoot.is_some() {
             "reshoot"
         } else {
             "generation"
@@ -525,9 +590,28 @@ async fn summarize_project_metadata(
         created_at: metadata.created_at,
         completed_at,
         duration_ms: metadata.duration_ms,
-        quality: metadata.quality,
+        quality: (!imported_project).then_some(metadata.quality),
         source_name,
-        registered_ratio: output.map(|v| v.registered_ratio),
+        model_format: metadata.imported.as_ref().map(|value| value.source_format),
+        source_available,
+        reshoot_eligible: metadata.imported.as_ref().map(|value| {
+            value
+                .colmap
+                .as_ref()
+                .is_some_and(|colmap| colmap.reshoot_eligible)
+        }),
+        reshoot_reason: metadata
+            .imported
+            .as_ref()
+            .and_then(|value| value.colmap.as_ref())
+            .and_then(|colmap| colmap.reshoot_reason.clone()),
+        // Imported projects did not run OOOSplat reconstruction. Their optional COLMAP data is
+        // provenance for reshoot compatibility, not a registration result for this task.
+        registered_ratio: if imported_project {
+            None
+        } else {
+            output.map(|value| value.registered_ratio)
+        },
         points_3d: output.map(|v| v.points_3d),
         failure_message: if completion_inconsistent {
             Some("完成记录与 final.ply 不一致，可以继续任务以修复结果".into())
@@ -607,6 +691,7 @@ mod tests {
             transform: Default::default(),
             editing: Default::default(),
             reshoot: None,
+            imported: None,
         }
     }
 
@@ -694,6 +779,47 @@ mod tests {
         let summary = summarize_project(directory.path()).await.unwrap();
         assert_eq!(summary.status, ProjectStatus::Interrupted);
         assert!(summary.failure_message.unwrap().contains("final.ply"));
+    }
+
+    #[tokio::test]
+    async fn imported_summary_does_not_report_a_synthetic_registration_ratio() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_path = directory.path().join("external.ply");
+        write_valid_ply(&model_path);
+        let file = model_path.metadata().unwrap();
+        let modified_ms = file
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64);
+        let mut metadata = test_metadata(directory.path(), ProjectStatus::Completed);
+        metadata.output = Some(crate::project::ProjectOutput {
+            final_ply: model_path.clone(),
+            file_size: file.len(),
+            splat_count: 1,
+            input_images: 0,
+            registered_images: 0,
+            registered_ratio: 0.0,
+            points_3d: 0,
+        });
+        metadata.imported = Some(crate::project::ImportedProjectProvenance {
+            source_model_path: model_path,
+            source_format: crate::project::ImportedGaussianFormat::Ply,
+            source_fingerprint: crate::project::ExternalFileFingerprint {
+                sha256: "test".into(),
+                file_size: file.len(),
+                modified_ms,
+            },
+            canonical_model_path: None,
+            colmap: None,
+        });
+
+        let summary = summarize_project_metadata(directory.path(), metadata)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.task_kind, "import");
+        assert_eq!(summary.registered_ratio, None);
     }
 
     #[tokio::test]
@@ -824,6 +950,7 @@ mod tests {
             transform: Default::default(),
             editing: Default::default(),
             reshoot: None,
+            imported: None,
         };
         assert!(!has_project_ownership(
             &metadata,

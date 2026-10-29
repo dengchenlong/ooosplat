@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
 import type { SharedTask } from "../types/tasks";
+import { changesOperation, isProgressEvent, staleOperation } from '../lib/progressState';
 
 interface AppState {
   inputPath: string | null;
@@ -55,6 +56,7 @@ function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
       ? event.runId === next.liveTask.run_id && (!event.taskId || event.taskId === next.liveTask.task_id)
       : event.runId === next.latestEvent?.runId);
     if (sameRun && event.sequence > 0 && event.sequence <= Math.max(next.lastEventSequence, next.latestEvent?.sequence ?? 0)) continue;
+    if (staleOperation(next.latestEvent, event)) continue;
     if (event.kind === "runtime") {
       if (next.phase !== "running" || ["completed", "failed", "cancelled"].includes(next.latestEvent?.stage ?? "")) continue;
       next = { ...next, latestRuntime: event.runtime ?? next.latestRuntime, lastEventSequence: event.sequence };
@@ -63,12 +65,14 @@ function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
     logs ??= state.events.slice();
     logs.push(event);
     const terminal = event.stage === "failed" || event.stage === "cancelled";
+    const progressEvent = isProgressEvent(event) || terminal;
     next = {
       ...next,
-      latestEvent: event,
+      latestRuntime: !terminal && changesOperation(next.latestEvent, event) ? null : next.latestRuntime,
+      latestEvent: progressEvent ? event : next.latestEvent,
       lastEventSequence: event.sequence,
-      progress: terminal ? next.progress : Math.max(next.progress, Math.min(100, event.progress)),
-      progressMessage: event.message,
+      progress: terminal ? next.progress : Math.max(next.progress, Math.min(event.stage === 'completed' ? 100 : 99.9, event.progress)),
+      progressMessage: progressEvent ? event.message : next.progressMessage,
       taskColmapAcceleration: event.acceleration ?? next.taskColmapAcceleration,
     };
   }
@@ -143,12 +147,22 @@ export const useAppStore = create<AppState>((set) => ({
     const ordered = events.filter(event => (!event.taskId || event.taskId === task.task_id)
       && (!event.runId || event.runId === task.run_id)).sort((a, b) => a.sequence - b.sequence);
     const next = reduceEvents(reset ? { ...state, ...newRunState } : state, ordered);
+    const latestEvent: PipelineEvent | null = task.stage ? {
+      sequence: task.sequence ?? next.lastEventSequence, timestamp: task.updated_at, kind: 'progress', level: 'info',
+      engine: next.latestEvent?.engine ?? null, elapsedMs: task.elapsed_ms, acceleration: null, message: '',
+      stage: task.stage, substage: task.substage, operation: task.operation,
+      progress: task.estimated_progress ?? next.progress, stageProgress: task.progress,
+      indeterminate: task.progress == null, current: task.current, total: task.total, unit: task.unit ?? null,
+    } : next.latestEvent;
     return {
       ...next,
+      latestEvent,
       phase: ["starting", "running", "cancelling"].includes(task.status) ? "running"
         : task.status === "completed" || task.status === "failed" || task.status === "cancelled" ? task.status : "idle",
-      progress: task.estimated_progress == null ? next.progress : Math.max(next.progress, Math.min(100, task.estimated_progress)),
-      latestRuntime: task.runtime === undefined ? next.latestRuntime : task.runtime,
+      progress: task.estimated_progress == null ? next.progress : Math.max(next.progress, Math.min(task.status === 'completed' ? 100 : 99.9, task.estimated_progress)),
+      latestRuntime: task.runtime === undefined
+        ? (latestEvent && changesOperation(next.latestEvent, { ...latestEvent, kind: 'stage' }) ? null : next.latestRuntime)
+        : task.runtime,
       result: task.result ?? next.result,
       // Advance the snapshot watermark only after its earlier log entries are merged.
       lastEventSequence: Math.max(next.lastEventSequence, task.sequence ?? 0),

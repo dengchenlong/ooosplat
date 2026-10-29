@@ -549,7 +549,7 @@ fn write_alpha_mask(image: &DynamicImage, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn has_native_transparency(image: &DynamicImage) -> bool {
+pub(crate) fn has_native_transparency(image: &DynamicImage) -> bool {
     match image {
         DynamicImage::ImageLumaA16(value) => value.pixels().any(|pixel| pixel[1] < u16::MAX),
         DynamicImage::ImageRgba16(value) => value.pixels().any(|pixel| pixel[3] < u16::MAX),

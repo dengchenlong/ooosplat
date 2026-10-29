@@ -20,6 +20,73 @@ use crate::{
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const ROWS_PER_CHUNK: usize = 4096;
 
+/// Full bounded read, used for reshoot initialization and publication validation.
+/// Unlike header inspection this rejects truncated/non-finite Gaussian payloads.
+pub fn validate_training_ply(
+    path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(PlyInfo, u32, String)> {
+    use sha2::{Digest, Sha256};
+    let file = File::open(path)?;
+    let info = file.metadata()?;
+    let mut reader = BufReader::new(file);
+    let layout = parse_layout(&mut reader)?;
+    let expected = (layout.header.len() as u64)
+        .checked_add(
+            layout
+                .count
+                .checked_mul(layout.stride as u64)
+                .ok_or_else(|| unsupported("PLY size overflow"))?,
+        )
+        .ok_or_else(|| unsupported("PLY size overflow"))?;
+    if info.len() != expected {
+        return Err(unsupported("PLY data length mismatch"));
+    }
+    let mut hash = Sha256::new();
+    hash.update(&layout.header);
+    let mut row = vec![0; layout.stride];
+    let rotation_offsets: Vec<_> = (0..4)
+        .map(|i| layout.offsets[&format!("rot_{i}")])
+        .collect();
+    for _ in 0..layout.count {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        reader.read_exact(&mut row)?;
+        if row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|b| !f32::from_le_bytes(*b).is_finite())
+        {
+            return Err(unsupported("Non-finite Gaussian attributes"));
+        }
+        let norm: f64 = rotation_offsets
+            .iter()
+            .map(|offset| read_float(&row, *offset).powi(2))
+            .sum();
+        if norm < 1e-20 {
+            return Err(unsupported("Invalid Gaussian rotation"));
+        }
+        hash.update(&row);
+    }
+    let sh = match layout.rest_count {
+        0 => 0,
+        9 => 1,
+        24 => 2,
+        _ => 3,
+    };
+    Ok((
+        PlyInfo {
+            file_size: info.len(),
+            splat_count: layout.count,
+        },
+        sh,
+        format!("{:x}", hash.finalize()),
+    ))
+}
+pub mod export_view;
+
 #[cfg(windows)]
 fn publish_export(source: &Path, destination: &Path) -> Result<()> {
     use std::{iter, os::windows::ffi::OsStrExt};
@@ -355,74 +422,87 @@ fn header_with_vertex_count(header: &[u8], count: u64) -> Vec<u8> {
     output.into_bytes()
 }
 
-fn transform_row(
-    row: &mut [u8],
-    layout: &PlyLayout,
+/// Cached offsets and fixed scratch buffers: no allocation/name lookup per row.
+struct RowTransform {
     transform: GaussianTransform,
     rotation: Quaternion,
-    sh_rotation: &ShRotation,
-) -> Result<()> {
-    let offset = |name: &str| *layout.offsets.get(name).expect("validated property");
-    let source = [
-        read_float(row, offset("x")) * transform.scale,
-        read_float(row, offset("y")) * transform.scale,
-        read_float(row, offset("z")) * transform.scale,
-    ];
-    let point = rotation.transform_point(source);
-    for (name, value, translation) in [
-        ("x", point[0], transform.position[0]),
-        ("y", point[1], transform.position[1]),
-        ("z", point[2], transform.position[2]),
-    ] {
-        let result = value + translation;
-        if !result.is_finite() {
-            return Err(unsupported("Transform 导致 position 溢出"));
-        }
-        write_float(row, offset(name), result);
-    }
-
-    let gaussian = Quaternion {
-        w: read_float(row, offset("rot_0")),
-        x: read_float(row, offset("rot_1")),
-        y: read_float(row, offset("rot_2")),
-        z: read_float(row, offset("rot_3")),
-    };
-    let composed = rotation.mul(gaussian);
-    for (name, value) in [
-        ("rot_0", composed.w),
-        ("rot_1", composed.x),
-        ("rot_2", composed.y),
-        ("rot_3", composed.z),
-    ] {
-        write_float(row, offset(name), value);
-    }
-
-    let log_scale = transform.scale.ln();
-    for name in ["scale_0", "scale_1", "scale_2"] {
-        write_float(row, offset(name), read_float(row, offset(name)) + log_scale);
-    }
-
-    if layout.rest_count > 0 {
-        let per_channel = layout.rest_count / 3;
-        let mut source = vec![0.0_f64; per_channel];
-        for channel in 0..3 {
-            for (coefficient, value) in source.iter_mut().enumerate() {
-                *value = read_float(
-                    row,
-                    offset(&format!("f_rest_{}", channel * per_channel + coefficient)),
-                );
-            }
-            let result = sh_rotation.apply(&source);
-            for (coefficient, value) in result.into_iter().enumerate() {
-                write_float(
-                    row,
-                    offset(&format!("f_rest_{}", channel * per_channel + coefficient)),
-                    value,
-                );
-            }
+    rotated: bool,
+    identity: bool,
+    xyz: [usize; 3],
+    quaternion: [usize; 4],
+    scales: [usize; 3],
+    log_scale: f64,
+    sh: Vec<usize>,
+    sh_rotation: Option<ShRotation>,
+}
+impl RowTransform {
+    fn new(layout: &PlyLayout, transform: GaussianTransform, rotation: Quaternion) -> Self {
+        let rotated =
+            rotation.x.abs() > 1e-12 || rotation.y.abs() > 1e-12 || rotation.z.abs() > 1e-12;
+        let offset = |name: &str| layout.offsets[name];
+        Self {
+            identity: !rotated && transform.scale == 1.0 && transform.position == [0.0; 3],
+            transform,
+            rotation,
+            rotated,
+            xyz: ["x", "y", "z"].map(offset),
+            quaternion: ["rot_0", "rot_1", "rot_2", "rot_3"].map(offset),
+            scales: ["scale_0", "scale_1", "scale_2"].map(offset),
+            log_scale: transform.scale.ln(),
+            sh: (0..layout.rest_count)
+                .map(|i| offset(&format!("f_rest_{i}")))
+                .collect(),
+            sh_rotation: (rotated && layout.rest_count > 0)
+                .then(|| ShRotation::new(rotation.matrix())),
         }
     }
-    Ok(())
+    fn apply(&self, row: &mut [u8]) -> Result<()> {
+        if self.identity {
+            return Ok(());
+        }
+        let point = self
+            .xyz
+            .map(|offset| read_float(row, offset) * self.transform.scale);
+        let point = if self.rotated {
+            self.rotation.transform_point(point)
+        } else {
+            point
+        };
+        for (i, value) in point.into_iter().enumerate() {
+            let value = value + self.transform.position[i];
+            if !value.is_finite() {
+                return Err(unsupported("Transform 导致 position 溢出"));
+            }
+            write_float(row, self.xyz[i], value);
+        }
+        if self.rotated {
+            let [w, x, y, z] = self.quaternion.map(|offset| read_float(row, offset));
+            let q = self.rotation.mul(Quaternion { w, x, y, z });
+            for (offset, value) in self.quaternion.into_iter().zip([q.w, q.x, q.y, q.z]) {
+                write_float(row, offset, value);
+            }
+        }
+        if self.transform.scale != 1.0 {
+            for offset in self.scales {
+                write_float(row, offset, read_float(row, offset) + self.log_scale);
+            }
+        }
+        if let Some(rotation) = &self.sh_rotation {
+            let n = self.sh.len() / 3;
+            let mut source = [0.0; 15];
+            let mut result = [0.0; 15];
+            for channel in 0..3 {
+                for (i, value) in source[..n].iter_mut().enumerate() {
+                    *value = read_float(row, self.sh[channel * n + i]);
+                }
+                rotation.apply_into(&source[..n], &mut result[..n]);
+                for (i, value) in result[..n].iter().enumerate() {
+                    write_float(row, self.sh[channel * n + i], *value);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn export_transformed_ply(
@@ -476,7 +556,7 @@ pub fn export_transformed_ply_to(
             ));
         }
     }
-    let sh_rotation = ShRotation::new(rotation.matrix());
+    let row_transform = RowTransform::new(&layout, transform, rotation);
 
     let mut retained = 0_u64;
     let mut row = vec![0_u8; layout.stride];
@@ -521,7 +601,7 @@ pub fn export_transformed_ply_to(
                 if !keep_row(row, index, &layout, transform, rotation, edits) {
                     continue;
                 }
-                transform_row(row, &layout, transform, rotation, &sh_rotation)?;
+                row_transform.apply(row)?;
                 output_chunk.extend_from_slice(row);
             }
             writer.write_all(&output_chunk)?;
@@ -691,8 +771,13 @@ impl ShRotation {
         }
     }
 
+    #[cfg(test)]
     fn apply(&self, source: &[f64]) -> Vec<f64> {
         let mut result = source.to_vec();
+        self.apply_into(source, &mut result);
+        result
+    }
+    fn apply_into(&self, source: &[f64], result: &mut [f64]) {
         if source.len() >= 3 {
             multiply_band(&mut result[0..3], &source[0..3], &self.band1);
         }
@@ -702,7 +787,6 @@ impl ShRotation {
         if source.len() >= 15 {
             multiply_band(&mut result[8..15], &source[8..15], &self.band3);
         }
-        result
     }
 }
 
@@ -922,6 +1006,29 @@ mod tests {
     }
 
     #[test]
+    fn reshoot_full_ply_validation_rejects_nonfinite_truncated_and_cancelled_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.ply");
+        let token = tokio_util::sync::CancellationToken::new();
+        write_fixture(&path);
+        let original = std::fs::read(&path).unwrap();
+        let (info, sh, hash) = validate_training_ply(&path, &token).unwrap();
+        assert_eq!((info.splat_count, sh), (1, 0));
+        assert_eq!(hash, crate::video::panorama::fingerprint(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, &original[..original.len() - 1]).unwrap();
+        assert!(validate_training_ply(&path, &token).is_err());
+        write_fixture_rows(&path, &[[f32::NAN, 0., 0.]]);
+        assert!(validate_training_ply(&path, &token).is_err());
+        write_fixture(&path);
+        token.cancel();
+        assert!(matches!(
+            validate_training_ply(&path, &token),
+            Err(SplatError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn identity_sh_rotation_preserves_coefficients() {
         let rotation = ShRotation::new(Quaternion::from_euler_degrees([0.0, 0.0, 0.0]).matrix());
         let source = (1..=15).map(f64::from).collect::<Vec<_>>();
@@ -1017,6 +1124,7 @@ mod tests {
             crop: Some(GaussianCrop::Box {
                 center: [-1.0, 0.0, 0.0],
                 size: [3.0, 1.0, 1.0],
+                inverted: false,
             }),
             deleted_mask: Some(&deleted),
         };
@@ -1062,6 +1170,7 @@ mod tests {
                 crop: Some(GaussianCrop::Box {
                     center: [8.0, 0.0, 0.0],
                     size: [10.0, 2.0, 2.0],
+                    inverted: false,
                 }),
                 deleted_mask: Some(&[1]),
             },
@@ -1077,6 +1186,48 @@ mod tests {
         let mut row = vec![0; layout.stride];
         reader.read_exact(&mut row).unwrap();
         assert!((read_float(&row, layout.offsets["x"]) + 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn exports_inverted_sphere_and_box_using_the_same_world_space_filter() {
+        for crop in [
+            GaussianCrop::Sphere {
+                center: [-1.0, 0.0, 0.0],
+                radius: 2.0,
+                inverted: true,
+            },
+            GaussianCrop::Box {
+                center: [-1.0, 0.0, 0.0],
+                size: [4.0, 2.0, 2.0],
+                inverted: true,
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("final.ply");
+            write_fixture_rows(
+                &source,
+                &[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            );
+            let original = std::fs::read(&source).unwrap();
+            let (output, info) = export_transformed_ply_with_edits(
+                &source,
+                directory.path(),
+                GaussianTransform::default(),
+                GaussianExportEdits {
+                    crop: Some(crop),
+                    deleted_mask: Some(&[1]),
+                },
+                |_, _| {},
+            )
+            .unwrap();
+            assert_eq!(info.splat_count, 1);
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            let mut reader = BufReader::new(File::open(output).unwrap());
+            let layout = parse_layout(&mut reader).unwrap();
+            let mut row = vec![0; layout.stride];
+            reader.read_exact(&mut row).unwrap();
+            assert_eq!(read_float(&row, layout.offsets["x"]), 4.0);
+        }
     }
     #[test]
     fn cancelled_dedicated_export_cleans_temporary_files() {

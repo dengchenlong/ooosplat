@@ -774,6 +774,7 @@ mod tests {
                 model: "test".into(),
                 width: 64,
                 height: 48,
+                params: params.to_vec(),
             },
             params: params.to_vec(),
         }
@@ -949,6 +950,7 @@ mod tests {
                         model: "PINHOLE".into(),
                         width: 64,
                         height: 48,
+                        params: vec![800.0, 800.0, 32.0, 24.0],
                     },
                     params: vec![800.0, 800.0, 32.0, 24.0],
                 },

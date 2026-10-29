@@ -19,6 +19,50 @@ const loadProject = (splatCount = 16) => useGaussianTransformStore.getState().lo
 describe("GaussianTransformStore", () => {
   beforeEach(() => useGaussianTransformStore.getState().close());
 
+  it("cancels a live transform without creating history or losing previous edits and save failures", () => {
+    loadProject();
+    const store = useGaussianTransformStore.getState();
+    store.beginTransaction(); store.setTransformLive({ position: [1, 2, 3], rotation: [10, 20, 30], scale: 2 }); store.commitTransaction();
+    const before = useGaussianTransformStore.getState();
+    store.beginTransaction(); store.setTransformLive({ position: [9, 8, 7], rotation: [40, 50, 60], scale: 2 });
+    store.setSaveState("error", "Disk full"); store.cancelTransaction(); store.cancelTransaction();
+    const after = useGaussianTransformStore.getState();
+    expect(after.transform).toEqual(before.transform);
+    expect(after.history).toEqual(before.history); expect(after.revision).toBe(before.revision);
+    expect(after.transactionStart).toBeNull(); expect(after.saveError).toBe("Disk full");
+    store.undo(); expect(useGaussianTransformStore.getState().transform).toEqual(IDENTITY_TRANSFORM);
+    store.redo(); expect(useGaussianTransformStore.getState().transform).toEqual(before.transform);
+  });
+
+  it("preserves inverted sphere and box crops through undo, redo, and freezing", () => {
+    for (const crop of [
+      { kind: "sphere", center: [0, 0, 0], radius: 1 },
+      { kind: "box", center: [0, 0, 0], size: [2, 2, 2] },
+    ] as Exclude<GaussianCrop, null>[]) {
+      loadProject();
+      const store = useGaussianTransformStore.getState();
+      store.beginCropTransaction(); store.setCropLive(crop); store.commitCropTransaction();
+      store.beginCropTransaction(); store.setCropLive({ ...crop, inverted: true }); store.commitCropTransaction();
+      expect(useGaussianTransformStore.getState().editing.crop?.inverted).toBe(true);
+      store.undo(); expect(useGaussianTransformStore.getState().editing.crop?.inverted).toBeUndefined();
+      store.redo(); expect(useGaussianTransformStore.getState().editing.crop?.inverted).toBe(true);
+      store.commitCropFreeze({ ...crop, inverted: true }, new Uint8Array([3, 0]));
+      store.undo(); expect(useGaussianTransformStore.getState().editing.crop?.inverted).toBe(true);
+      store.redo(); expect(useGaussianTransformStore.getState().editing.crop).toBeNull();
+    }
+  });
+
+  it("allows freezing while an old crop receives the backend's explicit false default", () => {
+    loadProject();
+    const store = useGaussianTransformStore.getState();
+    const crop = { kind: "sphere" as const, center: [0, 0, 0] as [number, number, number], radius: 1 };
+    store.beginCropTransaction(); store.setCropLive(crop); store.commitCropTransaction();
+    const state = useGaussianTransformStore.getState();
+    store.applySavedEditing({ ...state.editing, crop: { ...crop, inverted: false } }, state.editChangeSerial);
+    expect(() => store.commitCropFreeze(crop, new Uint8Array(2))).not.toThrow();
+    expect(useGaussianTransformStore.getState().editing.crop).toBeNull();
+  });
+
   it("records a drag as one transaction and supports undo and redo", () => {
     const store = useGaussianTransformStore.getState();
     store.beginTransaction();

@@ -30,6 +30,10 @@ pub struct FramePlan {
     pub candidate_frames: Vec<PlannedFrame>,
     #[serde(default)]
     pub rescue_max_frames: u64,
+    /// Version-3 manual sampling searches this source range lazily. This is
+    /// candidate availability, not permission to extract every source frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_source_frames: Option<u64>,
     #[serde(default)]
     pub minimum_frame_override_applied: bool,
 }
@@ -43,8 +47,25 @@ impl Default for FramePlan {
             selected_frames: Vec::new(),
             candidate_frames: Vec::new(),
             rescue_max_frames: 0,
+            bridge_source_frames: None,
             minimum_frame_override_applied: false,
         }
+    }
+}
+
+impl FramePlan {
+    pub fn candidate_count(&self) -> u64 {
+        self.bridge_source_frames
+            .unwrap_or(self.candidate_frames.len() as u64)
+    }
+
+    pub fn use_manual_bridge_budget(&mut self, total_frames: u64) {
+        let initial = self.selected_frames.len() as u64;
+        if initial == 0 || total_frames < initial {
+            return;
+        }
+        self.bridge_source_frames = Some(total_frames);
+        self.rescue_max_frames = initial + (initial / 5).min(total_frames.saturating_sub(initial));
     }
 }
 
@@ -71,24 +92,25 @@ impl FrameSelectionStrategy for UniformRatioFrameSelection {
 pub struct QualityV2FrameSelection;
 
 impl QualityV2FrameSelection {
+    fn frame_at(video: &VideoInfo, count: u64, position: u64) -> PlannedFrame {
+        let source_frame_index = ((position as f64 * video.total_frames as f64) / count as f64)
+            .floor()
+            .min(video.total_frames.saturating_sub(1) as f64)
+            as u64;
+        PlannedFrame {
+            source_frame_index,
+            timestamp_seconds: if video.fps > 0.0 {
+                source_frame_index as f64 / video.fps
+            } else {
+                0.0
+            },
+        }
+    }
+
     fn uniform_frames(video: &VideoInfo, count: u64) -> Vec<PlannedFrame> {
         let count = count.min(video.total_frames).max(1);
         (0..count)
-            .map(|position| {
-                let source_frame_index = ((position as f64 * video.total_frames as f64)
-                    / count as f64)
-                    .floor()
-                    .min(video.total_frames.saturating_sub(1) as f64)
-                    as u64;
-                PlannedFrame {
-                    source_frame_index,
-                    timestamp_seconds: if video.fps > 0.0 {
-                        source_frame_index as f64 / video.fps
-                    } else {
-                        0.0
-                    },
-                }
-            })
+            .map(|position| Self::frame_at(video, count, position))
             .fold(Vec::new(), |mut frames, frame| {
                 if frames
                     .last()
@@ -130,6 +152,25 @@ impl QualityV2FrameSelection {
 
 impl FrameSelectionStrategy for QualityV2FrameSelection {
     fn create_plan(&self, video: &VideoInfo, preset: &QualityPreset) -> FramePlan {
+        self.create_plan_with_source(video, preset, false)
+    }
+}
+
+impl QualityV2FrameSelection {
+    pub fn create_manual_bridge_plan(
+        &self,
+        video: &VideoInfo,
+        preset: &QualityPreset,
+    ) -> FramePlan {
+        self.create_plan_with_source(video, preset, true)
+    }
+
+    fn create_plan_with_source(
+        &self,
+        video: &VideoInfo,
+        preset: &QualityPreset,
+        source: bool,
+    ) -> FramePlan {
         if video.total_frames == 0 || video.fps <= 0.0 || video.duration <= 0.0 {
             return FramePlan::default();
         }
@@ -146,21 +187,40 @@ impl FrameSelectionStrategy for QualityV2FrameSelection {
             ((video.duration * initial_fps).round() as u64).clamp(1, video.total_frames);
         let rescue_count =
             ((video.duration * rescue_fps).round() as u64).clamp(initial_count, video.total_frames);
-        let candidate_frames = Self::uniform_frames(video, rescue_count);
-        let selected_frames = Self::subset(&candidate_frames, initial_count);
+        let (selected_frames, candidate_frames) = if source {
+            // Compute exactly the old uniform-pool subset, but do not build the
+            // pool (at low source FPS it can contain every frame in the video).
+            let mut selected: Vec<_> = (0..initial_count)
+                .map(|position| {
+                    let pool_position = (u128::from(position) * u128::from(rescue_count)
+                        / u128::from(initial_count)) as u64;
+                    Self::frame_at(video, rescue_count, pool_position)
+                })
+                .collect();
+            selected.dedup_by_key(|frame| frame.source_frame_index);
+            (selected.clone(), selected)
+        } else {
+            let candidates = Self::uniform_frames(video, rescue_count);
+            (Self::subset(&candidates, initial_count), candidates)
+        };
         let selected_count = selected_frames.len() as u64;
         let actual_fps = selected_count as f64 / video.duration;
-        FramePlan {
+        let mut plan = FramePlan {
             retention_ratio: selected_count as f64 / video.total_frames as f64,
             sampling_fps: actual_fps,
             estimated_frames: selected_count,
             selected_frames,
             rescue_max_frames: candidate_frames.len() as u64,
             candidate_frames,
+            bridge_source_frames: None,
             minimum_frame_override_applied: preset
                 .initial_fps
                 .is_some_and(|preferred| minimum_required_fps > preferred),
+        };
+        if source {
+            plan.use_manual_bridge_budget(video.total_frames);
         }
+        plan
     }
 }
 

@@ -6,6 +6,58 @@ use rmcp::{
     ServiceExt,
 };
 
+#[test]
+fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v3() {
+    let definition = definitions()
+        .into_iter()
+        .find(|t| t.name == "create_generation_task")
+        .unwrap();
+    let schema = serde_json::to_value(definition.input_schema).unwrap();
+    let version = schema
+        .pointer("/properties/generation_policy/properties/version")
+        .unwrap();
+    assert_eq!(version["minimum"], 1);
+    assert_eq!(version["maximum"], 3);
+    assert_eq!(version["default"], 3);
+    for version in [1, 2, 3] {
+        let request: CreateRequest = serde_json::from_value(json!({"input_path":"clip.mp4","quality":"fast",
+            "client_request_id":"version-test","generation_policy":{"version":version,"frameSamplingRatio":0.9}})).unwrap();
+        assert_eq!(
+            request
+                .generation_policy
+                .unwrap()
+                .validate()
+                .unwrap()
+                .version,
+            version
+        );
+    }
+}
+
+#[test]
+fn reshoot_requests_are_explicit_and_old_generation_requests_remain_unchanged() {
+    let old: CreateRequest = serde_json::from_value(
+        json!({"input_path":"clip.mp4","quality":"fast","client_request_id":"old"}),
+    )
+    .unwrap();
+    assert!(old.source_project_id.is_none() && old.reshoot_options.is_none());
+    let new: CreateRequest = serde_json::from_value(json!({"input_path":"new-images","quality":"high","client_request_id":"new","source_project_id":Uuid::nil(),"reshoot_options":{"condition":"good","allowFallback":false,"sourceIdentity":"source","inputIdentity":"input","projection":"perspective"}})).unwrap();
+    assert!(!new.reshoot_options.unwrap().allow_fallback);
+    assert!(serde_json::from_value::<CreateRequest>(json!({"input_path":"new-images","quality":"high","client_request_id":"invalid","reshoot_options":{"condition":"good"}})).is_err());
+    let definition = definitions()
+        .into_iter()
+        .find(|t| t.name == "inspect_reshoot_input")
+        .unwrap();
+    assert!(definition.output_schema.is_some());
+    assert!(definition
+        .input_schema
+        .get("required")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .contains(&json!("source_project_id")));
+}
+
 #[tokio::test]
 async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     let temp = tempfile::tempdir().unwrap();
@@ -19,7 +71,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let release = Arc::new(tokio::sync::Notify::new());
     let worker_release = release.clone();
-    *tasks.executor.lock().unwrap() = Some(Arc::new(move |_| {
+    *tasks.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
         let release = worker_release.clone();
         Box::pin(async move {
             release.notified().await;
@@ -70,7 +122,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     );
     let client = ().serve(transport).await.unwrap();
     let definitions = client.list_tools(None).await.unwrap();
-    assert_eq!(definitions.tools.len(), 7);
+    assert_eq!(definitions.tools.len(), 8);
     assert!(definitions.tools.iter().all(|t| t.output_schema.is_some()));
     let app_status = client
         .call_tool(CallToolRequestParams::new("get_app_status"))

@@ -4,7 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LanguageProvider } from '../i18n';
 import type { SharedTask } from '../types/tasks';
-import type { ProjectSummary } from '../types/pipeline';
+import type { ProjectSummary, ReshootRecipeSummary } from '../types/pipeline';
 
 const mocks = vi.hoisted(() => ({ logs: vi.fn(), detail: vi.fn(), start: vi.fn(), cancel: vi.fn() }));
 vi.mock('../lib/backend', () => ({ readSharedTaskLogs: mocks.logs, getProjectTaskDetail: mocks.detail, startGuiTask: mocks.start, cancelSharedTask: mocks.cancel }));
@@ -19,6 +19,11 @@ const task = (overrides: Partial<SharedTask> = {}): SharedTask => ({
 });
 const project: ProjectSummary = { id: 'project-1', name: 'orbit', workspaceTaskId: 'agent-1', status: 'completed', projectPath: 'E:\\Projects\\orbit', finalPly: 'E:\\Projects\\orbit\\final.ply', fileSize: 2048, splatCount: 1500, createdAt: '2026-10-06T00:00:00Z', completedAt: '2026-10-06T00:01:00Z', durationMs: 60000, quality: 'balanced', sourceName: 'orbit.mov', registeredRatio: .9, points3d: 3000, failureMessage: null };
 const page = (text = '', source = 'brush') => ({ entries: text ? [{ source, text, partial_line: false }] : [], next_cursor: 'next', cursor_reset: false, has_more: false, reset_reason: null });
+const reshootRecipe: ReshootRecipeSummary = {
+  options: { condition: 'appearance', allowFallback: true, sourceIdentity: 'source', inputIdentity: 'input', projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+  initial: { reconstruction: 'incremental', training: 'cold' },
+  actual: { reconstruction: 'incremental', training: 'cold' },
+};
 let root: Root, container: HTMLDivElement;
 const resume = vi.fn();
 const render = async (value: SharedTask) => { await act(async () => root.render(<LanguageProvider><SharedTaskDetail key={`${value.task_id}:${value.run_id}`} task={value} project={value.project_id ? project : null} onResume={resume} showRuntimePanel={false} /></LanguageProvider>)); };
@@ -31,7 +36,42 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); window.localStorage.clear(); });
 
+it('shows new retry consent without waiting for a project detail and marks only actual completed retries', async () => {
+  await render(task({generation_policy:{version:1,autoRetryEnabled:false,frameSamplingRatio:.5},status:'created',stage:null,project_id:null}));
+  expect(container.querySelector('.planner-switch strong')?.textContent).toBe('自动重试');
+  expect(container.querySelector('.planner-switch')?.getAttribute('aria-checked')).toBe('false');
+  expect(container.textContent).not.toContain('已自动重试');
+  await render(task({generation_policy:{version:1,autoRetryEnabled:true,frameSamplingRatio:.5},status:'completed',automatically_retried:true,project_id:null}));
+  expect(container.textContent).toContain('已自动重试');
+});
+
 describe('restored shared task detail', () => {
+  it('shows localized quiet notices as system logs without inventing counts', async () => {
+    localStorage.setItem('ooo-splat-language', 'en');
+    const notice = { kind: 'log', engine: 'system', stage: 'matching', sequence: 1,
+      message: '图像匹配进程仍在运行，最近 15 秒无新输出。此步骤可能耗时较长，请耐心等待' } as import('../types/pipeline').PipelineEvent;
+    await render(task({ stage: 'matching', current: null, total: null, recent_events: [notice] }));
+    expect(container.querySelector('.live-log')?.textContent).toContain('no new output for 15 seconds');
+    expect(container.querySelector('.live-log')?.textContent).toContain('system');
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).not.toBe('100.0%');
+  });
+  it('does not revive an old monitor or count after the task snapshot explicitly cleared them', async () => {
+    const old = { sequence: 1, timestamp: '2026-10-09T00:00:00Z', kind: 'progress', stage: 'trainingSplats', message: '', engine: 'system',
+      substage: 'panoramaTrainingPreparation', current: 72, total: 228, unit: 'panoramaFaces',
+      runtime: { training: { iteration: 999, total: 8000 } } } as unknown as import('../types/pipeline').PipelineEvent;
+    await render(task({ substage: 'training', current: null, total: null, progress: null, runtime: null,
+      operation: { id: 2, attempt: 2 }, recent_events: [old] }));
+    expect(container.querySelector('.current-message')?.textContent).not.toMatch(/72|228|999/);
+    expect(container.querySelector('.stage-timeline li.active b')?.textContent).toBe('Splat 训练');
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('处理中');
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+  it('shows the saved projection in the readonly media box without re-detecting input', async () => {
+    mocks.detail.mockResolvedValue({ project, inputType: 'video', videoProjection: 'equirectangular', video: null, imageSequence: null });
+    await render(task({ project_id: project.id, status: 'cancelled' }));
+    expect(container.querySelector('.source-input-card .media-source-status')?.textContent).toContain('本任务按全景视频处理');
+    expect(container.querySelector('.source-input-card select')).toBeNull();
+  });
   it.each(['zh-CN', 'en'])('uses only preset progress captions for every stage in %s', async locale => {
     window.localStorage.setItem('ooo-splat-language', locale);
     const stages = [
@@ -71,6 +111,17 @@ describe('restored shared task detail', () => {
     expect(document.querySelector('.error-detail-tooltip')?.textContent).toBe(error.message);
   });
 
+  it('uses the new classification for the error summary but leaves legacy summaries alone', async () => {
+    const error = { code: 'pipeline_failed', message: 'wgpu error: Out of Memory\nIO error while loading dataset: early eof', failed_stage: 'trainingSplats', engine: 'brush', exit_code: 101, failure_id: null,
+      classification: 'brush_out_of_memory', classification_version: 1, classification_is_heuristic: false };
+    await render(task({ status: 'failed', error }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('训练显存不足');
+    expect(container.textContent).not.toContain('错误分类为启发式判断');
+    await render(task({ status: 'failed', error: { ...error, classification: 'brush_dataset', classification_version: undefined, classification_is_heuristic: true } }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('生成所需图片读取不完整');
+    expect(container.textContent).toContain('错误分类为启发式判断');
+  });
+
   it('uses the original configuration, timeline and log layout with frozen settings and observed counters', async () => {
     await render(task({ input_path: '\\\\?\\E:\\Media\\orbit.mov', projects_root: '\\\\?\\E:\\Projects' }));
     expect(container.querySelectorAll('.path-picker.readonly')).toHaveLength(2);
@@ -99,11 +150,19 @@ describe('restored shared task detail', () => {
     expect(container.querySelector<HTMLButtonElement>('.cancel-action')!.disabled).toBe(true);
   });
 
-  it.each(['failed', 'cancelled', 'interrupted'] as const)('shows %s consistently without offering resume before a project/checkpoint exists', async status => {
+  it('explicitly retries a failed pre-project run using its run ID rather than pretending to resume a checkpoint', async () => {
+    await render(task({status:'failed',project_id:null,stage:null}));
+    expect(button('继续生成')).toBeDefined();
+    await act(async () => button('继续生成')!.click());
+    expect(mocks.start).toHaveBeenCalledWith('agent-1','run-1');
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'interrupted'] as const)('shows %s consistently without offering resume before a project/checkpoint exists', async status => {
     await render(task({ status, stage: null, estimated_progress: null }));
     expect(button('继续生成')).toBeUndefined();
     expect(container.querySelector('.cancel-action')).toBeNull();
-    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('—');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('0.0%');
     expect(container.querySelectorAll('.stage-timeline .failed, .stage-timeline .cancelled, .stage-timeline .interrupted')).toHaveLength(0);
   });
 
@@ -131,11 +190,61 @@ describe('restored shared task detail', () => {
     expect(container.querySelectorAll('.stage-timeline .done')).toHaveLength(7);
   });
 
-  it('shows inherited configuration only for an explicit resume or reshoot', async () => {
-    await render(task({ runs: [{ run_id: 'run-1', kind: 'resume' }] }));
+  it('keeps inherited configuration for inactive resume or reshoot records', async () => {
+    await render(task({ status: 'interrupted', runs: [{ run_id: 'run-1', kind: 'resume' }] }));
     expect(container.querySelector('.locked-setting')?.textContent).toContain('沿用原任务');
-    await render(task({ task_kind: 'reshoot' }));
+    await render(task({ status: 'interrupted', task_kind: 'reshoot' }));
     expect(container.querySelector('.locked-setting')?.textContent).toContain('继承源任务');
+  });
+
+  it.each(['zh-CN', 'en'] as const)('hides plan details and inheritance while starting/running/cancelling (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    mocks.detail.mockResolvedValue({ project, reshootRecipe, inputType: 'video' });
+    for (const status of ['starting', 'running', 'cancelling'] as const) {
+      await render(task({ task_kind: 'reshoot', project_id: project.id, status }));
+      const configuration = container.querySelector('.project-configuration-detail')!;
+      expect(configuration).not.toBeNull();
+      expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '补拍方案' : 'Reshoot plan');
+      expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '整体结构正常' : 'The overall structure');
+      expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '增量重建' : 'Incremental reconstruction');
+      expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '允许失败后' : 'Allow a slower fallback');
+      expect(configuration.querySelector('.locked-setting')).toBeNull();
+      expect(configuration.querySelectorAll('.quality-option:disabled')).toHaveLength(3);
+      expect(configuration.querySelector<HTMLButtonElement>('.planner-switch')?.disabled).toBe(true);
+      expect(mocks.detail).toHaveBeenCalledWith(project.id);
+    }
+  });
+
+  it.each(['zh-CN', 'en'] as const)('hides plan details and inheritance after a reshoot completes (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    mocks.detail.mockResolvedValue({ project, reshootRecipe, inputType: 'video' });
+    await render(task({ task_kind: 'reshoot', project_id: project.id, status: 'running' }));
+    await render(task({ task_kind: 'reshoot', project_id: project.id, status: 'completed', stage: 'completed' }));
+    const configuration = container.querySelector('.project-configuration-detail')!;
+    expect(configuration).not.toBeNull();
+    expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '补拍方案' : 'Reshoot plan');
+    expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '整体结构正常' : 'The overall structure');
+    expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '增量重建' : 'Incremental reconstruction');
+    expect(configuration.textContent).not.toContain(locale === 'zh-CN' ? '允许失败后' : 'Allow a slower fallback');
+    expect(configuration.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(configuration.querySelector('.locked-setting')).toBeNull();
+    expect(configuration.querySelectorAll('.quality-option:disabled')).toHaveLength(3);
+    expect(configuration.querySelector<HTMLButtonElement>('.planner-switch')?.disabled).toBe(true);
+    expect(configuration.textContent).toContain('E:\\Media\\orbit.mov');
+    expect(reshootRecipe.options.allowFallback).toBe(true);
+  });
+
+  it('preserves saved plan and fallback decisions for unfinished inactive reshoots', async () => {
+    mocks.detail.mockResolvedValue({ project, reshootRecipe, inputType: 'video' });
+    await render(task({ task_kind: 'reshoot', project_id: project.id, status: 'running' }));
+    expect(container.querySelector('.project-configuration-detail')?.textContent).not.toContain('补拍方案');
+    for (const status of ['failed', 'cancelled', 'interrupted'] as const) {
+      await render(task({ task_kind: 'reshoot', project_id: project.id, status }));
+      expect(container.querySelector('.project-configuration-detail')?.textContent).toContain('补拍方案');
+      expect(container.querySelector('.project-configuration-detail')?.textContent).toContain('整体结构正常，但生成效果不满意');
+      expect(container.querySelector<HTMLInputElement>('.project-configuration-detail input[type="checkbox"]')?.checked).toBe(true);
+    }
+    expect(reshootRecipe.options.allowFallback).toBe(true);
   });
 
   it('keeps file logs bounded and does not invent timestamps or levels for raw lines', async () => {

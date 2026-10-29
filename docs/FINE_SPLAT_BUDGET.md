@@ -1,0 +1,47 @@
+# 精细档有效像素预算 / Detailed effective-pixel budget
+
+## 范围与公式
+
+新建及失败后手动重试的普通图片、普通视频和普通补拍精细档使用生成策略版本2：
+
+```text
+k = 0.5
+t_mean = valid observations / points with valid tracks
+requested = round(k × sqrt(2462476 × 0.063362106 × X_eff / t_mean))
+effective maximum = max(initial Gaussian count, requested)
+```
+
+这是先前讨论的 TangoGS 静态预算公式的应用侧改编，不实现其动态增密／剔除控制，也不保证最终点数或画质。全景按用户确认保持原策略，不把六面像素与球面轨迹混算。快速、均衡、分辨率、学习率、增密日程、训练步数及自动重试规则均不变。
+
+`X_eff` 为本次最终模型中已注册的实际训练图片有效像素总数。逐张统计，不抽样；完全透明的像素排除，Alpha 大于零的像素全部计入，包括半透明边缘。普通不透明图片的黑色背景不当作遮蔽，不使用 COLMAP 的 Alpha ≥ 0.5 特征蒙版代替训练有效区域。当前普通训练没有额外独立的 Brush 排除蒙版。
+
+平均轨迹长度来自最终采用的普通 COLMAP 模型。只计入已注册图片中索引有效的轨迹，同一三维点对同一图片的重复引用只计一次；没有有效轨迹的点不参与平均值。只读取图片记录头并跳过2D观测载荷，不重新匹配或重建。
+
+统计在重建后、训练启动前执行，不加入素材快速检测。透明图片逐张只读解码，单幅保持512 MiB安全限制；不透明图片只读取头部。支持8／16位 RGBA／灰度 Alpha、混合尺寸及多相机补拍。支持取消；错误、全零有效像素、无有效轨迹、溢出或缺失文件时明确失败，不猜测预算或静默恢复40倍。
+
+## 保存与兼容
+
+- 保存可选 `brushTraining.fineSplatBudget`：策略版本、系数、注册数、有效像素数、稀疏点／轨迹／观测数、平均轨迹长度及请求上限。
+- 任务中断续跑沿用原策略及已解析参数；生成策略版本1仍使用40倍稀疏点预算。新任务及失败后手动重试升级至版本2，训练缓存按既有方式失效；兼容图片和重建缓存保留。
+- 旧 PLY 初始化超过公式结果时上调至实际初始化点数，不删点。OOM重试仍仅在原授权及可信计数条件下，使用失败进程点数的80%，不得低于初始化数量。
+- 不修改项目 schema、云端字段、版本号或已有模型；技术日志仅记录计算摘要，不输出逐图路径、GPS或像素数据。
+
+## English
+
+New ordinary-image/video Detailed runs and ordinary reshoots use generation policy v2 and the formula above, with one shared coefficient of 0.5. Only registered training views contribute. Every positive-alpha pixel counts, including semi-transparent edges; fully transparent pixels do not. Opaque black pixels remain valid. COLMAP's thresholded feature masks are not treated as Brush training masks.
+
+Valid sparse tracks determine mean track length; duplicate references within a track and invalid image/index references do not inflate it. The calculation runs after reconstruction, off the async executor, with sequential bounded image decoding and cancellation. It does not slow input metadata analysis or change SfM, training resolution, densification, learning rates, or steps. Panorama, Fast and Balanced budgets are unchanged.
+
+The optional budget snapshot and resolved preset are saved locally. Interrupted older runs keep their policy; new tasks and explicit failed-run retries use v2. Initialization is never silently reduced. Authorized OOM retry remains unchanged. This is a maximum, not a trained point count or a PSNR guarantee.
+
+## 验证 / Verification
+
+2026-10-27 Windows 开发环境：
+
+- Rust 全量测试498项通过，27项资源／人工测试默认忽略。最初沙箱运行有两项符号链接夹具被 Windows 1314 拒绝；获得相应权限后全量复验通过，没有跳过这些安全检查。
+- 前端600项测试、7项诊断协议测试、生产构建、Rust 1.99.0 全目标 Clippy（`-D warnings`）及稳定版 rustfmt 检查通过。构建仍有现有第三方模块／大分块警告。
+- 单独启用只读真实数据测试：`20261027-085019_images` 的90张2560×3840训练图片，364,993,345个有效像素，66,218个有效轨迹点、191,175条有效观测；平均轨迹长度2.8870548793，公式上限2,220,679。全部训练图片逐张统计，调试构建耗时144.81秒；这不是发布构建性能测量，也不影响素材输入检测。原项目 `state.json` 前后字节一致。
+- 覆盖不透明黑色、8／16位 RGBA及灰度 Alpha、半透明像素、混合尺寸／相机、未注册图片排除、无效及重复轨迹、二进制／文本模型、取消、缺失／损坏数据、初始化下限、预算保存与续跑、旧策略、普通补拍共用入口，以及全景／快速／均衡不变。
+- JSON浮点读回允许极小的舍入差异；上限始终从整数像素及观测计数复核，不能因为平均轨迹长度差一个浮点 ULP 就拒绝恢复。
+
+没有重新训练、重新计算PSNR或改写历史项目；不将只读公式核算视为画质验收。未执行原生桌面交互验收及 macOS／Linux 端到端训练验证。No new training or PSNR claim is made.

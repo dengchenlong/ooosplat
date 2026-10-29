@@ -13,6 +13,7 @@ pub struct ColmapCamera {
     pub model: String,
     pub width: u64,
     pub height: u64,
+    pub params: Vec<f64>,
 }
 
 /// A COLMAP camera with its raw intrinsics parameters, in the order defined
@@ -82,7 +83,7 @@ fn skip(reader: &mut impl Read, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
+pub(super) fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
     Some(match model_id {
         0 => ("SIMPLE_PINHOLE", 3),
         1 => ("PINHOLE", 4),
@@ -96,38 +97,134 @@ fn camera_model(model_id: i32) -> Option<(&'static str, u64)> {
         9 => ("RADIAL_FISHEYE", 5),
         10 => ("THIN_PRISM_FISHEYE", 12),
         11 => ("RAD_TAN_THIN_PRISM_FISHEYE", 16),
+        17 => ("EQUIRECTANGULAR", 2),
         _ => return None,
     })
 }
 
 pub fn read_single_camera(model: &Path) -> Result<ColmapCamera> {
-    let path = model.join("cameras.bin");
-    let mut reader = BufReader::new(File::open(&path)?);
-    let count = read_u64(&mut reader)?;
-    if count != 1 {
+    let mut cameras = read_cameras(model)?;
+    if cameras.len() != 1 {
         return Err(SplatError::Process(format!(
-            "高清补拍要求原项目只使用一台共享相机，当前模型包含 {count} 台相机"
+            "高清补拍要求原项目只使用一台共享相机，当前模型包含 {} 台相机",
+            cameras.len()
         )));
     }
-    let id = read_u32(&mut reader)?;
-    let model_id = read_i32(&mut reader)?;
-    let width = read_u64(&mut reader)?;
-    let height = read_u64(&mut reader)?;
-    let (model_name, parameter_count) = camera_model(model_id).ok_or_else(|| {
-        SplatError::Process(format!("原项目使用了暂不支持的相机模型编号 {model_id}"))
-    })?;
-    skip(&mut reader, parameter_count * 8)?;
-    Ok(ColmapCamera {
-        id,
-        model_id,
-        model: model_name.into(),
-        width,
-        height,
-    })
+    Ok(cameras.remove(0))
+}
+
+pub fn read_cameras(model: &Path) -> Result<Vec<ColmapCamera>> {
+    let path = model.join("cameras.bin");
+    if !path.is_file() {
+        return read_cameras_text(&model.join("cameras.txt"));
+    }
+    let mut reader = BufReader::new(File::open(&path)?);
+    let count = read_u64(&mut reader)?;
+    if count == 0 || count > 100_000 {
+        return Err(SplatError::Process("Invalid COLMAP camera count".into()));
+    }
+    let mut cameras = Vec::new();
+    for _ in 0..count {
+        let id = read_u32(&mut reader)?;
+        let model_id = read_i32(&mut reader)?;
+        let width = read_u64(&mut reader)?;
+        let height = read_u64(&mut reader)?;
+        let (model_name, parameter_count) = camera_model(model_id).ok_or_else(|| {
+            SplatError::Process(format!("原项目使用了暂不支持的相机模型编号 {model_id}"))
+        })?;
+        let params = (0..parameter_count)
+            .map(|_| read_f64(&mut reader))
+            .collect::<Result<Vec<_>>>()?;
+        cameras.push(ColmapCamera {
+            id,
+            model_id,
+            model: model_name.into(),
+            width,
+            height,
+            params,
+        });
+    }
+    validate_cameras(&cameras)?;
+    Ok(cameras)
+}
+
+fn read_cameras_text(path: &Path) -> Result<Vec<ColmapCamera>> {
+    let text = std::fs::read_to_string(path)?;
+    let rows = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if rows.is_empty() || rows.len() > 100_000 {
+        return Err(SplatError::Process("Invalid COLMAP camera count".into()));
+    }
+    let mut cameras = Vec::new();
+    for row in rows {
+        let fields = row.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5 {
+            return Err(SplatError::Process("COLMAP cameras.txt 内容不完整".into()));
+        }
+        let model = fields[1].to_string();
+        let model_id = (0..=17)
+            .find(|id| camera_model(*id).is_some_and(|value| value.0 == model))
+            .ok_or_else(|| {
+                SplatError::Process(format!("原项目使用了暂不支持的相机模型 {model}"))
+            })?;
+        let expected_params = camera_model(model_id)
+            .expect("camera model checked above")
+            .1 as usize;
+        if fields.len() != expected_params + 4 {
+            return Err(SplatError::Process(format!(
+                "COLMAP cameras.txt 的 {model} 相机参数数量无效"
+            )));
+        }
+        let params = fields[4..]
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .map_err(|_| SplatError::Process("COLMAP 相机参数无效".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cameras.push(ColmapCamera {
+            id: fields[0]
+                .parse()
+                .map_err(|_| SplatError::Process("COLMAP 相机 ID 无效".into()))?,
+            model_id,
+            model,
+            width: fields[2]
+                .parse()
+                .map_err(|_| SplatError::Process("COLMAP 相机宽度无效".into()))?,
+            height: fields[3]
+                .parse()
+                .map_err(|_| SplatError::Process("COLMAP 相机高度无效".into()))?,
+            params,
+        });
+    }
+    validate_cameras(&cameras)?;
+    Ok(cameras)
+}
+
+fn validate_cameras(cameras: &[ColmapCamera]) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    for camera in cameras {
+        if camera.id == 0
+            || !ids.insert(camera.id)
+            || camera.width == 0
+            || camera.height == 0
+            || camera.params.iter().any(|v| !v.is_finite())
+        {
+            return Err(SplatError::Process("Invalid COLMAP camera data".into()));
+        }
+    }
+    Ok(())
 }
 
 pub fn read_registered_images(model: &Path) -> Result<Vec<RegisteredImage>> {
     let path = model.join("images.bin");
+    if !path.is_file() {
+        return read_registered_images_text(&model.join("images.txt"));
+    }
     let mut reader = BufReader::new(File::open(&path)?);
     let count = read_u64(&mut reader)?;
     let capacity = usize::try_from(count)
@@ -192,6 +289,7 @@ pub fn read_camera_intrinsics(model: &Path) -> Result<CameraIntrinsics> {
             model: model_name.into(),
             width,
             height,
+            params: params.clone(),
         },
         params,
     })
@@ -244,6 +342,34 @@ pub fn read_posed_images(model: &Path) -> Result<Vec<PosedImage>> {
     Ok(images)
 }
 
+fn read_registered_images_text(path: &Path) -> Result<Vec<RegisteredImage>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut lines = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'));
+    let mut images = Vec::new();
+    while let Some(image_line) = lines.next() {
+        if image_line.trim().is_empty() {
+            continue;
+        }
+        let fields = image_line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 10 {
+            return Err(SplatError::Process("COLMAP images.txt 内容不完整".into()));
+        }
+        images.push(RegisteredImage {
+            id: fields[0]
+                .parse()
+                .map_err(|_| SplatError::Process("COLMAP 图像 ID 无效".into()))?,
+            camera_id: fields[8]
+                .parse()
+                .map_err(|_| SplatError::Process("COLMAP 图像相机 ID 无效".into()))?,
+            name: fields[9..].join(" "),
+        });
+        let _points_line = lines.next();
+    }
+    Ok(images)
+}
+
 pub fn required_model_files(model: &Path) -> [PathBuf; 3] {
     [
         model.join("cameras.bin"),
@@ -258,7 +384,18 @@ pub fn required_model_files(model: &Path) -> [PathBuf; 3] {
 /// writes rig and frame metadata; keep those files together when they exist so
 /// an incremental mapper sees the same reconstruction that was validated.
 pub fn reusable_model_files(model: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = required_model_files(model).into_iter().collect::<Vec<_>>();
+    let binary = model.join("cameras.bin").is_file();
+    let mut files = if binary {
+        required_model_files(model).into_iter().collect::<Vec<_>>()
+    } else {
+        [
+            model.join("cameras.txt"),
+            model.join("images.txt"),
+            model.join("points3D.txt"),
+        ]
+        .into_iter()
+        .collect::<Vec<_>>()
+    };
     for path in &files {
         if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
             return Err(SplatError::Process(format!(
@@ -268,8 +405,8 @@ pub fn reusable_model_files(model: &Path) -> Result<Vec<PathBuf>> {
         }
     }
 
-    let rigs = model.join("rigs.bin");
-    let frames = model.join("frames.bin");
+    let rigs = model.join(if binary { "rigs.bin" } else { "rigs.txt" });
+    let frames = model.join(if binary { "frames.bin" } else { "frames.txt" });
     let rigs_metadata = std::fs::symlink_metadata(&rigs).ok();
     let frames_metadata = std::fs::symlink_metadata(&frames).ok();
     if rigs_metadata
@@ -322,10 +459,33 @@ mod tests {
         let camera = read_single_camera(root.path()).unwrap();
         assert_eq!((camera.id, camera.width, camera.height), (7, 1920, 1080));
         assert_eq!(camera.model, "SIMPLE_RADIAL");
+        assert_eq!(camera.params, vec![0.0; 4]);
         assert_eq!(
             read_registered_images(root.path()).unwrap()[0].name,
             "frame_000001.jpg"
         );
+    }
+
+    #[test]
+    fn reads_and_reuses_text_models() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("cameras.txt"),
+            "# Camera list\n7 SIMPLE_RADIAL 1920 1080 900 960 540 0.01\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("images.txt"),
+            "# Image list\n3 1 0 0 0 0 0 0 7 nested/frame 1.jpg\n\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("points3D.txt"), "# Point list\n").unwrap();
+
+        let camera = read_single_camera(root.path()).unwrap();
+        assert_eq!(camera.params, vec![900.0, 960.0, 540.0, 0.01]);
+        let images = read_registered_images(root.path()).unwrap();
+        assert_eq!(images[0].name, "nested/frame 1.jpg");
+        assert_eq!(reusable_model_files(root.path()).unwrap().len(), 3);
     }
 
     #[test]

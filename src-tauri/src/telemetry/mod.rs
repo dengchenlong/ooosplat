@@ -29,6 +29,40 @@ pub use service::{TelemetryDeliveryStatus, TelemetryPreferences, TelemetryServic
 #[derive(Debug)]
 struct StageTiming {
     active: Option<(PipelineStage, Instant, bool)>,
+    last_stage: Option<TelemetryStage>,
+}
+
+#[cfg(test)]
+mod failure_stage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_stage_does_not_erase_the_failure_location() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(root.path().join("telemetry.json"));
+        service.preferences().await.unwrap();
+        let session =
+            PipelineTelemetrySession::new(service, Quality::High, TelemetryInputType::Images);
+        session.observe(&PipelineEvent::mapped(
+            PipelineStage::TrainingSplats,
+            0.0,
+            "start",
+        ));
+        session.observe(&PipelineEvent::mapped(
+            PipelineStage::TrainingSplats,
+            1.0,
+            "done",
+        ));
+        assert!(session.timing.lock().unwrap().active.is_none());
+        let mut log = PipelineEvent::mapped(PipelineStage::Matching, 0.0, "late log");
+        log.kind = EventKind::Log;
+        session.observe(&log);
+        session.observe(&PipelineEvent::mapped(PipelineStage::Failed, 1.0, "failed"));
+        assert_eq!(
+            session.current_stage(),
+            Some(TelemetryStage::TrainingSplats)
+        );
+    }
 }
 
 struct PlannerTelemetryRun {
@@ -47,6 +81,7 @@ pub struct PipelineTelemetrySession {
     input_type: TelemetryInputType,
     started: Instant,
     timing: Mutex<StageTiming>,
+    finished: AtomicBool,
     planner_run: Option<PlannerTelemetryRun>,
 }
 
@@ -61,7 +96,11 @@ impl PipelineTelemetrySession {
             quality: quality.into(),
             input_type,
             started: Instant::now(),
-            timing: Mutex::new(StageTiming { active: None }),
+            timing: Mutex::new(StageTiming {
+                active: None,
+                last_stage: None,
+            }),
+            finished: AtomicBool::new(false),
             planner_run: None,
         }
     }
@@ -79,7 +118,11 @@ impl PipelineTelemetrySession {
             quality: quality.into(),
             input_type,
             started: Instant::now(),
-            timing: Mutex::new(StageTiming { active: None }),
+            timing: Mutex::new(StageTiming {
+                active: None,
+                last_stage: None,
+            }),
+            finished: AtomicBool::new(false),
             planner_run: Some(PlannerTelemetryRun {
                 run_id: uuid::Uuid::new_v4(),
                 run_kind,
@@ -98,7 +141,7 @@ impl PipelineTelemetrySession {
     }
 
     pub fn observe(&self, event: &PipelineEvent) {
-        if event.kind != EventKind::Stage {
+        if self.finished.load(Ordering::Acquire) || event.kind != EventKind::Stage {
             return;
         }
         let Some(stage) = TelemetryStage::from_pipeline(event.stage) else {
@@ -109,6 +152,7 @@ impl PipelineTelemetrySession {
             .timing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        timing.last_stage = Some(stage);
 
         if timing
             .active
@@ -128,7 +172,10 @@ impl PipelineTelemetrySession {
             timing.active = Some((event.stage, now, record_effectiveness));
         }
 
-        if event
+        if !matches!(
+            event.substage.as_deref(),
+            Some("panoramaTrainingPreparation" | "panoramaTrainingValidation")
+        ) && event
             .stage_progress
             .is_some_and(|progress| progress >= 99.999)
         {
@@ -146,6 +193,9 @@ impl PipelineTelemetrySession {
         frame_count: u64,
         source_duration_seconds: Option<f64>,
     ) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.flush_active_stage();
         self.service.track(TelemetryEvent::GenerationCompleted {
             quality_preset: self.quality,
@@ -157,6 +207,9 @@ impl PipelineTelemetrySession {
     }
 
     pub fn generation_failed(&self, error: &SplatError) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if matches!(error, SplatError::Cancelled) {
             return;
         }
@@ -176,8 +229,7 @@ impl PipelineTelemetrySession {
         self.timing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
-            .and_then(|(stage, _, _)| TelemetryStage::from_pipeline(stage))
+            .last_stage
     }
 
     fn emit_stage_completed(
@@ -264,6 +316,7 @@ fn pipeline_stage_from_telemetry(stage: TelemetryStage) -> Option<PipelineStage>
 
 fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> TelemetryErrorCode {
     match error {
+        SplatError::Diagnostic { source, .. } => safe_error_code(source, stage),
         SplatError::EngineMissing(_)
         | SplatError::EngineStart { .. }
         | SplatError::UnsupportedEngine(_) => TelemetryErrorCode::EngineUnavailable,
@@ -281,12 +334,35 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::Cancelled => TelemetryErrorCode::Unknown,
         SplatError::BrushOutOfMemory(_) => TelemetryErrorCode::BrushOutOfMemory,
         SplatError::BrushDeviceLost(_) => TelemetryErrorCode::BrushDeviceLost,
+        SplatError::EngineProcess(failure) => match failure.classification.kind {
+            Some("brush_out_of_memory") => TelemetryErrorCode::BrushOutOfMemory,
+            Some("brush_device_lost") => TelemetryErrorCode::BrushDeviceLost,
+            Some("mapper_storage")
+                if failure.detail.to_ascii_lowercase().contains("disk full")
+                    || failure
+                        .detail
+                        .to_ascii_lowercase()
+                        .contains("no space left") =>
+            {
+                TelemetryErrorCode::DiskSpaceLow
+            }
+            _ if failure.engine == crate::pipeline::PipelineEngine::Brush => {
+                TelemetryErrorCode::BrushFailed
+            }
+            _ if failure.engine == crate::pipeline::PipelineEngine::Colmap => {
+                match failure.operation.as_str() {
+                    "feature_extractor" => TelemetryErrorCode::ColmapFeatureFailed,
+                    "sequential_matcher" | "exhaustive_matcher" | "matches_importer" => {
+                        TelemetryErrorCode::ColmapMatchingFailed
+                    }
+                    _ => TelemetryErrorCode::ColmapMapperFailed,
+                }
+            }
+            _ => TelemetryErrorCode::Unknown,
+        },
         SplatError::Process(detail) => {
             let normalized = detail.to_ascii_lowercase();
-            if normalized.contains("out of memory")
-                || normalized.contains("outofmemory")
-                || detail.contains("显存不足")
-            {
+            if stage == Some(TelemetryStage::TrainingSplats) && crate::failure::gpu_oom(detail) {
                 return TelemetryErrorCode::BrushOutOfMemory;
             }
             if normalized.contains("no space")
@@ -321,8 +397,50 @@ mod tests {
     use super::*;
     use crate::pipeline::{EventLevel, PipelineEngine};
 
+    #[test]
+    fn engine_failure_telemetry_keeps_existing_codes_without_cross_engine_oom_guesses() {
+        for (engine, text, expected) in [
+            (
+                PipelineEngine::Brush,
+                "wgpu error: Out of Memory\nAn IO error happened",
+                TelemetryErrorCode::BrushOutOfMemory,
+            ),
+            (
+                PipelineEngine::Brush,
+                "BufferTooBig(2290420416)",
+                TelemetryErrorCode::BrushFailed,
+            ),
+            (
+                PipelineEngine::Brush,
+                "VK_ERROR_DEVICE_LOST",
+                TelemetryErrorCode::BrushDeviceLost,
+            ),
+            (
+                PipelineEngine::Colmap,
+                "wgpu error: Out of Memory",
+                TelemetryErrorCode::ColmapMapperFailed,
+            ),
+        ] {
+            let output = crate::process::ProcessOutput {
+                success: false,
+                exit_code: Some(101),
+                termination: Default::default(),
+                stdout: String::new(),
+                stderr: text.into(),
+            };
+            let failure =
+                crate::failure::EngineProcessFailure::from_output(engine, "mapper", &output);
+            let error = SplatError::EngineProcess(Box::new(failure));
+            assert_eq!(
+                safe_error_code(&error, Some(TelemetryStage::TrainingSplats)),
+                expected
+            );
+        }
+    }
+
     fn stage_event(stage: PipelineStage, stage_progress: f32) -> PipelineEvent {
         PipelineEvent {
+            operation: None,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -332,6 +450,7 @@ mod tests {
             level: EventLevel::Info,
             stage,
             engine: Some(PipelineEngine::System),
+            substage: None,
             progress: stage_progress,
             stage_progress: Some(stage_progress),
             indeterminate: false,
@@ -361,6 +480,28 @@ mod tests {
             safe_error_code(&SplatError::Cancelled, None),
             TelemetryErrorCode::Unknown
         );
+    }
+
+    #[test]
+    fn panorama_preparation_does_not_complete_the_training_telemetry_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(directory.path().join("telemetry.json"));
+        let session =
+            PipelineTelemetrySession::new(service, Quality::Fast, TelemetryInputType::Video);
+        let mut event = stage_event(PipelineStage::TrainingSplats, 0.0);
+        event.substage = Some("panoramaTrainingPreparation".into());
+        session.observe(&event);
+        event.stage_progress = Some(100.0);
+        event.substage = Some("panoramaTrainingValidation".into());
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.substage = Some("training".into());
+        event.stage_progress = Some(0.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.stage_progress = Some(100.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_none());
     }
 
     #[test]
@@ -426,9 +567,9 @@ mod tests {
             true,
             PlannerEffectivenessTracker::default(),
         );
-        session.generation_failed(&SplatError::Cancelled);
         session.generation_completed(100, 30, None);
         session.generation_completed(100, 30, None);
+        session.generation_failed(&SplatError::Process("late failure".into()));
 
         for _ in 0..50 {
             if events
@@ -441,16 +582,90 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let recorded = events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let evaluations = recorded
-            .iter()
-            .filter(|value| value["event"] == "planner_evaluation")
-            .collect::<Vec<_>>();
-        assert_eq!(evaluations.len(), 1);
-        assert_eq!(evaluations[0]["properties"]["runKind"], "resume");
-        assert_eq!(evaluations[0]["properties"]["outcome"], "completed");
+        {
+            let recorded = events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let evaluations = recorded
+                .iter()
+                .filter(|value| value["event"] == "planner_evaluation")
+                .collect::<Vec<_>>();
+            assert_eq!(evaluations.len(), 1);
+            assert_eq!(evaluations[0]["properties"]["runKind"], "resume");
+            assert_eq!(evaluations[0]["properties"]["outcome"], "completed");
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|event| event["event"] == "generation_completed")
+                    .count(),
+                1
+            );
+            assert!(!recorded
+                .iter()
+                .any(|event| event["event"] == "generation_failed"));
+        }
+
+        let cancelled = PipelineTelemetrySession::new_with_planner_evaluation(
+            session.service.clone(),
+            Quality::High,
+            TelemetryInputType::Images,
+            TelemetryRunKind::New,
+            true,
+            PlannerEffectivenessTracker::default(),
+        );
+        cancelled.generation_failed(&SplatError::Cancelled);
+        cancelled.generation_completed(100, 30, None);
+        assert!(cancelled.finished.load(Ordering::Acquire));
+
+        let failed = PipelineTelemetrySession::new_with_planner_evaluation(
+            session.service.clone(),
+            Quality::High,
+            TelemetryInputType::Images,
+            TelemetryRunKind::New,
+            true,
+            PlannerEffectivenessTracker::default(),
+        );
+        failed.generation_failed(&SplatError::BrushDeviceLost("fixture".into()));
+        failed.generation_failed(&SplatError::BrushDeviceLost("duplicate".into()));
+        failed.generation_completed(100, 30, None);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let ready = {
+                    let events = events.lock().unwrap();
+                    events
+                        .iter()
+                        .filter(|event| event["event"] == "planner_evaluation")
+                        .count()
+                        == 2
+                        && events
+                            .iter()
+                            .filter(|event| event["event"] == "generation_failed")
+                            .count()
+                            == 1
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event["event"] == "generation_completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event["event"] == "generation_failed")
+                .count(),
+            1
+        );
     }
 
     #[test]
