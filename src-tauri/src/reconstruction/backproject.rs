@@ -1295,6 +1295,211 @@ mod tests {
         assert_eq!(touching.cluster_count, 1);
     }
 
+    // ---- cluster-level filter (issue #15) --------------------------------
+
+    /// Lays out `count` points on a compact lattice starting at `origin`, so a
+    /// synthetic cluster's spatial spread stays far below the distances the
+    /// filter measures between clusters.
+    fn lattice_cluster(origin: [f64; 3], count: usize, step: f64) -> Vec<[f64; 3]> {
+        let side = (count as f64).cbrt().ceil().max(1.0) as usize;
+        (0..count)
+            .map(|index| {
+                [
+                    origin[0] + step * (index % side) as f64,
+                    origin[1] + step * ((index / side) % side) as f64,
+                    origin[2] + step * (index / (side * side)) as f64,
+                ]
+            })
+            .collect()
+    }
+
+    /// Builds `(positions, labels)` for a synthetic scene; cluster `i` gets
+    /// label `i + 1`, the numbering `label_object_clusters` produces.
+    fn labelled_scene(clusters: &[(usize, [f64; 3])]) -> (Vec<[f64; 3]>, Vec<i32>) {
+        let mut positions = Vec::new();
+        let mut labels = Vec::new();
+        for (index, (count, origin)) in clusters.iter().enumerate() {
+            positions.extend(lattice_cluster(*origin, *count, 0.02));
+            labels.extend(std::iter::repeat_n((index + 1) as i32, *count));
+        }
+        (positions, labels)
+    }
+
+    #[test]
+    fn cluster_filter_keeps_main_and_near_cluster_but_drops_far_cluster() {
+        // Main (120) + near dense cluster (40 splats, ~0.22 m away) + far
+        // cluster (40 splats, ~3.9 m away). Both non-main clusters clear
+        // min_cluster_points; only the far one violates the distance rule.
+        let (positions, labels) = labelled_scene(&[
+            (120, [0.0, 0.0, 0.0]),
+            (40, [0.3, 0.0, 0.0]),
+            (40, [4.0, 0.0, 0.0]),
+        ]);
+        let config = ClusterFilterConfig {
+            min_cluster_points: 30,
+            max_distance_ratio: Some(0.15),
+        };
+        let outcome = filter_object_clusters(&positions, &labels, &config).unwrap();
+        println!(
+            "[acceptance] filter: kept clusters={} (points={}), dropped clusters={} (points={}), diag={:.3}",
+            outcome.kept_clusters,
+            outcome.kept_points,
+            outcome.dropped_clusters,
+            outcome.dropped_points,
+            outcome.scene_diagonal
+        );
+        for cluster in &outcome.clusters {
+            println!(
+                "[acceptance]   label={} points={} distance={:.3} ratio={:.4} kept={}",
+                cluster.label, cluster.points, cluster.distance_to_main,
+                cluster.distance_ratio, cluster.kept
+            );
+        }
+        assert_eq!(outcome.kept_clusters, 2);
+        assert_eq!(outcome.dropped_clusters, 1);
+        assert_eq!(outcome.dropped_points, 40);
+        assert_eq!(outcome.kept_points + outcome.dropped_points, 200);
+        assert!(outcome.labels[..120].iter().all(|label| *label == 1));
+        assert!(outcome.labels[120..160].iter().all(|label| *label == 2));
+        assert!(
+            outcome.labels[160..].iter().all(|label| *label == 0),
+            "far cluster must fall back to background"
+        );
+        // Stats are ordered by cluster size, largest (always kept) first.
+        assert_eq!(outcome.clusters[0].label, 1);
+        assert!(outcome.clusters[0].kept, "the largest cluster is never dropped");
+        assert_eq!(outcome.clusters[0].distance_to_main, 0.0);
+        assert!(outcome.clusters.iter().any(|cluster| !cluster.kept
+            && cluster.points == 40
+            && cluster.distance_ratio > 0.15));
+    }
+
+    #[test]
+    fn cluster_filter_keeps_cluster_exactly_at_min_cluster_points() {
+        // Boundary: 30 points is kept, 29 is dropped (rule is `<`).
+        let (positions, labels) = labelled_scene(&[
+            (50, [0.0, 0.0, 0.0]),
+            (30, [0.3, 0.0, 0.0]),
+            (29, [0.6, 0.0, 0.0]),
+        ]);
+        let config = ClusterFilterConfig {
+            min_cluster_points: 30,
+            max_distance_ratio: None,
+        };
+        let outcome = filter_object_clusters(&positions, &labels, &config).unwrap();
+        assert_eq!(outcome.kept_clusters, 2, "main + exactly-at-threshold");
+        assert_eq!(outcome.dropped_clusters, 1);
+        assert_eq!(outcome.dropped_points, 29);
+        assert!(outcome.labels[50..80].iter().all(|label| *label == 2));
+        assert!(outcome.labels[80..].iter().all(|label| *label == 0));
+    }
+
+    #[test]
+    fn cluster_filter_always_keeps_the_largest_cluster_even_below_threshold() {
+        // A tiny main cluster (5 points) must survive even though every
+        // cluster here is below min_cluster_points: the largest cluster is
+        // the only reference for "far away" and is never dropped.
+        let (positions, labels) = labelled_scene(&[(5, [0.0, 0.0, 0.0]), (3, [0.2, 0.0, 0.0])]);
+        let config = ClusterFilterConfig {
+            min_cluster_points: 30,
+            max_distance_ratio: Some(0.1),
+        };
+        let outcome = filter_object_clusters(&positions, &labels, &config).unwrap();
+        assert_eq!(outcome.kept_clusters, 1);
+        assert_eq!(outcome.dropped_clusters, 1);
+        assert!(outcome.labels[..5].iter().all(|label| *label == 1));
+        assert!(outcome.labels[5..].iter().all(|label| *label == 0));
+    }
+
+    #[test]
+    fn cluster_filter_handles_empty_and_noise_only_scenes() {
+        let config = ClusterFilterConfig::default();
+        let empty = filter_object_clusters(&[], &[], &config).unwrap();
+        assert!(empty.labels.is_empty());
+        assert_eq!(empty.kept_clusters, 0);
+        assert_eq!(empty.dropped_clusters, 0);
+        assert_eq!(empty.scene_diagonal, 0.0);
+        // Only label 0 (background splats) / no candidate at all.
+        let labels = vec![0_i32; 7];
+        let noise = filter_object_clusters(&[[0.0; 3]; 7], &labels, &config).unwrap();
+        assert_eq!(noise.labels, labels);
+        assert_eq!(noise.kept_points, 0);
+        assert_eq!(noise.dropped_points, 0);
+        assert_eq!(noise.kept_clusters, 0);
+        assert_eq!(noise.dropped_clusters, 0);
+    }
+
+    #[test]
+    fn cluster_filter_rejects_label_length_mismatch() {
+        let error = filter_object_clusters(
+            &[[0.0; 3]; 4],
+            &[1, 1, 0],
+            &ClusterFilterConfig::default(),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("簇标签"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn cluster_filter_distance_rule_can_be_disabled() {
+        let (positions, labels) =
+            labelled_scene(&[(80, [0.0, 0.0, 0.0]), (40, [5.0, 0.0, 0.0])]);
+        let config = ClusterFilterConfig {
+            min_cluster_points: 30,
+            max_distance_ratio: None,
+        };
+        let outcome = filter_object_clusters(&positions, &labels, &config).unwrap();
+        assert_eq!(outcome.kept_clusters, 2, "dense far cluster survives");
+        assert_eq!(outcome.dropped_clusters, 0);
+        assert!(outcome.labels[80..].iter().all(|label| *label == 2));
+    }
+
+    #[test]
+    fn cluster_filter_after_dbscan_keeps_main_and_near_blob() {
+        // End-to-end wiring: DBSCAN (eps 0.1, min_points 10) over three dense
+        // 3x3x3 blobs — main at the origin, near at 0.4 m, far at 4 m — then
+        // the cluster filter. The near blob clears both rules, the far one
+        // only fails the distance rule.
+        let mut positions = Vec::new();
+        for origin in [[0.0_f64, 0.0, 0.0], [0.4, 0.0, 0.0], [4.0, 0.0, 0.0]] {
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        positions.push([
+                            origin[0] + 0.03 * f64::from(i),
+                            origin[1] + 0.03 * f64::from(j),
+                            origin[2] + 0.03 * f64::from(k),
+                        ]);
+                    }
+                }
+            }
+        }
+        let candidates = vec![true; positions.len()];
+        let clusters = label_object_clusters(
+            &positions,
+            &candidates,
+            &ClusterConfig {
+                eps: 0.1,
+                min_points: 10,
+            },
+        );
+        assert_eq!(clusters.cluster_count, 3);
+        let outcome = filter_object_clusters(
+            &positions,
+            &clusters.labels,
+            &ClusterFilterConfig {
+                min_cluster_points: 20,
+                max_distance_ratio: Some(0.1),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.kept_clusters, 2);
+        assert_eq!(outcome.dropped_clusters, 1);
+        assert_eq!(outcome.dropped_points, 27);
+        assert!(outcome.labels[54..].iter().all(|label| *label == 0));
+    }
+
     // ---- instance bitmap output + frame pairing --------------------------
 
     #[test]
