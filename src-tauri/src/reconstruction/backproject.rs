@@ -669,6 +669,222 @@ pub fn label_object_clusters(
     }
 }
 
+/// Cluster-level filtering of the DBSCAN output (issue #15).
+///
+/// `label_object_clusters` drops isolated splats (non-core noise), but a real
+/// scan of one object still breaks into dozens of DBSCAN clusters and a few of
+/// them are junk sitting away from the object. Those are whole clusters, so
+/// they have to be judged as clusters — a per-splat vote ratio cannot see them.
+///
+/// The largest cluster is always kept: on P2 the chair's seat and backrest
+/// split into separate clusters at eps = 0.1, and deleting everything that is
+/// not the largest is exactly what erased the seat cushion in #14. Rules B/C
+/// therefore only ever remove clusters *relative to* the largest one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterFilterConfig {
+    /// Non-largest clusters with fewer splats than this fall back to
+    /// background. `0` disables the size rule.
+    pub min_cluster_points: usize,
+    /// Optional distance gate: a non-largest cluster is dropped when its
+    /// nearest splat is farther from the largest cluster than
+    /// `max_distance_ratio * scene_diagonal`, where the diagonal is the AABB
+    /// diagonal of the labelled (candidate) splats.
+    pub max_distance_ratio: Option<f64>,
+}
+
+impl Default for ClusterFilterConfig {
+    /// Defaults derived from the P1/P2 runs (object.ply produced with
+    /// eps = 0.1, DBSCAN min_points = 10):
+    ///
+    /// * `min_cluster_points = 30`. P1 has 27 clusters, the largest holding
+    ///   13052 of 13810 splats (94.5 %); its tail is 29, 25, 21, 21, 18, ...
+    ///   At 30 the filter removes 312 splats (2.26 %), at 50 it removes 472
+    ///   (3.42 %) — beyond the 3 % non-regression budget, because P1's small
+    ///   clusters are chair surface patches within 0.34 m of the body, not
+    ///   junk. P2 has 62 clusters (largest 4112) and a continuous tail
+    ///   (26, 25, 24, 23, 23, 22 x 8, 21, 20, ...) with no natural gap, so
+    ///   there the threshold is a policy choice: 30 drops 33 clusters / 538
+    ///   splats (7.3 %), 50 drops 45 clusters / 955 splats (12.9 %).
+    /// * `max_distance_ratio = None`. Measured nearest-point distances from
+    ///   real chair fragments to the largest cluster reach 1.01 m on P2 —
+    ///   5.9 % of the 17.1 m candidate diagonal, but 26 % of the largest
+    ///   cluster's own 3.85 m extent. A ratio of the *scene* diagonal is only
+    ///   safe while distant noise inflates that diagonal; in a tighter scene
+    ///   the same ratio would delete those fragments, which is the #14
+    ///   regression. The gate stays opt-in (`--max-distance-ratio`); at 0.15
+    ///   it trims P2's far specks (6869 -> 6369 splats) without touching P1.
+    fn default() -> Self {
+        Self {
+            min_cluster_points: 30,
+            max_distance_ratio: None,
+        }
+    }
+}
+
+/// Per-cluster decision produced by [`filter_object_clusters`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterFilterSummary {
+    /// Instance label from `label_object_clusters` (1..).
+    pub label: i32,
+    /// Splats in this cluster.
+    pub points: usize,
+    /// Distance from the closest splat of this cluster to the largest cluster
+    /// (0 for the largest cluster, which is its own reference).
+    pub distance_to_main: f64,
+    /// `distance_to_main` divided by the candidate AABB diagonal.
+    pub distance_ratio: f64,
+    /// Whether the cluster survived the filter.
+    pub kept: bool,
+}
+
+/// Result of [`filter_object_clusters`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterFilterOutcome {
+    /// Per splat labels; dropped clusters are reset to 0 (background) so that
+    /// object + background still partition every splat of `final.ply`.
+    pub labels: Vec<i32>,
+    /// Every input cluster, largest first (ties by label).
+    pub clusters: Vec<ClusterFilterSummary>,
+    pub kept_clusters: usize,
+    pub dropped_clusters: usize,
+    /// Splats of the kept clusters (the new object.ply size).
+    pub kept_points: usize,
+    /// Splats that fell back to background.
+    pub dropped_points: usize,
+    /// AABB diagonal of the labelled splats, the scale of `distance_ratio`.
+    pub scene_diagonal: f64,
+}
+
+/// Drops whole clusters that are too small or too far from the largest one.
+///
+/// Pure post-processing of [`label_object_clusters`]: it only rewrites labels,
+/// never positions, and a dropped cluster becomes background instead of being
+/// deleted, so the object/background split stays exhaustive. The largest
+/// cluster is unconditionally kept. Query complexity is
+/// O(sum(non-main splats) x main splats) — ~1.3e7 distance evaluations on the
+/// current P1/P2 scans, fast enough to avoid an approximate grid.
+pub fn filter_object_clusters(
+    positions: &[[f64; 3]],
+    labels: &[i32],
+    config: &ClusterFilterConfig,
+) -> Result<ClusterFilterOutcome> {
+    if labels.len() != positions.len() {
+        return Err(SplatError::Process(format!(
+            "簇标签数量 {} 与 splat 位置数量 {} 不一致",
+            labels.len(),
+            positions.len()
+        )));
+    }
+    let mut members: std::collections::BTreeMap<i32, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for (index, label) in labels.iter().copied().enumerate() {
+        if label == 0 {
+            continue;
+        }
+        members.entry(label).or_default().push(index);
+        let position = positions[index];
+        for axis in 0..3 {
+            low[axis] = low[axis].min(position[axis]);
+            high[axis] = high[axis].max(position[axis]);
+        }
+    }
+    let scene_diagonal = if members.is_empty() {
+        0.0
+    } else {
+        ((high[0] - low[0]).powi(2) + (high[1] - low[1]).powi(2) + (high[2] - low[2]).powi(2))
+            .sqrt()
+    };
+
+    // Largest cluster first; ties resolved by label so the choice (and the
+    // reported order) is deterministic.
+    let mut order: Vec<(i32, usize)> = members
+        .iter()
+        .map(|(label, indices)| (*label, indices.len()))
+        .collect();
+    order.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let main_label = order.first().map(|(label, _)| *label);
+    let main_points: Vec<[f64; 3]> = main_label
+        .and_then(|label| members.get(&label))
+        .map(|indices| indices.iter().map(|index| positions[*index]).collect())
+        .unwrap_or_default();
+
+    let mut filtered = labels.to_vec();
+    let mut summaries = Vec::with_capacity(order.len());
+    let (mut kept_clusters, mut dropped_clusters) = (0_usize, 0_usize);
+    let (mut kept_points, mut dropped_points) = (0_usize, 0_usize);
+    for (label, points) in order {
+        let is_main = Some(label) == main_label;
+        let indices = &members[&label];
+        let distance_to_main = if is_main {
+            0.0
+        } else {
+            indices
+                .iter()
+                .map(|index| nearest_distance(positions[*index], &main_points))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let distance_ratio = if scene_diagonal > 0.0 {
+            distance_to_main / scene_diagonal
+        } else {
+            0.0
+        };
+        let too_small = !is_main && points < config.min_cluster_points;
+        let too_far = !is_main
+            && config
+                .max_distance_ratio
+                .is_some_and(|ratio| distance_to_main > ratio.max(0.0) * scene_diagonal);
+        let kept = !(too_small || too_far);
+        if kept {
+            kept_clusters += 1;
+            kept_points += points;
+        } else {
+            dropped_clusters += 1;
+            dropped_points += points;
+            for index in indices {
+                filtered[*index] = 0;
+            }
+        }
+        summaries.push(ClusterFilterSummary {
+            label,
+            points,
+            distance_to_main,
+            distance_ratio,
+            kept,
+        });
+    }
+    Ok(ClusterFilterOutcome {
+        labels: filtered,
+        clusters: summaries,
+        kept_clusters,
+        dropped_clusters,
+        kept_points,
+        dropped_points,
+        scene_diagonal,
+    })
+}
+
+/// Euclid distance from `point` to the closest point of `cloud`.
+fn nearest_distance(point: [f64; 3], cloud: &[[f64; 3]]) -> f64 {
+    let mut best = f64::INFINITY;
+    for other in cloud {
+        let delta = [
+            point[0] - other[0],
+            point[1] - other[1],
+            point[2] - other[2],
+        ];
+        let squared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+        if squared < best {
+            best = squared;
+            if best == 0.0 {
+                break;
+            }
+        }
+    }
+    best.sqrt()
+}
+
 /// Writes the object/environment split as an OOSMASK-compatible packed bitmap
 /// (one bit per splat, set = object instance) to a derived-asset path.
 ///
@@ -1351,8 +1567,11 @@ mod tests {
         for cluster in &outcome.clusters {
             println!(
                 "[acceptance]   label={} points={} distance={:.3} ratio={:.4} kept={}",
-                cluster.label, cluster.points, cluster.distance_to_main,
-                cluster.distance_ratio, cluster.kept
+                cluster.label,
+                cluster.points,
+                cluster.distance_to_main,
+                cluster.distance_ratio,
+                cluster.kept
             );
         }
         assert_eq!(outcome.kept_clusters, 2);
@@ -1367,11 +1586,15 @@ mod tests {
         );
         // Stats are ordered by cluster size, largest (always kept) first.
         assert_eq!(outcome.clusters[0].label, 1);
-        assert!(outcome.clusters[0].kept, "the largest cluster is never dropped");
+        assert!(
+            outcome.clusters[0].kept,
+            "the largest cluster is never dropped"
+        );
         assert_eq!(outcome.clusters[0].distance_to_main, 0.0);
-        assert!(outcome.clusters.iter().any(|cluster| !cluster.kept
-            && cluster.points == 40
-            && cluster.distance_ratio > 0.15));
+        assert!(outcome
+            .clusters
+            .iter()
+            .any(|cluster| !cluster.kept && cluster.points == 40 && cluster.distance_ratio > 0.15));
     }
 
     #[test]
@@ -1431,20 +1654,16 @@ mod tests {
 
     #[test]
     fn cluster_filter_rejects_label_length_mismatch() {
-        let error = filter_object_clusters(
-            &[[0.0; 3]; 4],
-            &[1, 1, 0],
-            &ClusterFilterConfig::default(),
-        )
-        .unwrap_err();
+        let error =
+            filter_object_clusters(&[[0.0; 3]; 4], &[1, 1, 0], &ClusterFilterConfig::default())
+                .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("簇标签"), "unexpected error: {message}");
     }
 
     #[test]
     fn cluster_filter_distance_rule_can_be_disabled() {
-        let (positions, labels) =
-            labelled_scene(&[(80, [0.0, 0.0, 0.0]), (40, [5.0, 0.0, 0.0])]);
+        let (positions, labels) = labelled_scene(&[(80, [0.0, 0.0, 0.0]), (40, [5.0, 0.0, 0.0])]);
         let config = ClusterFilterConfig {
             min_cluster_points: 30,
             max_distance_ratio: None,
