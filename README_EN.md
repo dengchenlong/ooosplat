@@ -419,7 +419,7 @@ Linux FFmpeg/FFprobe retain their individual environment/PATH discovery. Brush d
 
 ## MCP (optional)
 
-Enable it under Settings → MCP to let local AI agents such as Codex create, start, inspect, and cancel tasks and read logs. These tasks appear in the application. The service is off by default, listens only on `127.0.0.1`, and needs no token.
+Enable it under Settings → MCP to let local AI agents such as Codex inspect ordinary/panorama inputs, collect generation and reshoot answers, start/resume tasks, and read status and logs. Agents can also export saved edits as standard PLY, compressed PLY, SPZ, or SOG without opening preview; files stay in the project's `exports/` directory, and SPZ range adjustments require user approval. The service is off by default, listens only on `127.0.0.1`, and needs no token.
 
 See the [MCP documentation](docs/mcp-v1.md) for connection and configuration examples.
 

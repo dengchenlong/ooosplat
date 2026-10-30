@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Application, Entity } from "@playcanvas/react";
+import { useMcpExportActivity } from "../../lib/mcpExportExecutor";
 import { Camera, GSplat } from "@playcanvas/react/components";
 import { useApp, useSplat } from "@playcanvas/react/hooks";
 import {
@@ -1093,7 +1094,17 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   const onStatus = useCallback((status: ViewportStatus) => setViewport(status), []);
   const onAnimationStatus = useCallback((status: AnimationStatus) => setAnimationStatus(status), []);
   const gaussianExporting = !["closed", "completed", "error"].includes(gaussianExportDialog.phase);
-  const operationBusy = savingEdits || navigationSaving || pendingNavigation !== null || htmlBusy || htmlConfirm || cropFreezing || gaussianExporting || !["idle", "completed", "error"].includes(videoPhase);
+  const mcpExporting = useMcpExportActivity(state => state.projectId !== null && state.projectId === store.descriptor?.projectId);
+  const localOperationBusy = savingEdits || navigationSaving || pendingNavigation !== null || htmlBusy || htmlConfirm || cropFreezing || gaussianExporting || !["idle", "completed", "error"].includes(videoPhase);
+  const editorBusy = localOperationBusy || gizmoDragging || selectionBusy || selectionDrag !== null;
+  useEffect(() => {
+    const projectId = store.descriptor?.projectId ?? null;
+    useMcpExportActivity.setState({ editorProjectId: projectId, editorBusy });
+    return () => {
+      if (useMcpExportActivity.getState().editorProjectId === projectId) useMcpExportActivity.setState({ editorProjectId: null, editorBusy: false });
+    };
+  }, [store.descriptor?.projectId, editorBusy]);
+  const operationBusy = localOperationBusy || mcpExporting;
   const busy = operationBusy || gizmoDragging || selectionBusy;
   const interactionBlocked = operationBusy || selectionBusy || viewport.phase !== "ready" || cropFreezeError !== null;
   const focusAllowedRef = useRef(false);

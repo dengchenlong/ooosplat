@@ -43,13 +43,19 @@ All tools have input/output JSON Schemas and structured results. MCP fields use 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `get_app_status` | `{}` | App/engine versions, capabilities, active task, start availability and recommended polling interval |
+| `inspect_generation_input` | Required `input_path`, `quality`; optional `generation_policy`, `source_project_id` | Cached lightweight input analysis, source identity, estimated frame plan, GPS summary and bilingual questions |
 | `inspect_reshoot_input` | Required `source_project_id`, authorized `input_path`, `quality` | Read-only source/input analysis, projection, identities, warm-start availability |
-| `create_generation_task` | Required `input_path`, `quality`, `client_request_id`; optional paired `source_project_id`, `reshoot_options` | Persisted task; generation has not started |
-| `start_task` | Required `task_id` | `accepted`, `task_id`, `run_id`, status and revision |
+| `create_generation_task` | Required `input_path`, `quality`, `client_request_id`; optional `preflight_id`, `input_source_identity`, `answers`, `generation_policy`, `source_project_id`; legacy `reshoot_options` retained | Persisted task only after all required answers; generation has not started |
+| `start_task` | Required `task_id`; optional `retry_failed_run_id` | Start a created task or explicitly retry the identified failed run |
+| `resume_task` | Required `task_id`, `expected_run_id` | Resume cancelled/interrupted work using its saved recipe and checkpoint |
 | `list_tasks` | Optional `cursor`, `limit` (default 50, maximum 100) | Tasks, `next_cursor`, `has_more` |
 | `get_task_status` | Required `task_id` | State, stage, progress, frozen/actual configuration, time, errors, run identities and local artifacts |
 | `read_task_logs` | Required `task_id`; optional `run_id`, `sources`, `cursor`, `tail_lines`, `max_bytes` | Bounded text chunks, cursor, truncation/reset flags and registered sources |
 | `cancel_task` | Required `task_id`, `run_id` | Current task state after requesting cancellation |
+| `start_model_export` | Required `project_id`, `format`, `client_request_id` | Application-owned export job; formats `ply`, `compressed_ply`, `spz`, `sog` |
+| `get_model_export_status` | Required `export_id` | Phase, nullable progress, pending SPZ confirmation or final local file metadata |
+| `confirm_model_export` | Required `export_id`, `confirmation_id`, `accepted` | Approve the exact pending adjustment after asking the user; false cancels |
+| `cancel_model_export` | Required `export_id` | Cancel this export and remove only its owned temporary file |
 
 `input_path` names an existing MP4/MOV video or an image directory. Output uses the remembered project root; the Agent cannot override engine commands or output destinations. `client_request_id` must be 1–256 bytes. Reusing a key with the same explicit parameters returns the original task, even if global settings have subsequently changed; different parameters return `IDEMPOTENCY_CONFLICT`.
 
@@ -63,11 +69,75 @@ created → starting → running → completed / failed
                  cancelling → cancelled
 ```
 
-After an app restart, leftover active states become `interrupted`. No job is automatically restarted. Existing GUI resume creates a fresh run of the same task using its saved configuration and existing checkpoints. MCP tools do not implicitly resume failed, cancelled, interrupted or completed tasks. New reshoots require explicit model-condition and fallback decisions; see [Reshoot v2](RESHOOT_V2.md). The nested `reshoot_options` uses the application's camelCase field names; outer MCP fields remain snake_case.
+After an app restart, leftover active states become `interrupted`. No job is automatically restarted. `resume_task` requires the last run ID and a readable checkpoint containing completed work, and preserves its saved recipe. Missing work returns `NO_RESUMABLE_CHECKPOINT`; mismatched runs return `STALE_RUN_ID`. Failed runs use `start_task.retry_failed_run_id` for explicit manual retry, not resume; completed tasks cannot restart. New reshoots require explicit answers; see [Reshoot v2](RESHOOT_V2.md). Nested `generation_policy` and legacy `reshoot_options` retain application camelCase field names; outer MCP fields and `answers` use snake_case.
 
 `progress` is an observed stage percentage when actual counters are available; `estimated_progress` is the existing overall stage estimate. These are different measurements. `runtime` contains the latest existing engine runtime snapshot when available. ETA is an estimate based on observed training rate and becomes null when unavailable. `actual_configuration` contains resolved frame/resolution/Brush settings as the Runner saves checkpoints, without transferring large frame lists.
 
 Completed results contain only local paths, sizes and model metadata. PLY contents and Base64 models are never returned. If the user deletes a project through the GUI, its row and artifacts are removed; the task's identity remains queryable with `project_deleted: true` and `result: null`.
+
+## Input preflight and answers / 素材预检与回答
+
+Call `inspect_generation_input` first. It shares GUI header-only analysis, projection detection, planning and hardware caches; changing quality or sampling replans without another metadata scan/FFprobe. `input` contains measured metadata; `plan_is_estimate: true` labels the plan and duration estimate. `max_splats` is null: a preflight cannot know a budget that depends on the final sparse reconstruction. This upgrade does not change recipes or resolve existing panorama High entry-point differences; use saved actual parameters, not a predicted cap.
+
+先预检，再由 Agent 向用户询问返回的 `questions`，不弹桌面确认框。每题包含稳定的 `key`、`options[].value` 及 `zh-CN`／`en` 文案；没有预选答案。用户已明确给出的答案可复用，缺失答案不能由 Agent 猜测。创建时带回同一 `preflight_id`、`input_source_identity`、配置和答案。
+
+| Answer key | Stable values | Required when |
+| --- | --- | --- |
+| `input_projection` | `perspective`, `equirectangular` | Projection is ambiguous; unsupported ERP cannot be forced through |
+| `small_images` | `true` (acknowledge warning) | New image task has fewer than 30 images, not reshoot |
+| `model_condition` | `good`, `appearance`, `geometry`, `unsure` | Reshoot |
+| `camera_relation` | `same`, `different`, `unsure` | Ordinary reshoot, not ERP |
+| `image_order` | `sequential`, `exhaustive` | More than 100 images, ordinary or panorama, including reshoot |
+
+100 images or fewer retain exhaustive matching. Metadata-confirmed ERP is automatic. Unsupported spherical input may use ordinary processing only where the GUI allows it. Reshoot questions follow the existing model condition → ordinary camera settings → image order flow, without a second scheme confirmation. Retry authorization comes from `generation_policy.autoRetryEnabled`, not a second MCP switch.
+
+Missing answers return `{ "error": { "code": "CONFIRMATION_REQUIRED", "message": "…", "details": { "preflight_id": "…", "input_source_identity": "…", "questions": [] } } }` with the unanswered questions, **without creating a task**. Stale/expired preflight, changed input or changed source/configuration returns `INPUT_CHANGED`; inspect again and ask any affected questions. Creation and start both check input identity. Old calls without a preflight still perform admission checks; no-question inputs remain compatible, but ambiguous inputs are not silently treated as ordinary.
+
+`generation_policy` accepts saved versions 1–3; new admission/manual retry resolves the current version 3, while interrupted resumes keep their saved policy. Nested options include `autoRetryEnabled` and optional `frameSamplingRatio` (0.001–1). Manual sampling keeps the existing Bridge v3 extra-frame budget; disabling automatic retry does not disable normal bridge backfill. No training parameters are changed here.
+
+GPS is a non-blocking summary (`pending`, `checked`, `unavailable`; nullable `detected`). No coordinates, geographic origin or per-image GPS manifest are returned. Status exposes actual projection/matching, bounded sampling/backfill summaries, initial/final Brush settings, controlled retries, actual reshoot path and GPS adoption/fallback status. Each run returns its last eight Brush executions in order, with a truncation flag; device/VRAM/driver remain null unless supported by that execution's evidence. Raw device identifiers and raw config/log blobs are not returned in these summaries.
+
+### 中文调用示例：疑似全景图片
+
+```json
+{"name":"inspect_generation_input","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","generation_policy":{"version":3,"autoRetryEnabled":true}}}
+{"name":"create_generation_task","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","client_request_id":"panorama-01","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","generation_policy":{"version":3,"autoRetryEnabled":true},"answers":{"input_projection":"equirectangular","image_order":"sequential"}}}
+{"name":"start_task","arguments":{"task_id":"TASK_UUID"}}
+```
+
+上述答案仅示意用户已明确选择完整全景、超过100张且按顺序排列的情况；按实际问题回答。少于30张的新任务还需确认 `small_images: true`。
+
+### English example: reshoot and resume
+
+```json
+{"name":"inspect_generation_input","arguments":{"input_path":"E:\\Media\\supplement","quality":"balanced","source_project_id":"SOURCE_UUID"}}
+{"name":"create_generation_task","arguments":{"input_path":"E:\\Media\\supplement","quality":"balanced","client_request_id":"reshoot-01","source_project_id":"SOURCE_UUID","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","answers":{"model_condition":"good","camera_relation":"different","image_order":"exhaustive"}}}
+{"name":"resume_task","arguments":{"task_id":"TASK_UUID","expected_run_id":"CANCELLED_OR_INTERRUPTED_RUN_UUID"}}
+{"name":"start_task","arguments":{"task_id":"FAILED_TASK_UUID","retry_failed_run_id":"FAILED_RUN_UUID"}}
+```
+
+Ask the returned questions first; these values are examples, not defaults. Resume/retry examples refer to different lifecycle states, not steps to run unconditionally.
+
+## Saved model exports / 已保存模型导出
+
+Exports use the same Rust edited virtual view and browser encoding Worker as the GUI, hosted at app level. No preview, Node runtime or intermediate PLY is required. Only registered published models plus **saved** transform/crop/deletions are used, applied once. Unsaved/saving edits or an ongoing target edit operation reject the request; ask the user to save/finish in the GUI. MCP does not autosave or edit models. GUI/MCP share one export lock and block edits to the target during export. `get_app_status.model_export` reports executor readiness, supported formats, `busy` (including GUI exports) and the current MCP job; a launchability check is not proof of successful GPU training.
+
+Output is fixed to `exports/mcp-UUID.{ply,compressed.ply,spz,sog}` inside the registered project, using unique names and atomic **no-replacement** publication. Redirected export directories are rejected. There is no arbitrary destination argument. The filesystem must support same-filesystem hard links for this publication step; failure leaves existing files intact. Existing cancellation, chunk bounds, source/revision validation and readback remain; removed memory-budget gates stay removed. Format limits still apply.
+
+SPZ range overflow pauses at `awaiting_confirmation`. Return its existing bilingual risk description and proposed `{center, scale}` to the user, then pass the exact export/confirmation IDs and explicit decision. No encoding or output temporary file is created while awaiting consent. Approval is not reusable in another job/retry; duplicate/stale approvals return `STALE_CONFIRMATION`. Source/revision checks run again after approval and before publication. Unsafe scaling still fails.
+
+```json
+{"name":"start_model_export","arguments":{"project_id":"PROJECT_UUID","format":"spz","client_request_id":"saved-spz-01"}}
+{"name":"get_model_export_status","arguments":{"export_id":"EXPORT_UUID"}}
+{"name":"confirm_model_export","arguments":{"export_id":"EXPORT_UUID","confirmation_id":42,"accepted":true}}
+{"name":"cancel_model_export","arguments":{"export_id":"EXPORT_UUID"}}
+```
+
+只在用户同意后发送 `accepted: true`；拒绝发送 false，或取消导出。确认等待期间仍占用导出互斥。发布开始后不能取消。成功仅返回路径、大小、点数、格式及实际坐标调整，不返回模型字节或 JSON 附件。
+
+Export jobs survive MCP disconnects while the app stays running. Executor reload/loss or app restart marks unfinished jobs interrupted, releases owned resources and does not resume encoding or carry approval forward. Start a new request ID to retry; the same ID returns the original job, including its terminal state. Export history is local in `mcp-exports.json`; no project schema/cloud protocol changes. Poll every 15–30 seconds and let the Agent serialize generation; this is not a backend queue and does not consume GUI drafts.
+
+Verification for this upgrade is recorded separately in [MCP upgrade validation](MCP_UPGRADE_VALIDATION.md). The older verification record below is historical, not evidence for new native desktop/platform end-to-end behavior.
 
 ## Invocation examples
 

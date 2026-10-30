@@ -413,13 +413,16 @@ pub struct VideoAnalysis {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputAnalysis {
-    input_type: ProjectInputType,
-    video: Option<VideoInfo>,
-    image_sequence: Option<ImageSequenceInfo>,
-    projection_detection: crate::video::panorama::ProjectionDetection,
+    pub(crate) input_type: ProjectInputType,
+    pub(crate) video: Option<VideoInfo>,
+    pub(crate) image_sequence: Option<ImageSequenceInfo>,
+    pub(crate) projection_detection: crate::video::panorama::ProjectionDetection,
 }
 
-async fn analyze_media(engine_paths: &EnginePaths, input: &Path) -> Result<InputAnalysis> {
+pub(crate) async fn analyze_media(
+    engine_paths: &EnginePaths,
+    input: &Path,
+) -> Result<InputAnalysis> {
     static CACHE: std::sync::OnceLock<
         tokio::sync::Mutex<std::collections::VecDeque<(String, InputAnalysis)>>,
     > = std::sync::OnceLock::new();
@@ -608,18 +611,39 @@ pub async fn probe_and_plan(
     generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
     let engine_paths = paths_for_app(&app);
+    let _ = planner_enabled;
+    plan_input(
+        &engine_paths,
+        PathBuf::from(path),
+        quality,
+        video_analysis,
+        input_analysis,
+        generation_policy,
+        Some(&app),
+    )
+    .await
+}
+
+/// Shared planning: callers authorize inputs; GUI diagnostics remain optional.
+pub(crate) async fn plan_input(
+    engine_paths: &EnginePaths,
+    input: PathBuf,
+    quality: Quality,
+    video_analysis: Option<VideoAnalysis>,
+    input_analysis: Option<InputAnalysis>,
+    generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    app: Option<&tauri::AppHandle>,
+) -> Result<ProbeAndPlan> {
     let samples = catalog::runtime_samples().await;
-    let input = PathBuf::from(path);
     let policy = generation_policy.unwrap_or_default().validate()?;
-    let _legacy_planner_enabled = planner_enabled;
     let planner_enabled = true;
     if input.is_dir() {
-        let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+        let analysis = input_analysis_for_plan(engine_paths, &input, input_analysis).await?;
         let image_sequence = analysis
             .image_sequence
             .ok_or_else(|| SplatError::InvalidPath(input.clone()))?;
         let plan = create_image_plan(&image_sequence, &quality.preset());
-        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let acceleration = detect_colmap_acceleration(engine_paths).await;
         let resolution = planner_enabled.then(|| {
             policy.resolution(
                 quality,
@@ -673,7 +697,7 @@ pub async fn probe_and_plan(
         let analysis = async {
             let video_analysis = if input_analysis.is_some() {
                 let analysis =
-                    input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+                    input_analysis_for_plan(engine_paths, &input, input_analysis).await?;
                 Some(VideoAnalysis {
                     video: analysis
                         .video
@@ -692,12 +716,17 @@ pub async fn probe_and_plan(
             .await
         }
         .await;
+        let analysis = if let Some(app) = app {
+            video_preflight_diagnostics(app, &engine_paths.ffprobe, &input, analysis).await
+        } else {
+            analysis
+        };
         let VideoAnalysis {
             video,
             projection_detection,
-        } = video_preflight_diagnostics(&app, &engine_paths.ffprobe, &input, analysis).await?;
+        } = analysis?;
         let plan = policy.frame_plan(&video, quality);
-        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let acceleration = detect_colmap_acceleration(engine_paths).await;
         let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
             (video.height, video.width)
         } else {
@@ -1955,7 +1984,9 @@ pub async fn begin_gaussian_edit_save(
     project_id: String,
     edit_state: GaussianEditDraft,
 ) -> Result<GaussianEditSaveReservation> {
+    let _lifecycle = state.lifecycle.lock().await;
     let project_id = parse_project_id(&project_id)?;
+    model_export::ensure_editable(&state, project_id).await?;
     let (_, source, metadata) = catalog::registered_final_ply_for_project(project_id).await?;
     let info = inspect_gaussian_ply(&source)?;
     let current = metadata.editing.validate(info.splat_count)?;
@@ -2074,6 +2105,8 @@ pub async fn reset_gaussian_edits(
     project_id: String,
 ) -> Result<GaussianEditing> {
     let id = parse_project_id(&project_id)?;
+    let _lifecycle = state.lifecycle.lock().await;
+    model_export::ensure_editable(&state, id).await?;
     let mut active = state.edit_save.lock().await;
     if active
         .as_ref()
@@ -2104,6 +2137,8 @@ pub async fn save_gaussian_transform(
     transform: GaussianTransform,
 ) -> Result<GaussianTransform> {
     let id = parse_project_id(&project_id)?;
+    let _lifecycle = state.lifecycle.lock().await;
+    model_export::ensure_editable(&state, id).await?;
     let transform = transform.validate()?;
     let _write_guard = state.metadata_write.lock().await;
     let (root, _, mut metadata) = catalog::registered_final_ply_for_project(id).await?;

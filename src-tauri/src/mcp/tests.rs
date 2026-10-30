@@ -61,8 +61,14 @@ fn reshoot_requests_are_explicit_and_old_generation_requests_remain_unchanged() 
 #[tokio::test]
 async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("clip.mp4");
-    std::fs::write(&input, b"fixture, not a real video").unwrap();
+    let input = temp.path().join("ordinary-images");
+    std::fs::create_dir(&input).unwrap();
+    // Real, unambiguous image headers; only execution is controlled, not admission.
+    for index in 0..31 {
+        image::RgbImage::new(3, 3)
+            .save(input.join(format!("{index:03}.png")))
+            .unwrap();
+    }
     let tasks = TaskService::at(temp.path().join("registry"));
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -82,6 +88,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     }));
     let stop = CancellationToken::new();
     let tools = McpTools {
+        app: None,
         tasks: tasks.clone(),
         engines: crate::pipeline::runner::default_engine_paths(Some(
             temp.path().join("missing-engines"),
@@ -122,7 +129,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     );
     let client = ().serve(transport).await.unwrap();
     let definitions = client.list_tools(None).await.unwrap();
-    assert_eq!(definitions.tools.len(), 8);
+    assert_eq!(definitions.tools.len(), 14);
     assert!(definitions.tools.iter().all(|t| t.output_schema.is_some()));
     let app_status = client
         .call_tool(CallToolRequestParams::new("get_app_status"))
@@ -135,6 +142,23 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
     );
     let arguments =
         json!({"input_path":input,"quality":"fast","client_request_id":"protocol-request-1"});
+    let inspected = client
+        .call_tool(
+            CallToolRequestParams::new("inspect_generation_input").with_arguments(
+                json!({"input_path":input,"quality":"fast"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.is_error, Some(false), "{inspected:#?}");
+    let inspected = inspected.structured_content.unwrap();
+    assert!(inspected["questions"].as_array().unwrap().is_empty());
+    assert_eq!(inspected["plan_is_estimate"], true);
+    assert!(inspected["max_splats"].is_null());
+    assert!(!inspected.to_string().contains("preview_jpeg"));
     let created = client
         .call_tool(
             CallToolRequestParams::new("create_generation_task")
@@ -408,15 +432,95 @@ fn local_request_guard_keeps_host_and_origin_checks_without_credentials() {
 }
 
 #[test]
-fn schemas_and_annotations_match_the_seven_tool_contracts() {
+fn schemas_and_annotations_match_the_fourteen_tool_contracts() {
     for tool in definitions() {
         let annotation = tool.annotations.unwrap();
         assert_eq!(annotation.open_world_hint, Some(false));
-        assert_eq!(annotation.idempotent_hint, Some(true));
+        assert_eq!(
+            annotation.idempotent_hint,
+            Some(tool.name != "confirm_model_export")
+        );
         assert_eq!(
             annotation.destructive_hint,
-            Some(tool.name == "cancel_task")
+            Some(matches!(
+                tool.name.as_ref(),
+                "cancel_task" | "cancel_model_export"
+            ))
         );
         assert_eq!(tool.input_schema["additionalProperties"], false);
+        let schema = tool.output_schema.unwrap();
+        assert_eq!(
+            schema["anyOf"][1]["properties"]["error"]["required"],
+            json!(["code", "message"])
+        );
     }
+}
+
+#[tokio::test]
+async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("video.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let mut task = service
+        .create(
+            None,
+            input,
+            Quality::High,
+            root.path().join("projects"),
+            true,
+            "mcp",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    task.actual_configuration = Some(
+        json!({"reshoot_recipe":{"version":2,"init_georeference":"PRIVATE_GEO","init_ply_path":"PRIVATE_INIT","source_names":["PRIVATE_SOURCE"],"actual":"retrain","options":{"condition":"appearance","camera_relation":"unsure","allow_fallback":true,"source_identity":"PRIVATE_ID"}}}),
+    );
+    let mut runtime = crate::pipeline::runtime::RuntimeTracker::new().snapshot;
+    runtime.device = Some("Fixture GPU".into());
+    runtime.process_id = 12345;
+    runtime
+        .config
+        .insert("private".into(), "PRIVATE_DEVICE_ID".into());
+    let execution = crate::pipeline::brush_execution::BrushExecutionSnapshot::new(&runtime, None);
+    task.runs.push(crate::tasks::TaskRun {
+        run_id: Uuid::new_v4(),
+        kind: "generation".into(),
+        started_at: chrono::Utc::now(),
+        ended_at: None,
+        logs: Default::default(),
+        last_engine: None,
+        last_exit_code: None,
+        error: None,
+        brush_executions: vec![execution; 10],
+        current_brush_execution: Some(9),
+    });
+    let public = public_task(task).unwrap();
+    let text = public.to_string();
+    for private in [
+        "PRIVATE_GEO",
+        "PRIVATE_INIT",
+        "PRIVATE_SOURCE",
+        "PRIVATE_ID",
+        "PRIVATE_DEVICE_ID",
+        "request_parameters",
+        "process_id",
+    ] {
+        assert!(!text.contains(private), "{private}");
+    }
+    assert_eq!(
+        public["runs"][0]["brush_executions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert_eq!(public["runs"][0]["brush_executions_truncated"], true);
+    assert_eq!(
+        public["runs"][0]["brush_executions"][7]["device"]["name"],
+        "Fixture GPU"
+    );
+    assert!(public["runs"][0]["brush_executions"][7]["device"]["total_memory_mb"].is_null());
 }
