@@ -18,6 +18,40 @@ pub mod telemetry;
 pub mod updates;
 pub mod video;
 
+#[cfg(all(test, windows, target_env = "msvc"))]
+mod windows_manifest_tests {
+    #[test]
+    fn test_executable_embeds_common_controls_v6_without_a_sidecar() {
+        use windows_sys::Win32::System::LibraryLoader::{
+            FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+        };
+        // Read the executing EXE's embedded RT_MANIFEST (24), resource ID 1.
+        // This cannot accidentally pass by finding an external .exe.manifest.
+        unsafe {
+            let module = GetModuleHandleW(std::ptr::null());
+            assert!(!module.is_null());
+            let resource = FindResourceW(
+                module,
+                std::ptr::without_provenance(1),
+                std::ptr::without_provenance(24),
+            );
+            assert!(
+                !resource.is_null(),
+                "The test EXE must embed its own manifest"
+            );
+            let size = SizeofResource(module, resource) as usize;
+            let loaded = LoadResource(module, resource);
+            let data = LockResource(loaded);
+            assert!(size > 0 && !data.is_null());
+            let xml =
+                std::str::from_utf8(std::slice::from_raw_parts(data.cast::<u8>(), size)).unwrap();
+            assert!(xml.contains("Microsoft.Windows.Common-Controls"));
+            assert!(xml.contains("6.0.0.0"));
+            assert!(xml.contains("6595b64144ccf1df"));
+        }
+    }
+}
+
 pub fn run_app() {
     tauri::Builder::default()
         // Keep this first so a second process exits before other plugins initialize.
@@ -35,9 +69,20 @@ pub fn run_app() {
         .plugin(tauri_plugin_opener::init())
         .manage(commands::PipelineController::default())
         .manage(commands::PreviewController::default())
+        .manage(mcp::exports::ExportController::default())
         .manage(telemetry::TelemetryService::new())
         .manage(updates::UpdateService::default())
         .manage(imports::ImportController::default())
+        .on_page_load(|webview, payload| {
+            use tauri::Manager;
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                if let Some(controller) = webview.try_state::<mcp::exports::ExportController>() {
+                    controller.page_loading(webview.app_handle().clone());
+                }
+            }
+        })
         .setup(|app| {
             use tauri::Manager;
             let tasks = app.state::<commands::PipelineController>().inner().clone();
@@ -82,6 +127,9 @@ pub fn run_app() {
             commands::start_gui_reshoot,
             mcp::get_mcp_settings,
             mcp::set_mcp_settings,
+            mcp::exports::mcp_export_executor_ready,
+            mcp::exports::mcp_export_executor_stopped,
+            mcp::exports::update_mcp_model_export,
             commands::inspect_reshoot_source,
             commands::probe_reshoot_input,
             commands::start_incremental_reshoot_pipeline,

@@ -35,6 +35,13 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("token-scoped model exports", () => {
+  it("adopts an application reservation without starting a second export", async () => {
+    const op = createModelExport("p", transform, 7, "ply", vi.fn(), "export-1");
+    await op.prepared; await op.export();
+    expect(backend.beginModelExport).not.toHaveBeenCalled();
+    expect(backend.prepareModelExport).toHaveBeenCalledExactlyOnceWith("export-1");
+    expect(backend.completeModelExport).toHaveBeenCalledExactlyOnceWith("export-1", null);
+  });
   it("publishes standard PLY without a Worker and ignores unrelated and late progress", async () => {
     const preparation = deferred<typeof info>();
     vi.mocked(backend.prepareModelExport).mockReturnValue(preparation.promise);

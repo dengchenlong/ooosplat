@@ -1,5 +1,111 @@
 use super::*;
 
+#[tokio::test]
+async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("clip.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let task = service
+        .create(
+            None,
+            input,
+            Quality::High,
+            root.path().join("projects"),
+            true,
+            "mcp",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let run = Uuid::new_v4();
+    assert_eq!(
+        service
+            .resume_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
+    );
+    {
+        let mut records = service.records();
+        let t = records.tasks.get_mut(&task.task_id).unwrap();
+        t.run_id = Some(run);
+        t.status = TaskStatus::Failed;
+    }
+    assert_eq!(
+        service
+            .resume_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "TASK_NOT_RESUMABLE"
+    );
+    {
+        service
+            .records()
+            .tasks
+            .get_mut(&task.task_id)
+            .unwrap()
+            .status = TaskStatus::Cancelled;
+    }
+    assert_eq!(
+        service
+            .resume_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "NO_RESUMABLE_CHECKPOINT"
+    );
+    let project = root.path().join("checkpoint");
+    std::fs::create_dir(&project).unwrap();
+    let mut state = crate::project::PipelineStateFile::created(Quality::High);
+    state.features_complete = true;
+    atomic_write_json(&project.join("state.json"), &state)
+        .await
+        .unwrap();
+    {
+        let mut records = service.records();
+        let t = records.tasks.get_mut(&task.task_id).unwrap();
+        t.project_path = Some(project.clone());
+        t.project_id = Some(Uuid::new_v4());
+    }
+    assert_eq!(
+        service
+            .resume_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "NO_RESUMABLE_CHECKPOINT"
+    );
+    let frames = project.join("work/frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    for index in 0..2 {
+        image::RgbImage::new(3, 3)
+            .save(frames.join(format!("{index:03}.png")))
+            .unwrap();
+    }
+    *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async { Err(crate::error::SplatError::Cancelled) })
+    }));
+    let resumed = service
+        .resume_identified(task.task_id, run, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    assert!(resumed.accepted);
+    assert_ne!(resumed.run_id, Some(run));
+    service.wait(task.task_id).await.unwrap();
+    assert_eq!(
+        service
+            .resume_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
+    );
+}
+
 #[test]
 fn generation_defaults_are_not_retry_consent_and_invalid_ratios_are_rejected() {
     let defaults = generation_parameters(None).unwrap();
@@ -124,7 +230,14 @@ async fn current_failure_status_and_classification_survive_task_restart() {
         })
     }));
     service
-        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
+        .start_inner(
+            task.task_id,
+            default_engine_paths(None),
+            None,
+            false,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let finished = tokio::time::timeout(
@@ -1006,7 +1119,14 @@ async fn changed_video_identity_is_rejected_before_starting_a_run() {
         .unwrap();
     std::fs::write(&input, b"changed input size").unwrap();
     let error = service
-        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
+        .start_inner(
+            task.task_id,
+            default_engine_paths(None),
+            None,
+            false,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code, "INPUT_CHANGED");
@@ -1730,6 +1850,7 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
                 default_engine_paths(None),
                 Some(telemetry.clone()),
                 resume,
+                None,
                 None,
             )
             .await

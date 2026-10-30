@@ -10,12 +10,33 @@ pub(super) fn output(name: &str) -> Value {
     }});
     task["properties"]["generation_policy"] = json!({"type":["object","null"]});
     task["properties"]["automatically_retried"] = json!({"type":"boolean"});
-    match name {
+    task["properties"]["substage"] = json!({"type":["string","null"]});
+    task["properties"]["operation"] = json!({"type":["object","null"]});
+    task["properties"]["runtime"] = json!({"type":["object","null"]});
+    task["properties"]["error"]["properties"]["classification_version"] =
+        json!({"type":["integer","null"]});
+    task["properties"]["error"]["properties"]["termination"] = json!({"type":["object","null"]});
+    task["properties"]["runs"]["items"]["properties"]["brush_executions_truncated"] =
+        json!({"type":"boolean"});
+    task["properties"]["runs"]["items"]["properties"]["brush_executions"] = json!({"type":"array","maxItems":8,"items":{"type":"object","properties":{
+        "operation":{"type":["object","null"]},"started_at":{"type":"string"},"ended_at":{"type":["string","null"]},"exit_code":{"type":["integer","null"]},
+        "backend":{"type":["string","null"]},"device":{"type":["object","null"],"properties":{"name":{"type":"string"},"total_memory_mb":{"type":["integer","null"]},"driver_version":{"type":["string","null"]}}},"configuration":{"type":["object","null"]}
+    }}});
+    let mut success = match name {
+        "inspect_generation_input" => {
+            json!({"type":"object","required":["preflight_id","input_source_identity","input","plan","questions","gps"],"properties":{"preflight_id":id,"input_source_identity":{"type":"string"},"input":{"type":"object"},"source":{"type":["object","null"]},"generation_policy":{"type":"object"},"plan":{"type":"object"},"plan_is_estimate":{"const":true},"max_splats":{"type":"null"},"questions":{"type":"array","items":{"type":"object"}},"gps":{"type":"object"}}})
+        }
+        "start_model_export"
+        | "get_model_export_status"
+        | "confirm_model_export"
+        | "cancel_model_export" => {
+            json!({"type":"object","required":["export_id","project_id","format","phase","progress","confirmation","result","error"],"properties":{"export_id":id,"project_id":id,"format":{"type":"string","enum":["ply","compressed_ply","spz","sog"]},"phase":{"type":"string","enum":["starting","preparing","awaiting_confirmation","encoding","validating","publishing","cancelling","completed","failed","cancelled","interrupted"]},"progress":{"type":["number","null"],"minimum":0,"maximum":100},"edit_revision":{"type":"integer"},"confirmation":{"type":["object","null"]},"result":{"type":["object","null"]},"error":{"type":["object","null"]}}})
+        }
         "inspect_reshoot_input" => {
             json!({"type":"object","required":["source","input"],"properties":{"source":{"type":"object"},"input":{"type":"object"}}})
         }
         "create_generation_task" | "get_task_status" | "cancel_task" => task,
-        "start_task" => {
+        "start_task" | "resume_task" => {
             json!({"type":"object","required":["accepted","task_id","run_id","status","revision"],"properties":{"accepted":{"type":"boolean"},"task_id":id,"run_id":nullable_id,"status":status,"revision":{"type":"integer"}}})
         }
         "list_tasks" => {
@@ -28,5 +49,22 @@ pub(super) fn output(name: &str) -> Value {
             json!({"type":"object","required":["task_id","run_id","entries","next_cursor","has_more","truncated","cursor_reset","reset_reason","available_sources","content_is_untrusted"],"properties":{"task_id":id,"run_id":nullable_id,"entries":{"type":"array","items":{"type":"object","required":["source","text","partial_line"],"properties":{"source":{"type":"string"},"text":{"type":"string"},"partial_line":{"type":"boolean"}}}},"next_cursor":{"type":["string","null"]},"has_more":{"type":"boolean"},"truncated":{"type":"boolean"},"cursor_reset":{"type":"boolean"},"reset_reason":{"type":["string","null"]},"available_sources":{"type":"array","items":{"type":"string"}},"content_is_untrusted":{"type":"boolean"}}})
         }
         _ => json!({"type":"object"}),
+    };
+    if name == "get_app_status" {
+        success["properties"]["generation_policy_version"] = json!({"type":"integer","minimum":1});
+        success["properties"]["model_export"] = json!({"type":"object","required":["executor_ready","formats","active_export"],"properties":{
+            "executor_ready":{"type":"boolean"},"busy":{"type":"boolean"},"formats":{"type":"array","items":{"enum":["ply","compressed_ply","spz","sog"]}},"active_export":{"type":["object","null"]}
+        }});
+        success["properties"]["engines"]["items"]["properties"]["cpu_only"] =
+            json!({"type":"boolean"});
+        success["properties"]["engines"]["items"]["properties"]["detail"] =
+            json!({"type":"string"});
     }
+    // MCP output schemas describe structured errors and pending questions too.
+    let failure = json!({"type":"object","required":["error"],"properties":{
+        "error":{"type":"object","required":["code","message"],"properties":{
+            "code":{"type":"string"},"message":{"type":"string"},"details":{"type":["object","null"]}
+        }}
+    }});
+    json!({"type":"object","anyOf":[success,failure]})
 }

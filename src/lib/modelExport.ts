@@ -6,7 +6,7 @@ import { ownedBinaryChunk } from "./binaryChunk";
 const cancelled = () => new DOMException("Export cancelled", "AbortError");
 
 /** Owns one reservation/worker, including reservations arriving after cancel. */
-export function createModelExport(projectId: string, transform: GaussianTransform, revision: number, format: ModelFormat, onProgress: (event: ModelProgress) => void) {
+export function createModelExport(projectId: string, transform: GaussianTransform, revision: number, format: ModelFormat, onProgress: (event: ModelProgress) => void, reservation?: string) {
   let id: string | null = null;
   let aborted = false, ended = false, executing = false, ready = false, publishing = false;
   let unlisten: (() => void) | undefined;
@@ -27,7 +27,7 @@ export function createModelExport(projectId: string, transform: GaussianTransfor
         if (event.exportId === id && !aborted && !ended && !publishing && !confirmation && (!ready || (nativeEncodingStarted && event.phase === "encoding"))) onProgress({ exportId: event.exportId, phase: event.phase, progress: event.progress });
       });
       ensure();
-      id = await backend.beginModelExport(projectId, transform, revision, format);
+      id = reservation ?? await backend.beginModelExport(projectId, transform, revision, format);
       ensure();
       const result = await backend.prepareModelExport(id);
       ensure();

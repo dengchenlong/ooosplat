@@ -221,6 +221,8 @@ pub struct ServiceError {
     pub message: String,
     pub task_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 impl ServiceError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
@@ -229,6 +231,7 @@ impl ServiceError {
             message: message.into(),
             task_id: None,
             run_id: None,
+            details: None,
         }
     }
 }
@@ -623,6 +626,15 @@ impl TaskService {
                 "项目根目录必须为绝对路径",
             ));
         }
+        // Admit a supplemental task atomically with its frozen source identity.
+        // A concurrent repeated MCP request must never observe it as generation.
+        let source_project_id = parameters
+            .as_ref()
+            .filter(|p| p.get("reshootOptions").is_some())
+            .and_then(|p| p.get("source_project_id"))
+            .cloned()
+            .map(serde_json::from_value::<Uuid>)
+            .transpose()?;
         let now = Utc::now();
         let task = TaskRecord {
             schema_version: 1,
@@ -640,8 +652,13 @@ impl TaskService {
             quality,
             source: Some(source.into()),
             configuration_inferred: false,
-            task_kind: "generation".into(),
-            source_project_id: None,
+            task_kind: if source_project_id.is_some() {
+                "reshoot"
+            } else {
+                "generation"
+            }
+            .into(),
+            source_project_id,
             planner_enabled,
             projects_root,
             configuration: (*crate::presets::pipeline_optimization_config()).clone(),
@@ -899,7 +916,7 @@ impl TaskService {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .start_inner(id, engines, telemetry, false, None)
+                .start_inner(id, engines, telemetry, false, None, None)
                 .await
         })
         .await
@@ -915,7 +932,7 @@ impl TaskService {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .start_inner(id, engines, telemetry, true, Some(failed_run))
+                .start_inner(id, engines, telemetry, true, Some(failed_run), None)
                 .await
         })
         .await
@@ -929,6 +946,7 @@ impl TaskService {
         telemetry: Option<TelemetryService>,
         resume: bool,
         retry_failed_run: Option<Uuid>,
+        expected_resume_run: Option<Uuid>,
     ) -> Result<StartReceipt> {
         let _gate = self.gate.lock().await;
         self.load_locked().await?;
@@ -938,6 +956,60 @@ impl TaskService {
             .get(&id)
             .cloned()
             .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "任务不存在"))?;
+        if let Some(expected) = expected_resume_run {
+            if task.run_id != Some(expected) {
+                return Err(ServiceError::new(
+                    "STALE_RUN_ID",
+                    "The task execution has changed",
+                ));
+            }
+            if !matches!(task.status, TaskStatus::Cancelled | TaskStatus::Interrupted) {
+                return Err(ServiceError::new("TASK_NOT_RESUMABLE", "Only cancelled or interrupted tasks may resume; failed tasks require explicit retry"));
+            }
+            let root = task.project_path.as_ref().ok_or_else(|| {
+                ServiceError::new(
+                    "NO_RESUMABLE_CHECKPOINT",
+                    "No project checkpoint was created",
+                )
+            })?;
+            let saved: crate::project::PipelineStateFile = tokio::fs::read(root.join("state.json"))
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .ok_or_else(|| {
+                    ServiceError::new(
+                        "NO_RESUMABLE_CHECKPOINT",
+                        "No readable checkpoint is available",
+                    )
+                })?;
+            if !saved.features_complete
+                && !saved.matching_complete
+                && !saved.reconstruction_complete
+                && !saved.brush_complete
+                && !saved
+                    .reshoot
+                    .as_ref()
+                    .is_some_and(|s| s.source_snapshot_complete)
+                && !saved
+                    .frames
+                    .as_ref()
+                    .is_some_and(|f| f.extracted_frames.is_some_and(|n| n > 0))
+            {
+                return Err(ServiceError::new(
+                    "NO_RESUMABLE_CHECKPOINT",
+                    "No completed work is available to resume",
+                ));
+            }
+            // A stale flag alone is not resumable work. The Runner still performs
+            // its full per-stage validation before reusing any of these images.
+            let images = crate::video::list_images(&root.join("work/frames")).unwrap_or_default();
+            if images.len() < 2 {
+                return Err(ServiceError::new(
+                    "NO_RESUMABLE_CHECKPOINT",
+                    "Saved working images are missing; no valid work can be resumed",
+                ));
+            }
+        }
         if retry_failed_run
             .is_some_and(|run| task.run_id != Some(run) || task.status != TaskStatus::Failed)
         {
@@ -948,6 +1020,26 @@ impl TaskService {
             return Ok(StartReceipt::existing(&task));
         }
         if !resume || task.project_id.is_none() {
+            if task.source.as_deref() == Some("mcp") {
+                if let (Some(source), Some(expected)) = (
+                    task.source_project_id,
+                    task.request_parameters
+                        .as_ref()
+                        .and_then(|p| p.pointer("/reshootOptions/sourceIdentity"))
+                        .and_then(Value::as_str),
+                ) {
+                    let current = PipelineRunner::new(engines.clone(), |_| {})
+                        .inspect_reshoot_source_v2(source)
+                        .await
+                        .map_err(|e| ServiceError::new("INPUT_CHANGED", e.to_string()))?;
+                    if current.source_identity != expected {
+                        return Err(ServiceError::new(
+                            "INPUT_CHANGED",
+                            "Reshoot source changed; inspect and confirm again",
+                        ));
+                    }
+                }
+            }
             if let Some(expected) = task
                 .request_parameters
                 .as_ref()
@@ -976,6 +1068,7 @@ impl TaskService {
                 message: "已有任务正在运行".into(),
                 task_id: Some(active.task_id),
                 run_id: active.run_id,
+                details: None,
             });
         }
         let original_task = task.clone();
@@ -1585,7 +1678,24 @@ impl TaskService {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .start_inner(id, engines, telemetry, true, None)
+                .start_inner(id, engines, telemetry, true, None, None)
+                .await
+        })
+        .await
+        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+    }
+
+    pub async fn resume_identified(
+        &self,
+        id: Uuid,
+        expected_run: Uuid,
+        engines: EnginePaths,
+        telemetry: Option<TelemetryService>,
+    ) -> Result<StartReceipt> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .start_inner(id, engines, telemetry, true, None, Some(expected_run))
                 .await
         })
         .await
@@ -1753,7 +1863,32 @@ fn actual_snapshot(state: Value) -> Value {
         .pointer("/reshoot/recipe")
         .cloned()
         .unwrap_or(Value::Null);
+    extend_actual_summary(&mut result, &state);
     result
+}
+
+fn extend_actual_summary(result: &mut Value, state: &Value) {
+    let panorama = state.get("panorama").is_some_and(Value::is_object);
+    result["input_projection"] = if panorama {
+        Value::String("equirectangular".into())
+    } else {
+        state
+            .get("videoProjection")
+            .filter(|v| matches!(v.as_str(), Some("perspective" | "equirectangular")))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    result["image_matching_strategy"] =
+        if state.get("inputType").and_then(Value::as_str) == Some("video") {
+            Value::String("sequential".into())
+        } else {
+            state
+                .get("imageMatchingStrategy")
+                .cloned()
+                .unwrap_or_else(|| Value::String("exhaustive".into()))
+        };
+    result["gps"] = serde_json::json!({"status":state.pointer("/gps/status"),"reference_valid":state.pointer("/gps/referenceValid")});
+    result["backfill"] = serde_json::json!({"status":state.pointer("/bridgeBackfill/status"),"initial_frames":state.pointer("/frames/initialExtractedFrames"),"actual_frames":state.pointer("/frames/extractedFrames"),"total_frame_budget":state.pointer("/frames/rescueMaxFrames")});
 }
 
 struct ExecutionCleanup {
@@ -1792,5 +1927,9 @@ impl Drop for ExecutionCleanup {
 }
 
 pub(crate) fn checkpoint_snapshot(state: &crate::project::PipelineStateFile) -> Value {
-    serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"reshoot_recipe":state.reshoot.as_ref().and_then(|r|r.recipe.as_ref()),"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}})
+    let mut result = serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"reshoot_recipe":state.reshoot.as_ref().and_then(|r|r.recipe.as_ref()),"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}});
+    if let Ok(value) = serde_json::to_value(state) {
+        extend_actual_summary(&mut result, &value);
+    }
+    result
 }

@@ -13,7 +13,10 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tauri::{
     ipc::{InvokeBody, Request, Response},
@@ -34,6 +37,14 @@ pub enum ModelFormat {
     Sog,
 }
 impl ModelFormat {
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::Ply => "ply",
+            Self::CompressedPly => "compressed.ply",
+            Self::Spz => "spz",
+            Self::Sog => "sog",
+        }
+    }
     fn filename(self) -> &'static str {
         match self {
             Self::Ply => "edit.ply",
@@ -58,6 +69,8 @@ pub(super) struct ModelExportSession {
     root: PathBuf,
     output: PathBuf,
     format: ModelFormat,
+    destination: Option<PathBuf>,
+    publishing: AtomicBool,
     revision: u64,
     transform: GaussianTransform,
     cancel: CancellationToken,
@@ -92,7 +105,7 @@ pub struct ModelValidation {
     splat_count: u64,
     sh_bands: u8,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelExportResult {
     path: PathBuf,
@@ -144,6 +157,58 @@ fn check_current_export(
     }
     Ok(())
 }
+
+pub(crate) async fn ensure_editable(state: &PreviewController, project: Uuid) -> Result<()> {
+    if state
+        .model_export
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|s| s.project_id == project)
+    {
+        return Err(error("已有导出正在进行"));
+    }
+    Ok(())
+}
+
+pub(crate) async fn export_busy(state: &PreviewController) -> bool {
+    let held = state.export.try_lock().is_err();
+    held || state.video_export.lock().await.is_some() || state.html_export.lock().await.is_some()
+}
+
+fn check_saved_transform(s: &ModelExportSession, transform: &GaussianTransform) -> Result<()> {
+    if s.destination.is_some()
+        && serde_json::to_value(transform)? != serde_json::to_value(s.transform)?
+    {
+        return Err(error("编辑状态已变化，请重新保存编辑并导出"));
+    }
+    Ok(())
+}
+
+/// MCP may only publish new files below this real (non-redirected) directory.
+fn mcp_directory(root: &std::path::Path, create: bool) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(root)?;
+    let directory = root.join("exports");
+    if create && !directory.exists() {
+        std::fs::create_dir(&directory)?;
+    }
+    match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => {
+            let redirected = metadata.file_type().is_symlink();
+            #[cfg(windows)]
+            let redirected = {
+                use std::os::windows::fs::MetadataExt;
+                redirected || metadata.file_attributes() & 0x400 != 0
+            };
+            if redirected || !metadata.is_dir() || std::fs::canonicalize(&directory)? != directory {
+                return Err(error("Export directory must not be redirected"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(directory)
+}
 #[cfg(test)]
 fn bands(path: &std::path::Path) -> Result<u8> {
     use std::io::{BufRead, BufReader};
@@ -184,7 +249,54 @@ pub async fn begin_gaussian_model_export(
     edit_revision: u64,
     format: ModelFormat,
 ) -> Result<Uuid> {
+    reserve(&state, project_id, transform, edit_revision, format, false).await
+}
+
+pub(crate) async fn begin_saved_mcp_export(
+    state: &PreviewController,
+    project_id: Uuid,
+    format: ModelFormat,
+) -> Result<(Uuid, GaussianTransform, u64)> {
+    if state
+        .edit_save
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|s| s.project_id == project_id)
+    {
+        return Err(error("编辑状态已变化，请重新保存编辑并导出"));
+    }
+    let (_, _, metadata) = catalog::registered_final_ply_for_project(project_id).await?;
+    let id = reserve(
+        state,
+        project_id,
+        metadata.transform,
+        metadata.editing.revision,
+        format,
+        true,
+    )
+    .await?;
+    Ok((id, metadata.transform, metadata.editing.revision))
+}
+async fn reserve(
+    state: &PreviewController,
+    project_id: Uuid,
+    transform: GaussianTransform,
+    edit_revision: u64,
+    format: ModelFormat,
+    mcp: bool,
+) -> Result<Uuid> {
     let _lifecycle = state.lifecycle.lock().await;
+    if mcp
+        && state
+            .edit_save
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.project_id == project_id)
+    {
+        return Err(error("编辑状态已变化，请重新保存编辑并导出"));
+    }
     let guard = state
         .export
         .clone()
@@ -195,7 +307,15 @@ pub async fn begin_gaussian_model_export(
     }
     let (root, source, metadata) = catalog::registered_final_ply_for_project(project_id).await?;
     check_revision(edit_revision, metadata.editing.revision)?;
+    if mcp && serde_json::to_value(metadata.transform)? != serde_json::to_value(transform)? {
+        return Err(error("编辑状态已变化，请重新保存编辑并导出"));
+    }
     let id = Uuid::new_v4();
+    let destination = if mcp {
+        Some(mcp_directory(&root, false)?.join(format!("mcp-{id}.{}", format.extension())))
+    } else {
+        None
+    };
     let s = Arc::new(ModelExportSession {
         id,
         project_id,
@@ -204,6 +324,8 @@ pub async fn begin_gaussian_model_export(
         revision: edit_revision,
         output: root.join(format!(".ooosplat-model-{id}.encoded.tmp")),
         format,
+        destination,
+        publishing: AtomicBool::new(false),
         root,
         cancel: CancellationToken::new(),
         operation: Mutex::new(()),
@@ -232,6 +354,7 @@ pub async fn prepare_gaussian_model_export(
     let _metadata = state.metadata_write.lock().await;
     let (_, source, metadata) = catalog::registered_final_ply_for_project(s.project_id).await?;
     check_revision(s.revision, metadata.editing.revision)?;
+    check_saved_transform(&s, &metadata.transform)?;
     if source != s.source {
         return Err(error("模型源文件已发生变化"));
     }
@@ -309,6 +432,7 @@ pub async fn start_gaussian_model_encoding(
     let _metadata = state.metadata_write.lock().await;
     let (_, source, metadata) = catalog::registered_final_ply_for_project(s.project_id).await?;
     check_current_export(&s, &source, metadata.editing.revision)?;
+    check_saved_transform(&s, &metadata.transform)?;
     let mut e = s.encoding.lock().await;
     if e.format.is_some() {
         return Err(error("模型导出已开始"));
@@ -516,6 +640,7 @@ fn validate(info: &PlyInfo, sh: u8, validation: &ModelValidation) -> Result<()> 
 }
 #[tauri::command]
 pub async fn complete_gaussian_model_export(
+    app: tauri::AppHandle,
     state: State<'_, PreviewController>,
     export_id: Uuid,
     validation: Option<ModelValidation>,
@@ -526,7 +651,28 @@ pub async fn complete_gaussian_model_export(
     let _metadata = state.metadata_write.lock().await;
     let (_, source, metadata) = catalog::registered_final_ply_for_project(s.project_id).await?;
     check_current_export(&s, &source, metadata.editing.revision)?;
-    let result = publish(&s, validation).await?;
+    check_saved_transform(&s, &metadata.transform)?;
+    s.publishing.store(true, Ordering::SeqCst);
+    let result = match publish(&s, validation).await {
+        Ok(result) => result,
+        Err(error) => {
+            s.publishing.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    if let Some(destination) = &s.destination {
+        use tauri::Manager;
+        if let Err(e) = app
+            .state::<crate::mcp::exports::ExportController>()
+            .published(export_id, &result)
+            .await
+        {
+            // This UUID path was just created without replacement by this session.
+            let _ = std::fs::remove_file(destination);
+            s.publishing.store(false, Ordering::SeqCst);
+            return Err(error(e.to_string()));
+        }
+    }
     release(&state, export_id).await;
     Ok(result)
 }
@@ -560,11 +706,20 @@ async fn publish(
         return Err(error("模型输出不完整"));
     }
     let temporary = s.output.clone();
-    let destination = s.root.join(format.filename());
+    let destination = s
+        .destination
+        .clone()
+        .unwrap_or_else(|| s.root.join(format.filename()));
     let size = std::fs::metadata(&temporary)?.len();
     let count = info.splat_count;
     running(s)?;
-    atomic_replace_file(&temporary, &destination).await?;
+    if s.destination.is_some() {
+        mcp_directory(&s.root, true)?;
+        // Same-filesystem atomic create, unlike rename this never replaces a rival.
+        tokio::fs::hard_link(&temporary, &destination).await?;
+    } else {
+        atomic_replace_file(&temporary, &destination).await?;
+    }
     Ok(ModelExportResult {
         path: preview_client_path(&destination),
         file_size: size,
@@ -581,6 +736,9 @@ pub async fn cancel_gaussian_model_export(
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
+    if s.publishing.load(Ordering::SeqCst) {
+        return Err(error("模型正在发布，请等待完成"));
+    }
     s.cancel.cancel();
     let _op = s.operation.lock().await;
     release(&state, export_id).await;
@@ -963,6 +1121,8 @@ mod tests {
             0
         };
         ModelExportSession {
+            destination: None,
+            publishing: AtomicBool::new(false),
             id,
             project_id: Uuid::new_v4(),
             source,
@@ -1005,6 +1165,54 @@ mod tests {
         let output = s.output.clone();
         drop(s);
         assert!(!output.exists());
+    }
+    #[tokio::test]
+    async fn mcp_publish_is_unique_no_clobber_and_keeps_source_and_gui_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fixture(dir.path(), ModelFormat::Ply).await;
+        let original = std::fs::read(&s.source).unwrap();
+        let destination = mcp_directory(dir.path(), false)
+            .unwrap()
+            .join(format!("mcp-{}.ply", s.id));
+        s.destination = Some(destination.clone());
+        assert!(!destination.parent().unwrap().exists());
+        std::fs::write(dir.path().join("edit.ply"), b"existing GUI export").unwrap();
+        publish(&s, None).await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
+        assert!(publish(&s, None).await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
+        let temporary = s.output.clone();
+        drop(s);
+        assert!(!temporary.exists());
+        assert!(destination.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("final.ply")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("edit.ply")).unwrap(),
+            b"existing GUI export"
+        );
+    }
+    #[tokio::test]
+    async fn mcp_rejects_redirected_exports_and_holds_target_edit_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), dir.path().join("exports"))
+            .expect("temporary symlink permission");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("exports")).unwrap();
+        assert!(mcp_directory(dir.path(), true).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        let state = PreviewController::default();
+        let s = Arc::new(fixture(dir.path(), ModelFormat::Spz).await);
+        let project = s.project_id;
+        *state.model_export.lock().await = Some(s.clone());
+        assert!(ensure_editable(&state, project).await.is_err());
+        assert!(ensure_editable(&state, Uuid::new_v4()).await.is_ok());
+        release(&state, s.id).await;
+        assert!(ensure_editable(&state, project).await.is_ok());
     }
     #[tokio::test]
     async fn prepared_view_reads_before_encoding_without_an_output_and_rechecks_source_and_revision(
