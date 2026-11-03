@@ -303,12 +303,21 @@ pub struct VoteOutcome {
     pub ratios: Vec<f32>,
     /// `ratios[i] >= vote_threshold` — object candidates before clustering.
     pub candidates: Vec<bool>,
+    /// Per splat: how many frames could see it (in-image and not occluded).
+    /// This is the denominator behind `ratios`; dumping it separates "the
+    /// z-buffer hid this splat" from "it was visible but outside the mask"
+    /// (issue #16).
+    pub visible: Vec<u32>,
+    /// Per splat: how many visible frames had it inside the mask.
+    pub yes: Vec<u32>,
 }
 
 impl VoteOutcome {
-    fn push_splat(&mut self, ratio: f32, config: &VoteConfig) {
+    fn push_splat(&mut self, ratio: f32, visible: u32, yes: u32, config: &VoteConfig) {
         self.ratios.push(ratio);
         self.candidates.push(ratio >= config.vote_threshold as f32);
+        self.visible.push(visible);
+        self.yes.push(yes);
     }
 
     /// Object-candidate vote statistics (used for acceptance evidence).
@@ -483,6 +492,8 @@ pub fn vote_splats(
         splat_count: 0,
         ratios: Vec::new(),
         candidates: Vec::new(),
+        visible: Vec::new(),
+        yes: Vec::new(),
     };
     stream_splat_cores(ply_path, batch_size, &mut |batch| {
         for splat in batch {
@@ -522,7 +533,7 @@ pub fn vote_splats(
             } else {
                 yes as f32 / visible as f32
             };
-            outcome.push_splat(ratio, config);
+            outcome.push_splat(ratio, visible, yes, config);
         }
         Ok(())
     })?;
@@ -910,6 +921,50 @@ pub fn write_instance_mask(destination: &Path, splat_count: u64, labels: &[i32])
     // Revision 0 marks a derived instance bitmap (edit bitmaps start at 1).
     super::edit_mask::write_mask_container_atomic(destination, splat_count, 0, &mask)?;
     Ok(object_count)
+}
+
+/// Writes the per-splat voting evidence as CSV for issue #16 diagnosis.
+///
+/// Columns: `index,x,y,z,visible_frames,yes_votes,ratio,candidate,label`.
+/// `visible_frames` is the z-buffer-filtered denominator, `yes_votes` the
+/// numerator, so a splat with `visible_frames == 0` was judged occluded in
+/// every frame it projected into — the signature of the z-buffer defect this
+/// dump exists to confirm or rule out.
+pub fn write_vote_dump(
+    destination: &Path,
+    positions: &[[f64; 3]],
+    outcome: &VoteOutcome,
+    labels: &[i32],
+) -> Result<()> {
+    if positions.len() != outcome.ratios.len()
+        || labels.len() != outcome.ratios.len()
+        || outcome.visible.len() != outcome.ratios.len()
+        || outcome.yes.len() != outcome.ratios.len()
+    {
+        return Err(SplatError::Process(format!(
+            "投票明细列数不一致：positions {} / ratios {} / labels {}",
+            positions.len(),
+            outcome.ratios.len(),
+            labels.len()
+        )));
+    }
+    let mut text = String::with_capacity(outcome.ratios.len() * 48);
+    text.push_str("index,x,y,z,visible_frames,yes_votes,ratio,candidate,label\n");
+    for (index, position) in positions.iter().enumerate() {
+        text.push_str(&format!(
+            "{index},{:.6},{:.6},{:.6},{},{},{:.6},{},{}\n",
+            position[0],
+            position[1],
+            position[2],
+            outcome.visible[index],
+            outcome.yes[index],
+            outcome.ratios[index],
+            u8::from(outcome.candidates[index]),
+            labels[index]
+        ));
+    }
+    std::fs::write(destination, text)
+        .map_err(|error| SplatError::Process(format!("写投票明细失败：{error}")))
 }
 
 /// Pairs the COLMAP model (single camera + posed images) with the per-frame
@@ -1389,6 +1444,58 @@ mod tests {
     }
 
     // ---- connected components / DBSCAN cleanup --------------------------
+
+    #[test]
+    fn vote_dump_csv_records_per_splat_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("occlusion.ply");
+        let (splats, front_len, back_len) = cube_and_occluded_plane();
+        write_scene_cloud(&ply, &splats);
+        let mask = rect_mask(64, 48, 14, 6, 50, 42);
+        let frames = vec![
+            frame([0.0, 0.0, 0.0], &mask),
+            frame([0.01, 0.0, 0.0], &mask),
+            frame([-0.01, 0.0, 0.0], &mask),
+            frame([0.0, 0.01, 0.0], &mask),
+        ];
+        let outcome = vote_splats(&ply, &frames, &VoteConfig::default(), 128).unwrap();
+
+        // Why the dump exists (issue #16): the visible front face must show
+        // visible frames > 0, while the hidden back face and the hidden plane
+        // must show 0 visible frames — i.e. they were rejected by the
+        // z-buffer, not by the mask.
+        assert_eq!(outcome.visible.len(), splats.len());
+        assert_eq!(outcome.yes.len(), splats.len());
+        assert!(outcome.visible[..front_len].iter().all(|v| *v == 4));
+        assert!(
+            outcome.visible[front_len..front_len + back_len]
+                .iter()
+                .all(|v| *v == 0),
+            "hidden back face must be invisible in every frame: {:?}",
+            &outcome.visible[front_len..front_len + back_len]
+        );
+
+        let dump = dir.path().join("votes.csv");
+        write_vote_dump(&dump, &splats, &outcome, &vec![1_i32; splats.len()]).unwrap();
+        let text = std::fs::read_to_string(&dump).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "index,x,y,z,visible_frames,yes_votes,ratio,candidate,label"
+        );
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), splats.len(), "one row per splat");
+        let first: Vec<&str> = rows[0].split(',').collect();
+        assert_eq!(first.len(), 9, "row must carry all nine columns");
+        assert_eq!(first[0], "0");
+        assert_eq!(first[4], "4", "front face visible in all four frames");
+        assert_eq!(first[5], "4");
+        assert_eq!(first[8], "1");
+        // A hidden splat row reports zero visible frames and zero yes votes.
+        let hidden: Vec<&str> = rows[front_len].split(',').collect();
+        assert_eq!(hidden[4], "0");
+        assert_eq!(hidden[5], "0");
+    }
 
     #[test]
     fn clusters_candidates_and_drops_outliers() {

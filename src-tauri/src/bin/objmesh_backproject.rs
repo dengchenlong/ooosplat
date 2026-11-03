@@ -16,16 +16,24 @@ use std::path::PathBuf;
 
 use ooo_splat::reconstruction::backproject::{
     filter_object_clusters, label_object_clusters, load_frame_views, vote_splats,
-    write_instance_mask, ClusterConfig, ClusterFilterConfig, ClusterFilterOutcome, VoteConfig,
+    write_instance_mask, write_vote_dump, ClusterConfig, ClusterFilterConfig, ClusterFilterOutcome,
+    VoteConfig,
 };
 use ooo_splat::reconstruction::ply::stream_splat_cores;
 use ooo_splat::reconstruction::splat_transform::export_instance_assets;
 
 const USAGE: &str = "usage: objmesh_backproject <project_root> <colmap_model_dir> <masks_dir> \
-[--min-cluster-points N] [--max-distance-ratio R|none]";
+[--min-cluster-points N] [--max-distance-ratio R|none] [--dump-votes PATH]";
 
 fn main() {
-    let (project_root, model_dir, masks_dir, filter_config) = parse_arguments();
+    let arguments = parse_arguments();
+    let (project_root, model_dir, masks_dir, filter_config) = (
+        arguments.project_root,
+        arguments.model_dir,
+        arguments.masks_dir,
+        arguments.filter,
+    );
+    let dump_votes = arguments.dump_votes;
 
     let ply_path = project_root.join("final.ply");
     println!("[1/4] pairing COLMAP model with masks from {masks_dir:?}");
@@ -91,6 +99,7 @@ fn main() {
         labels,
     )
     .expect("write instance mask");
+    let matched = positions.len();
     let info = export_instance_assets(&project_root, || Ok(())).expect("export assets");
     println!(
         "      object.ply: {} splats; background.ply: {} splats; sum = {} (final = {})",
@@ -108,6 +117,11 @@ fn main() {
         object_count, info.object.splat_count,
         "instance bitmap and object.ply must agree"
     );
+
+    if let Some(path) = dump_votes {
+        write_vote_dump(&path, &positions[..matched], &outcome, labels).expect("write vote dump");
+        println!("      vote dump: {}", path.display());
+    }
 
     let mean = |select: &dyn Fn(usize) -> bool| -> (f64, usize) {
         let mut sum = 0.0_f64;
@@ -141,14 +155,28 @@ fn main() {
 }
 
 /// Parses the three legacy positional arguments plus the optional filter flags
-/// (`--min-cluster-points`, `--max-distance-ratio`; `none` disables the gate),
-/// so an existing three-argument invocation keeps working with the defaults.
-fn parse_arguments() -> (PathBuf, PathBuf, PathBuf, ClusterFilterConfig) {
+/// (`--min-cluster-points`, `--max-distance-ratio`; `none` disables the gate)
+/// and `--dump-votes PATH` for per-splat voting evidence (issue #16), so an
+/// existing three-argument invocation keeps working with the defaults.
+struct Arguments {
+    project_root: PathBuf,
+    model_dir: PathBuf,
+    masks_dir: PathBuf,
+    filter: ClusterFilterConfig,
+    dump_votes: Option<PathBuf>,
+}
+
+fn parse_arguments() -> Arguments {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut filter = ClusterFilterConfig::default();
+    let mut dump_votes = None;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--dump-votes" => {
+                let value = args.next().unwrap_or_else(|| fail("missing value"));
+                dump_votes = Some(PathBuf::from(value));
+            }
             "--min-cluster-points" => {
                 let value = args.next().unwrap_or_else(|| fail("missing value"));
                 filter.min_cluster_points = value
@@ -180,7 +208,13 @@ fn parse_arguments() -> (PathBuf, PathBuf, PathBuf, ClusterFilterConfig) {
     let masks_dir = positional.pop().expect("checked length");
     let model_dir = positional.pop().expect("checked length");
     let project_root = positional.pop().expect("checked length");
-    (project_root, model_dir, masks_dir, filter)
+    Arguments {
+        project_root,
+        model_dir,
+        masks_dir,
+        filter,
+        dump_votes,
+    }
 }
 
 fn fail(message: &str) -> ! {
