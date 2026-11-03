@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectAssetDescriptor } from "../../types/pipeline";
@@ -20,7 +20,7 @@ vi.mock("@playcanvas/react/hooks", () => ({
   }),
 }));
 
-vi.mock("@playcanvas/react", () => ({ Entity: ({ name, children }: { name: string; children?: unknown }) => <div data-name={name}>{children}</div> }));
+vi.mock("@playcanvas/react", () => ({ Entity: ({ name, children }: { name: string; children?: ReactNode }) => <div data-name={name}>{children}</div> }));
 vi.mock("@playcanvas/react/components", () => ({ GSplat: ({ asset }: { asset: unknown }) => <div data-splat={JSON.stringify(asset)} /> }));
 
 const transform = { position: [0, 0, 0] as [number, number, number], rotation: [0, 0, 0] as [number, number, number], scale: 1 };
