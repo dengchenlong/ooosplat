@@ -16,11 +16,22 @@ check=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
   if [ "$remote_sha" = "$ZERO" ]; then
-    base="$(git merge-base "$local_sha" HEAD~200 2>/dev/null || echo "")"
-    [ -z "$base" ] && base="$local_sha"
+    # New remote branch: compare against where it forked off a known base, and
+    # fall back to the root commit so the comparison is always a resolvable rev.
+    base=""
+    for candidate in origin/main upstream/main; do
+      if base="$(git merge-base "$local_sha" "$candidate" 2>/dev/null)" && [ -n "$base" ]; then
+        break
+      fi
+      base=""
+    done
+    if [ -z "$base" ]; then
+      base="$(git rev-list --max-parents=0 "$local_sha" 2>/dev/null | tail -1)"
+    fi
   else
     base="$remote_sha"
   fi
+  [ -z "$base" ] && continue
   if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -q '^src-tauri/.*\.rs$'; then
     check=1
   fi
