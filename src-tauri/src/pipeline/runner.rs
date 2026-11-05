@@ -6367,27 +6367,19 @@ async fn segment_frames_identity(frames_dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Assembles the historical unmasked Brush dataset. Masked route-A datasets go
+/// through [`crate::pipeline::brush_datasets::prepare_datasets`] (issue #8).
 async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {
-    let dataset = root.join("dataset");
-    let images = dataset.join("images");
-    let sparse = dataset.join("sparse").join("0");
-    tokio::fs::create_dir_all(&images).await?;
-    tokio::fs::create_dir_all(&sparse).await?;
-    let mut entries = tokio::fs::read_dir(frames).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let source = entry.path();
-        if !source.is_file() {
-            continue;
-        }
-        let destination = images.join(entry.file_name());
-        if tokio::fs::hard_link(&source, &destination).await.is_err() {
-            tokio::fs::copy(&source, &destination).await?;
-        }
-    }
-    for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-        tokio::fs::copy(model.join(name), sparse.join(name)).await?;
-    }
-    Ok(dataset)
+    crate::pipeline::brush_datasets::prepare_dataset(
+        root,
+        frames,
+        model,
+        None,
+        &crate::pipeline::brush_datasets::DatasetSpec::plain(
+            crate::pipeline::brush_datasets::SINGLE_DATASET_NAME,
+        ),
+    )
+    .await
 }
 
 pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
