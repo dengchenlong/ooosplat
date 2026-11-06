@@ -8,11 +8,13 @@
 //! writer are all implemented in this module tree.
 
 pub mod depth;
+pub mod surface;
 pub mod tsdf;
 
 pub use depth::{
     fill_holes, render_depth, scale_intrinsics, smooth_depth, DepthMap, DepthRasterOptions,
 };
+pub use surface::{assign_nearest_colors, extract_surface};
 pub use tsdf::{fuse_into, DepthFrame, FuseOptions, GridSpec, TsdfGrid};
 
 /// A triangle mesh with per-vertex normals and colours, in glTF conventions
