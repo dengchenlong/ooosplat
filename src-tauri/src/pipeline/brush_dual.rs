@@ -113,13 +113,26 @@ pub fn plan_dual_training(
 /// Runs both jobs in order through `run_one`, which performs the actual training
 /// call. Stopping at the first failure keeps the second side from burning GPU
 /// time on a split whose other half is already broken.
-pub fn run_dual_training<F>(jobs: &[DualJob; 2], mut run_one: F) -> Result<DualTrainingOutcome>
+///
+/// Async, and the job is passed **by value**: `brush::train` is async, so the
+/// callback must be able to hand back a future. With `&DualJob` the compiler
+/// cannot tie the future's lifetime to the borrow (one `Fut` type has to serve
+/// both calls), so the future would either outlive the job or force a boxed
+/// HRTB. `DualJob` is two paths and a string — cloning it per side costs nothing
+/// and keeps the signature readable.
+pub async fn run_dual_training<F, Fut>(
+    jobs: &[DualJob; 2],
+    mut run_one: F,
+) -> Result<DualTrainingOutcome>
 where
-    F: FnMut(&DualJob) -> Result<PathBuf>,
+    F: FnMut(DualJob) -> Fut,
+    Fut: std::future::Future<Output = Result<PathBuf>>,
 {
-    let object = run_one(&jobs[0])
+    let object = run_one(jobs[0].clone())
+        .await
         .map_err(|error| annotate(SidePolarity::Object, &jobs[0].dataset, error))?;
-    let background = run_one(&jobs[1])
+    let background = run_one(jobs[1].clone())
+        .await
         .map_err(|error| annotate(SidePolarity::Background, &jobs[1].dataset, error))?;
     Ok(DualTrainingOutcome { object, background })
 }
@@ -228,8 +241,8 @@ mod tests {
         assert!(error.to_string().contains("两个数据集"));
     }
 
-    #[test]
-    fn both_sides_run_in_order_and_return_their_exports() {
+    #[tokio::test]
+    async fn both_sides_run_in_order_and_return_their_exports() {
         let dir = tempfile::tempdir().unwrap();
         let datasets = vec![
             dataset(dir.path(), "dataset-object", true),
@@ -245,16 +258,18 @@ mod tests {
         let mut seen: Vec<&'static str> = Vec::new();
         let outcome = run_dual_training(&jobs, |job| {
             seen.push(job.polarity.label());
-            Ok(job.output_directory.join(&job.export_name))
+            let export = job.output_directory.join(&job.export_name);
+            async move { Ok(export) }
         })
+        .await
         .unwrap();
         assert_eq!(seen, vec!["object", "background"]);
         assert!(outcome.object.ends_with("object.ply.tmp"));
         assert!(outcome.background.ends_with("background.ply.tmp"));
     }
 
-    #[test]
-    fn a_failed_object_side_stops_before_training_the_background() {
+    #[tokio::test]
+    async fn a_failed_object_side_stops_before_training_the_background() {
         let dir = tempfile::tempdir().unwrap();
         let datasets = vec![
             dataset(dir.path(), "dataset-object", true),
@@ -267,13 +282,18 @@ mod tests {
             "dataset-background",
         )
         .unwrap();
-        let mut calls = 0;
+        let calls = std::cell::Cell::new(0_u32);
         let error = run_dual_training(&jobs, |_| {
-            calls += 1;
-            Err(SplatError::Process("boom".into()))
+            calls.set(calls.get() + 1);
+            async { Err(SplatError::Process("boom".into())) }
         })
+        .await
         .unwrap_err();
-        assert_eq!(calls, 1, "the second side must not run after a failure");
+        assert_eq!(
+            calls.get(),
+            1,
+            "the second side must not run after a failure"
+        );
         assert!(error.to_string().contains("object 训练失败"));
     }
 
