@@ -9,6 +9,7 @@
 
 pub mod depth;
 pub mod glb;
+pub mod pipeline;
 pub mod surface;
 pub mod tsdf;
 
@@ -16,6 +17,10 @@ pub use depth::{
     fill_holes, render_depth, scale_intrinsics, smooth_depth, DepthMap, DepthRasterOptions,
 };
 pub use glb::{encode_glb, split_glb, write_glb, GlbOutput};
+pub use pipeline::{
+    build_object_mesh, object_ply_path, write_mesh_glb, MeshBuild, MeshOptions, MeshSummary,
+    OBJECT_PLY_RELATIVE,
+};
 pub use surface::{assign_nearest_colors, extract_surface};
 pub use tsdf::{fuse_into, DepthFrame, FuseOptions, GridSpec, TsdfGrid};
 
