@@ -42,7 +42,19 @@ pub struct BrushTrainingOptions<'a> {
     pub panorama: bool,
     pub log_path: PathBuf,
     pub gpu_launch_policy: &'a BrushGpuLaunchPolicy,
+    /// Name of the exported PLY inside the output directory. Route A's dual
+    /// training needs one run per side, so the name can no longer be the
+    /// hardcoded `final.ply.tmp` (issue #9).
+    pub export_name: &'a str,
+    /// Keeps white as "ignore" instead of "keep". Route A bakes polarity into
+    /// the assembled masks, so this is only for callers that hand Brush a
+    /// dataset whose masks are the other way round.
+    pub invert_masks: bool,
 }
+
+/// The historical single-run export name. Every caller that does not opt into
+/// a different name keeps this value.
+pub const DEFAULT_EXPORT_NAME: &str = "final.ply.tmp";
 
 impl BrushGpuLaunchPolicy {
     pub fn from_acceleration(acceleration: &ColmapAccelerationStatus) -> Self {
@@ -142,10 +154,23 @@ impl BrushGpuLaunchPolicy {
     }
 }
 
+/// Convenience wrapper for callers that keep the historical export name.
+/// Only the test suite calls it now (production goes through
+/// `train_args_with_name`), so it is test-only to keep `-D warnings` green.
+#[cfg(test)]
 fn train_args(
     dataset: &Path,
     output_directory: &Path,
     preset: BrushTrainingPreset,
+) -> Vec<OsString> {
+    train_args_with_name(dataset, output_directory, preset, DEFAULT_EXPORT_NAME)
+}
+
+fn train_args_with_name(
+    dataset: &Path,
+    output_directory: &Path,
+    preset: BrushTrainingPreset,
+    export_name: &str,
 ) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--total-train-iters"),
@@ -180,19 +205,37 @@ fn train_args(
         OsString::from("--export-path"),
         output_directory.into(),
         OsString::from("--export-name"),
-        OsString::from("final.ply.tmp"),
+        OsString::from(export_name),
         dataset.into(),
     ]);
     args
 }
 
+/// Same, for the panorama-aware tests: production passes the real export name.
+#[cfg(test)]
 fn train_args_for_mode(
     dataset: &Path,
     output_directory: &Path,
     preset: BrushTrainingPreset,
     panorama: bool,
 ) -> Vec<OsString> {
-    let mut args = train_args(dataset, output_directory, preset);
+    train_args_for_mode_with_name(
+        dataset,
+        output_directory,
+        preset,
+        panorama,
+        DEFAULT_EXPORT_NAME,
+    )
+}
+
+fn train_args_for_mode_with_name(
+    dataset: &Path,
+    output_directory: &Path,
+    preset: BrushTrainingPreset,
+    panorama: bool,
+    export_name: &str,
+) -> Vec<OsString> {
+    let mut args = train_args_with_name(dataset, output_directory, preset, export_name);
     if panorama {
         // Pin these defaults for the versioned panorama recipe only.
         args.splice(
@@ -211,33 +254,36 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     }
 }
 
-pub async fn train(
-    executable: &Path,
+/// Assembles the complete Brush CLI argument vector for one training run.
+/// Split out of [`train`] so the mask/polarity/export-name flags are covered by
+/// a unit test instead of only by a real 20-minute training run.
+#[allow(clippy::too_many_arguments)]
+fn train_command_args(
     dataset: &Path,
     output_directory: &Path,
-    options: BrushTrainingOptions<'_>,
-    manager: &ProcessManager,
-    observer: Option<ProcessObserver>,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_directory).await?;
-    let candidate = output_directory.join("final.ply.tmp");
-    let alternate = output_directory.join("final.ply.tmp.ply");
-    for partial in [&candidate, &alternate] {
-        if partial.exists() {
-            tokio::fs::remove_file(partial).await?;
-        }
+    preset: BrushTrainingPreset,
+    panorama: bool,
+    export_name: &str,
+    alpha_mode: Option<&str>,
+    invert_masks: bool,
+    warm: Option<&crate::pipeline::reshoot::WarmStartParameters>,
+) -> Vec<OsString> {
+    let mut args =
+        train_args_for_mode_with_name(dataset, output_directory, preset, panorama, export_name);
+    // Flags must land before the trailing dataset positional: Brush parses the
+    // source path as the last argument.
+    let mut flags: Vec<OsString> = Vec::new();
+    if let Some(mode) = alpha_mode {
+        flags.extend([OsString::from("--alpha-mode"), OsString::from(mode)]);
     }
-    let environment = options.gpu_launch_policy.environment();
-    let mut args = train_args_for_mode(
-        dataset,
-        output_directory,
-        options.preset,
-        options.panorama && options.warm.is_none(),
-    );
-    if let Some(mode) = options.alpha_mode {
-        args.extend([OsString::from("--alpha-mode"), OsString::from(mode)]);
+    if invert_masks {
+        flags.push(OsString::from("--invert-masks"));
     }
-    if let Some(warm) = options.warm {
+    if !flags.is_empty() {
+        let insert_at = args.len().saturating_sub(1);
+        args.splice(insert_at..insert_at, flags);
+    }
+    if let Some(warm) = warm {
         args.splice(
             0..0,
             [
@@ -255,6 +301,36 @@ pub async fn train(
             .flat_map(|(key, value)| [OsString::from(key), OsString::from(value)]),
         );
     }
+    args
+}
+
+pub async fn train(
+    executable: &Path,
+    dataset: &Path,
+    output_directory: &Path,
+    options: BrushTrainingOptions<'_>,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(output_directory).await?;
+    let candidate = output_directory.join(options.export_name);
+    let alternate = output_directory.join(format!("{}.ply", options.export_name));
+    for partial in [&candidate, &alternate] {
+        if partial.exists() {
+            tokio::fs::remove_file(partial).await?;
+        }
+    }
+    let environment = options.gpu_launch_policy.environment();
+    let args = train_command_args(
+        dataset,
+        output_directory,
+        options.preset,
+        options.panorama && options.warm.is_none(),
+        options.export_name,
+        options.alpha_mode,
+        options.invert_masks,
+        options.warm.as_ref(),
+    );
     let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
     let counts = last_splat_count.clone();
     let observer: ProcessObserver = std::sync::Arc::new(move |update| {
@@ -469,6 +545,70 @@ mod tests {
     }
 
     #[test]
+    fn export_name_is_parameterised() {
+        let dataset = Path::new("dataset-object");
+        let output = Path::new("out");
+        let preset = resolve_brush_training_preset(Quality::Fast, false, None, 1_600, 0).preset;
+        let args = args_as_strings(train_args_with_name(
+            dataset,
+            output,
+            preset,
+            "object.ply.tmp",
+        ));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--export-name" && pair[1] == "object.ply.tmp"));
+        assert_eq!(args.last().unwrap(), "dataset-object");
+    }
+
+    #[test]
+    fn route_a_masked_training_passes_the_native_mask_flags() {
+        // Polarity is baked into the assembled masks, so invert stays off by
+        // default; Brush infers `Masked` from the presence of a `masks/`
+        // directory, so no explicit --alpha-mode is needed either.
+        let dataset = Path::new("dataset-background");
+        let output = Path::new("out");
+        let preset = resolve_brush_training_preset(Quality::Fast, false, None, 1_600, 0).preset;
+        let plain = args_as_strings(train_command_args(
+            dataset,
+            output,
+            preset,
+            false,
+            DEFAULT_EXPORT_NAME,
+            None,
+            false,
+            None,
+        ));
+        assert!(!plain.iter().any(|arg| arg == "--invert-masks"));
+        assert!(!plain.iter().any(|arg| arg == "--alpha-mode"));
+    }
+
+    #[test]
+    fn invert_masks_and_alpha_mode_reach_the_cli_when_requested() {
+        let dataset = Path::new("dataset-background");
+        let output = Path::new("out");
+        let preset = resolve_brush_training_preset(Quality::Fast, false, None, 1_600, 0).preset;
+        let args = args_as_strings(train_command_args(
+            dataset,
+            output,
+            preset,
+            false,
+            "background.ply.tmp",
+            Some("transparent"),
+            true,
+            None,
+        ));
+        assert!(args.iter().any(|arg| arg == "--invert-masks"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--alpha-mode" && pair[1] == "transparent"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--export-name" && pair[1] == "background.ply.tmp"));
+        assert_eq!(args.last().unwrap(), "dataset-background");
+    }
+
+    #[test]
     fn panorama_cli_pins_growth_start_and_sh_without_changing_ordinary_jobs() {
         for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
             let r =
@@ -476,7 +616,16 @@ mod tests {
                     .unwrap();
             let dataset = Path::new("existing panorama");
             let output = Path::new("isolated output");
-            let args = args_as_strings(train_args_for_mode(dataset, output, r.preset, true));
+            let args = args_as_strings(train_command_args(
+                dataset,
+                output,
+                r.preset,
+                true,
+                DEFAULT_EXPORT_NAME,
+                None,
+                false,
+                None,
+            ));
             assert_eq!(args.last().unwrap(), "existing panorama");
             for (flag, value) in [
                 ("--growth-start-iter", "0".into()),
