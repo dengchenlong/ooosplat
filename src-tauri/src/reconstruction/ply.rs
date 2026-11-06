@@ -185,18 +185,7 @@ pub fn parse_gaussian_ply_layout(path: &Path) -> Result<PlyLayout> {
         ));
     }
     let lines = lines.collect::<Vec<_>>();
-    let splat_count = lines
-        .iter()
-        .find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next() == Some("element") && fields.next() == Some("vertex"))
-                .then(|| fields.next()?.parse::<u64>().ok())
-                .flatten()
-        })
-        .unwrap_or(0);
-    if splat_count == 0 {
-        return Err(SplatError::Process("PLY 不包含 Gaussian 顶点".into()));
-    }
+    let splat_count = ply_splat_count(&lines)?;
 
     let mut offsets = SplatPropertyOffsets {
         x: 0,
@@ -213,7 +202,22 @@ pub fn parse_gaussian_ply_layout(path: &Path) -> Result<PlyLayout> {
     max_offset = max_offset.max(property_offset(&lines, "scale_1", &mut offsets.scale_1)?);
     max_offset = max_offset.max(property_offset(&lines, "scale_2", &mut offsets.scale_2)?);
 
-    let stride = lines
+    let stride = ply_stride(&lines)?;
+    if stride < max_offset + 4 {
+        return Err(SplatError::Process("PLY 属性布局与 stride 不一致".into()));
+    }
+
+    Ok(PlyLayout {
+        splat_count,
+        stride,
+        header_bytes: header.len(),
+        offsets,
+    })
+}
+
+/// Total record size (stride) summed over every `property` line.
+fn ply_stride(lines: &[&str]) -> Result<usize> {
+    lines
         .iter()
         .filter(|line| line.split_whitespace().next() == Some("property"))
         .try_fold(0_usize, |total, line| {
@@ -226,17 +230,151 @@ pub fn parse_gaussian_ply_layout(path: &Path) -> Result<PlyLayout> {
                 .ok_or_else(|| {
                     SplatError::Process(format!("PLY 包含无法解析的属性类型：{type_name}"))
                 })
-        })?;
+        })
+}
+
+/// Splat count from an already-read Gaussian PLY header.
+fn ply_splat_count(lines: &[&str]) -> Result<u64> {
+    let count = lines
+        .iter()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("element") && fields.next() == Some("vertex"))
+                .then(|| fields.next()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    if count == 0 {
+        return Err(SplatError::Process("PLY 不包含 Gaussian 顶点".into()));
+    }
+    Ok(count)
+}
+
+/// A splat's position and its view-independent (SH DC term) colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColoredSplat {
+    pub position: [f64; 3],
+    /// Linear RGB in 0..=1, already converted from the PLY's SH DC term.
+    pub color: [f32; 3],
+}
+
+/// Byte offsets of the properties the mesh stage reads from each record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColoredSplatOffsets {
+    pub x: usize,
+    pub y: usize,
+    pub z: usize,
+    pub f_dc_0: usize,
+    pub f_dc_1: usize,
+    pub f_dc_2: usize,
+}
+
+/// Streaming layout for a coloured Gaussian PLY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColoredSplatLayout {
+    pub splat_count: u64,
+    pub stride: usize,
+    pub header_bytes: usize,
+    pub offsets: ColoredSplatOffsets,
+}
+
+/// 3DGS stores colours as SH degree-0 coefficients; this is the SH basis
+/// constant `Y_0^0` that converts `f_dc` back to linear RGB.
+pub const SH_C0: f64 = 0.282_094_791_773_878_14;
+
+/// Converts one SH DC channel to linear RGB in 0..=1.
+pub fn dc_to_linear_rgb(dc: f64) -> f32 {
+    (0.5 + SH_C0 * dc).clamp(0.0, 1.0) as f32
+}
+
+/// Parses a Gaussian PLY header into the layout needed for position + colour
+/// streaming.
+pub fn parse_colored_splat_layout(path: &Path) -> Result<ColoredSplatLayout> {
+    let header = read_ply_header(File::open(path)?)?;
+    let mut lines = header.lines().map(str::trim_end);
+    if lines.next() != Some("ply") {
+        return Err(SplatError::Process("输出不是合法 PLY 文件".into()));
+    }
+    let lines = lines.collect::<Vec<_>>();
+    let splat_count = ply_splat_count(&lines)?;
+
+    let mut offsets = ColoredSplatOffsets {
+        x: 0,
+        y: 0,
+        z: 0,
+        f_dc_0: 0,
+        f_dc_1: 0,
+        f_dc_2: 0,
+    };
+    let mut max_offset = property_offset(&lines, "x", &mut offsets.x)?;
+    max_offset = max_offset.max(property_offset(&lines, "y", &mut offsets.y)?);
+    max_offset = max_offset.max(property_offset(&lines, "z", &mut offsets.z)?);
+    max_offset = max_offset.max(property_offset(&lines, "f_dc_0", &mut offsets.f_dc_0)?);
+    max_offset = max_offset.max(property_offset(&lines, "f_dc_1", &mut offsets.f_dc_1)?);
+    max_offset = max_offset.max(property_offset(&lines, "f_dc_2", &mut offsets.f_dc_2)?);
+
+    let stride = ply_stride(&lines)?;
     if stride < max_offset + 4 {
         return Err(SplatError::Process("PLY 属性布局与 stride 不一致".into()));
     }
-
-    Ok(PlyLayout {
+    Ok(ColoredSplatLayout {
         splat_count,
         stride,
         header_bytes: header.len(),
         offsets,
     })
+}
+
+/// Streams position + DC colour from a binary Gaussian PLY in batches.
+///
+/// Mirrors `stream_splat_cores` (bounded memory, read-only access) and adds
+/// the `f_dc_*` channels for vertex colouring. Returns the splat count.
+pub fn stream_colored_splats(
+    path: &Path,
+    batch_size: usize,
+    sink: &mut dyn FnMut(&[ColoredSplat]) -> Result<()>,
+) -> Result<u64> {
+    if batch_size == 0 {
+        return Err(SplatError::Process("PLY 流式读取批大小必须大于 0".into()));
+    }
+    let layout = parse_colored_splat_layout(path)?;
+    let mut file = File::open(path)?;
+    std::io::Seek::seek(
+        &mut file,
+        std::io::SeekFrom::Start(layout.header_bytes as u64),
+    )?;
+    let mut reader = BufReader::with_capacity(batch_size * layout.stride, file);
+    let mut record = vec![0_u8; layout.stride];
+    let mut batch: Vec<ColoredSplat> = Vec::with_capacity(batch_size);
+    let mut streamed = 0_u64;
+    let read_f32 = |bytes: &[u8], offset: usize| {
+        f32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("offset in range"),
+        ) as f64
+    };
+    while streamed < layout.splat_count {
+        batch.clear();
+        for _ in 0..batch_size.min((layout.splat_count - streamed) as usize) {
+            reader.read_exact(&mut record)?;
+            batch.push(ColoredSplat {
+                position: [
+                    read_f32(&record, layout.offsets.x),
+                    read_f32(&record, layout.offsets.y),
+                    read_f32(&record, layout.offsets.z),
+                ],
+                color: [
+                    dc_to_linear_rgb(read_f32(&record, layout.offsets.f_dc_0)),
+                    dc_to_linear_rgb(read_f32(&record, layout.offsets.f_dc_1)),
+                    dc_to_linear_rgb(read_f32(&record, layout.offsets.f_dc_2)),
+                ],
+            });
+        }
+        streamed += batch.len() as u64;
+        sink(&batch)?;
+    }
+    Ok(streamed)
 }
 
 /// Streams `SplatCore` values from a binary Gaussian PLY in batches.
@@ -464,5 +602,105 @@ mod tests {
         )
         .unwrap();
         assert!(parse_gaussian_ply_layout(&path).is_err());
+    }
+
+    fn write_colored_fixture(path: &Path, splats: &[ColoredSplat]) {
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\n{STREAM_PROPERTIES}end_header\n",
+            splats.len()
+        );
+        let mut bytes = header.into_bytes();
+        for splat in splats {
+            for value in splat.position {
+                bytes.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+            // f_dc_* is stored pre-encode: invert `dc_to_linear_rgb`.
+            for channel in splat.color {
+                let dc = (channel as f64 - 0.5) / SH_C0;
+                bytes.extend_from_slice(&(dc as f32).to_le_bytes());
+            }
+            for _ in 0..1 {
+                bytes.extend_from_slice(&(0.9_f32).to_le_bytes());
+            }
+            for _ in 0..3 {
+                bytes.extend_from_slice(&(-3.0_f32).to_le_bytes());
+            }
+            for _ in 0..4 {
+                bytes.extend_from_slice(&(0.5_f32).to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn converts_dc_coefficients_to_linear_rgb() {
+        assert!((dc_to_linear_rgb(0.0) - 0.5).abs() < 1e-6);
+        assert!(dc_to_linear_rgb(10.0) == 1.0, "clamped high");
+        assert!(dc_to_linear_rgb(-10.0) == 0.0, "clamped low");
+        assert!((dc_to_linear_rgb(1.0) - 0.782_094_8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_colored_layout_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("colored.ply");
+        write_colored_fixture(
+            &path,
+            &[ColoredSplat {
+                position: [0.0; 3],
+                color: [0.5; 3],
+            }],
+        );
+        let layout = parse_colored_splat_layout(&path).unwrap();
+        assert_eq!(layout.splat_count, 1);
+        assert_eq!(layout.stride, 56);
+        // f_dc_* follow x/y/z in STREAM_PROPERTIES.
+        assert_eq!(layout.offsets.x, 0);
+        assert_eq!(layout.offsets.z, 8);
+        assert_eq!(layout.offsets.f_dc_0, 12);
+        assert_eq!(layout.offsets.f_dc_2, 20);
+    }
+
+    #[test]
+    fn streams_positions_with_colours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream-colored.ply");
+        let expected = vec![
+            ColoredSplat {
+                position: [1.0, 2.0, 3.0],
+                color: [1.0, 0.0, 0.0],
+            },
+            ColoredSplat {
+                position: [-1.0, -2.0, -3.0],
+                color: [0.0, 1.0, 0.0],
+            },
+        ];
+        write_colored_fixture(&path, &expected);
+        let mut seen = Vec::new();
+        let mut batches = Vec::new();
+        let count = stream_colored_splats(&path, 1, &mut |batch| {
+            batches.push(batch.len());
+            seen.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(batches, vec![1, 1]);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].position, [1.0, 2.0, 3.0]);
+        assert!((seen[0].color[0] - 1.0).abs() < 1e-4);
+        assert!((seen[1].color[1] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rejects_colored_layout_without_dc_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nocolor.ply");
+        std::fs::write(
+            &path,
+            b"ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n",
+        )
+        .unwrap();
+        assert!(parse_colored_splat_layout(&path).is_err());
     }
 }

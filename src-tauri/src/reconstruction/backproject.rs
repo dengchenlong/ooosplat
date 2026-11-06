@@ -107,7 +107,15 @@ impl CameraProjection {
     ///
     /// Returns `None` when the point lies on or behind the camera plane.
     pub fn world_to_pixel(&self, pose: &ImagePose, point: [f64; 3]) -> Option<[f64; 2]> {
-        let cam = world_to_camera(pose, point);
+        self.camera_to_pixel(world_to_camera(pose, point))
+    }
+
+    /// Projects an already camera-space point into pixel coordinates.
+    ///
+    /// Split out from `world_to_pixel` so callers that transform many points
+    /// with the same pose (the TSDF voxel sweep) can rotate once per point
+    /// instead of once per lookup.
+    pub fn camera_to_pixel(&self, cam: [f64; 3]) -> Option<[f64; 2]> {
         // Points within float noise of the camera plane are treated as
         // on-plane (invisible): the sign of `cam[2]` is not meaningful there
         // and differs across platforms for exactly-on-plane inputs.
