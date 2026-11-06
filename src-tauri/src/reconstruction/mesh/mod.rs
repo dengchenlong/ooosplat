@@ -8,12 +8,14 @@
 //! writer are all implemented in this module tree.
 
 pub mod depth;
+pub mod glb;
 pub mod surface;
 pub mod tsdf;
 
 pub use depth::{
     fill_holes, render_depth, scale_intrinsics, smooth_depth, DepthMap, DepthRasterOptions,
 };
+pub use glb::{encode_glb, split_glb, write_glb, GlbOutput};
 pub use surface::{assign_nearest_colors, extract_surface};
 pub use tsdf::{fuse_into, DepthFrame, FuseOptions, GridSpec, TsdfGrid};
 
