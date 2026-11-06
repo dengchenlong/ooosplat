@@ -2,6 +2,7 @@ pub mod backproject;
 pub mod colmap_model;
 pub mod edit_mask;
 pub mod gps;
+pub mod mesh;
 pub mod ply;
 pub mod reference_view;
 pub mod splat_transform;
