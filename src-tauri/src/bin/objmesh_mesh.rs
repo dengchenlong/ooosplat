@@ -33,10 +33,10 @@ const USAGE: &str = "usage: objmesh_mesh <project_root> <colmap_model_dir> --out
   --max-frames N        fuse only the first N frames (default: all)\n\
   --scale-mm F          rescale the longest mesh edge to F millimetres (default: keep COLMAP scale)\n\
   --color-cell-size C   nearest-splat colour lookup cell (default: 2 voxels)\n\
-  --min-component-ratio R  drop connected components holding less than R of the triangles (0..1, default 0 = keep all)\n\
+  --min-component-ratio R  drop components holding less than R of the triangles (0..1; not set = keep every component)\n\
   --keep-largest-only  keep only the largest connected component (wins over --min-component-ratio)\n\
   --target-triangles N  simplify the mesh down to at most N triangles\n\
-  --simplify-ratio R    simplify to R of the extracted triangles (0..1]\n\
+  --simplify-ratio R    simplify to R of the extracted triangles (0..1; --target-triangles wins if both are given)\n\
   --scale-from-mm-ref A:B  calibrate physical scale: the mesh span A (scene units) is known to be B millimetres";
 
 struct Arguments {
