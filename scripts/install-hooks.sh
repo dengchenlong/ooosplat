@@ -11,7 +11,11 @@ cd "$ROOT"
 
 HOOKS="$(git rev-parse --git-common-dir)"
 case "$HOOKS" in
-  /*) ;;
+  # Absolute POSIX path (/g/ooosplat/.git), or an absolute Windows path with a
+  # drive letter (G:/ooosplat/.git). The drive-letter form is what git returns
+  # inside a worktree on this host; treating it as relative used to prepend
+  # $ROOT and create a bogus "$ROOT/G:/..." directory tree instead of installing.
+  /*|[A-Za-z]:/*) ;;
   *) HOOKS="$ROOT/${HOOKS#./}" ;;
 esac
 
