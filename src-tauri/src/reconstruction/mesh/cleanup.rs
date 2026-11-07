@@ -26,7 +26,7 @@ pub fn components(mesh: &Mesh) -> Vec<Component> {
     }
     let vertex_count = mesh.positions.len();
     let mut set = DisjointSet::new(vertex_count);
-    for triangle in mesh.indices.chunks_exact(3) {
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         set.union(triangle[0], triangle[1]);
         set.union(triangle[1], triangle[2]);
     }
@@ -41,7 +41,7 @@ pub fn components(mesh: &Mesh) -> Vec<Component> {
         }
     }
     let mut counts = vec![0usize; component_count];
-    for triangle in mesh.indices.chunks_exact(3) {
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         counts[slot_of_root[set.find(triangle[0]) as usize]] += 1;
     }
     let total = count as f64;
@@ -53,7 +53,7 @@ pub fn components(mesh: &Mesh) -> Vec<Component> {
             ratio: *triangles as f64 / total,
         })
         .collect();
-    result.sort_by(|left, right| right.triangles.cmp(&left.triangles));
+    result.sort_by_key(|component| std::cmp::Reverse(component.triangles));
     result
 }
 
@@ -72,7 +72,7 @@ pub fn clean_components(mesh: &Mesh, min_ratio: f64, largest_only: bool) -> Mesh
         return mesh.clone();
     }
     let mut set = DisjointSet::new(vertex_count);
-    for triangle in mesh.indices.chunks_exact(3) {
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         set.union(triangle[0], triangle[1]);
         set.union(triangle[1], triangle[2]);
     }
@@ -88,7 +88,7 @@ pub fn clean_components(mesh: &Mesh, min_ratio: f64, largest_only: bool) -> Mesh
     }
     let mut counts = vec![0usize; component_count];
     let mut triangle_component = Vec::with_capacity(count);
-    for triangle in mesh.indices.chunks_exact(3) {
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         let component = slot_of_root[set.find(triangle[0]) as usize];
         triangle_component.push(component);
         counts[component] += 1;
@@ -122,7 +122,7 @@ pub fn clean_components(mesh: &Mesh, min_ratio: f64, largest_only: bool) -> Mesh
     let mut normals = Vec::new();
     let mut colors = Vec::new();
     let mut indices = Vec::with_capacity(mesh.indices.len());
-    for (triangle_index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+    for (triangle_index, triangle) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
         if !keep[triangle_component[triangle_index]] {
             continue;
         }
@@ -170,7 +170,9 @@ pub fn simplify(mesh: &Mesh, target_triangles: usize) -> Mesh {
     }
     let mut triangles: Vec<[u32; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0], chunk[1], chunk[2]])
         .collect();
     let mut alive = vec![true; triangles.len()];
@@ -320,7 +322,7 @@ pub fn simplify(mesh: &Mesh, target_triangles: usize) -> Mesh {
 /// Area-weighted vertex normals from the current triangles.
 pub fn recompute_normals(mesh: &mut Mesh) {
     let mut normals = vec![[0.0_f32; 3]; mesh.positions.len()];
-    for triangle in mesh.indices.chunks_exact(3) {
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         let [i0, i1, i2] = [
             triangle[0] as usize,
             triangle[1] as usize,
