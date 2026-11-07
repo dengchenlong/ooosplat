@@ -7,12 +7,17 @@
 //! rasteriser, the voxel grid, the surface extractor and the glTF 2.0 binary
 //! writer are all implemented in this module tree.
 
+pub mod cleanup;
 pub mod depth;
 pub mod glb;
 pub mod pipeline;
 pub mod surface;
 pub mod tsdf;
 
+pub use cleanup::{
+    clean_components, components, parse_mm_ref, recompute_normals, scale_factor_from_mm_ref,
+    simplify, Component,
+};
 pub use depth::{
     fill_holes, render_depth, scale_intrinsics, smooth_depth, DepthMap, DepthRasterOptions,
 };

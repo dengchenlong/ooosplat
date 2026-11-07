@@ -15,11 +15,15 @@
 
 use std::path::PathBuf;
 
-use ooo_splat::reconstruction::mesh::{build_object_mesh, write_mesh_glb, MeshOptions};
+use ooo_splat::reconstruction::mesh::{
+    build_object_mesh, parse_mm_ref, write_mesh_glb, MeshOptions,
+};
 
 const USAGE: &str = "usage: objmesh_mesh <project_root> <colmap_model_dir> --out <file.glb> \
 [--voxel-size S | --resolution N] [--truncation-voxels V] [--min-observations K] \
-[--depth-scale D] [--max-frames N] [--scale-mm F] [--color-cell-size C]\n\
+[--depth-scale D] [--max-frames N] [--scale-mm F] [--color-cell-size C] \
+[--min-component-ratio R] [--keep-largest-only] [--target-triangles N | --simplify-ratio R] \
+[--scale-from-mm-ref A:B]\n\
 \n\
   --voxel-size S        TSDF voxel edge in scene units (default: object AABB longest edge / --resolution)\n\
   --resolution N        voxels along the longest AABB edge when --voxel-size is absent (default 256)\n\
@@ -28,7 +32,12 @@ const USAGE: &str = "usage: objmesh_mesh <project_root> <colmap_model_dir> --out
   --depth-scale D       render depth at 1/D resolution (default 2)\n\
   --max-frames N        fuse only the first N frames (default: all)\n\
   --scale-mm F          rescale the longest mesh edge to F millimetres (default: keep COLMAP scale)\n\
-  --color-cell-size C   nearest-splat colour lookup cell (default: 2 voxels)";
+  --color-cell-size C   nearest-splat colour lookup cell (default: 2 voxels)\n\
+  --min-component-ratio R  drop connected components holding less than R of the triangles (0..1, default 0 = keep all)\n\
+  --keep-largest-only  keep only the largest connected component (wins over --min-component-ratio)\n\
+  --target-triangles N  simplify the mesh down to at most N triangles\n\
+  --simplify-ratio R    simplify to R of the extracted triangles (0..1]\n\
+  --scale-from-mm-ref A:B  calibrate physical scale: the mesh span A (scene units) is known to be B millimetres";
 
 struct Arguments {
     project_root: PathBuf,
@@ -75,6 +84,24 @@ fn parse_arguments() -> Arguments {
             "--scale-mm" => options.scale_mm = Some(parse_number(&value(), "--scale-mm")),
             "--color-cell-size" => {
                 options.color_cell_size = Some(parse_number(&value(), "--color-cell-size"));
+            }
+            "--min-component-ratio" => {
+                options.min_component_ratio = Some(parse_number(&value(), "--min-component-ratio"));
+            }
+            "--keep-largest-only" => options.keep_largest_only = true,
+            "--target-triangles" => {
+                options.target_triangles = Some(parse_usize(&value(), "--target-triangles"));
+            }
+            "--simplify-ratio" => {
+                options.simplify_ratio = Some(parse_number(&value(), "--simplify-ratio"));
+            }
+            "--scale-from-mm-ref" => {
+                let raw = value();
+                options.scale_from_mm_ref = Some(parse_mm_ref(&raw).unwrap_or_else(|| {
+                    fail(&format!(
+                        "--scale-from-mm-ref expects <scene-length>:<millimetres>, got {raw}"
+                    ))
+                }));
             }
             "-h" | "--help" => {
                 println!("{USAGE}");

@@ -46,6 +46,20 @@ pub struct MeshOptions {
     /// Spatial-hash cell for nearest-splat colour lookup; defaults to two
     /// voxels.
     pub color_cell_size: Option<f64>,
+    /// Drop connected components holding less than this share of the
+    /// triangles. `None` (the default) keeps every component, so the output
+    /// is unchanged for callers that predate issue #17.
+    pub min_component_ratio: Option<f64>,
+    /// Keep only the largest connected component, whatever its ratio.
+    pub keep_largest_only: bool,
+    /// Simplify down to at most this many triangles.
+    pub target_triangles: Option<usize>,
+    /// Simplify to this share of the extracted triangles (0..1).
+    pub simplify_ratio: Option<f64>,
+    /// `(measured scene units, known millimetres)` calibration pair: the
+    /// mesh is uniformly rescaled so the measured span equals that many
+    /// millimetres.
+    pub scale_from_mm_ref: Option<(f64, f64)>,
 }
 
 impl Default for MeshOptions {
@@ -59,6 +73,11 @@ impl Default for MeshOptions {
             scale_mm: None,
             max_frames: None,
             color_cell_size: None,
+            min_component_ratio: None,
+            keep_largest_only: false,
+            target_triangles: None,
+            simplify_ratio: None,
+            scale_from_mm_ref: None,
         }
     }
 }
@@ -75,6 +94,17 @@ pub struct MeshBuild {
     pub voxel_size: f64,
     /// World-space AABB of the object splats, in scene units.
     pub object_bounds: ([f64; 3], [f64; 3]),
+    /// Connected components in the final mesh.
+    pub components: usize,
+    /// Components the cleanup pass dropped (`0` when it was not requested).
+    pub components_removed: usize,
+    /// Vertex/triangle counts before simplification, when it ran.
+    pub vertices_before_simplify: Option<usize>,
+    pub triangles_before_simplify: Option<usize>,
+    /// Uniform factor applied to the positions (`1.0` when unscaled).
+    pub scale_factor: f64,
+    /// `"scene"` (raw COLMAP units) or `"m"` (calibrated, metric).
+    pub units: &'static str,
 }
 
 /// JSON summary printed as the last line of the CLI output.
@@ -90,6 +120,19 @@ pub struct MeshSummary {
     /// `[min, max]` of the source object splats, in scene units.
     pub object_bbox: [[f64; 3]; 2],
     pub voxel_size: f64,
+    /// Components left after cleanup.
+    pub components: usize,
+    /// Components the cleanup pass dropped.
+    pub components_removed: usize,
+    /// Vertices before simplification (`None` when no simplification ran).
+    pub vertices_before_simplify: Option<usize>,
+    /// Triangles before simplification (`None` when no simplification ran).
+    pub triangles_before_simplify: Option<usize>,
+    /// Uniform factor applied to the positions (`1.0` when unscaled).
+    pub scale_factor: f64,
+    /// Physical unit of the reported coordinates: `"scene"` for the raw
+    /// COLMAP scale, `"m"` once calibration made the mesh metric.
+    pub units: String,
     pub out: String,
 }
 
@@ -105,6 +148,12 @@ impl MeshSummary {
             bbox: [min, max],
             object_bbox: [build.object_bounds.0, build.object_bounds.1],
             voxel_size: build.voxel_size,
+            components: build.components,
+            components_removed: build.components_removed,
+            vertices_before_simplify: build.vertices_before_simplify,
+            triangles_before_simplify: build.triangles_before_simplify,
+            scale_factor: build.scale_factor,
+            units: build.units.to_string(),
             out: out.into(),
         }
     }
@@ -231,13 +280,76 @@ pub fn build_object_mesh(
     let cell = options.color_cell_size.unwrap_or(voxel_size * 2.0);
     assign_nearest_colors(&mut mesh, &colored, cell);
 
-    if let Some(millimetres) = options.scale_mm {
+    // --- issue #17: component cleanup, simplification, scale calibration ---
+    let components_before = crate::reconstruction::mesh::cleanup::components(&mesh).len();
+    if options.keep_largest_only || options.min_component_ratio.is_some() {
+        let ratio = options.min_component_ratio.unwrap_or(0.0);
+        if !ratio.is_finite() || ratio < 0.0 || ratio > 1.0 {
+            return Err(SplatError::Process(
+                "--min-component-ratio must be within 0..1".into(),
+            ));
+        }
+        mesh = crate::reconstruction::mesh::cleanup::clean_components(
+            &mesh,
+            ratio,
+            options.keep_largest_only,
+        );
+        if mesh.is_empty() {
+            return Err(SplatError::Process(
+                "连通分量清理后没有任何三角形；检查 --min-component-ratio".into(),
+            ));
+        }
+    }
+    let components_after = crate::reconstruction::mesh::cleanup::components(&mesh).len();
+
+    let mut vertices_before_simplify = None;
+    let mut triangles_before_simplify = None;
+    if options.target_triangles.is_some() || options.simplify_ratio.is_some() {
+        let target = match (options.target_triangles, options.simplify_ratio) {
+            (Some(target), _) => target,
+            (None, Some(ratio)) => {
+                if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                    return Err(SplatError::Process(
+                        "--simplify-ratio must be within (0, 1]".into(),
+                    ));
+                }
+                ((mesh.triangle_count() as f64) * ratio).round() as usize
+            }
+            (None, None) => unreachable!("guarded by the outer condition"),
+        };
+        if target == 0 {
+            return Err(SplatError::Process("简化目标不能为 0 三角形".into()));
+        }
+        vertices_before_simplify = Some(mesh.positions.len());
+        triangles_before_simplify = Some(mesh.triangle_count());
+        mesh = crate::reconstruction::mesh::cleanup::simplify(&mesh, target);
+        if mesh.is_empty() {
+            return Err(SplatError::Process("简化后没有任何三角形".into()));
+        }
+    }
+
+    // Scale: `--scale-from-mm-ref` is the calibrated (metric) path and wins
+    // over the legacy `--scale-mm` longest-edge rescale.
+    let mut scale_factor = 1.0_f64;
+    let mut units = "scene";
+    if let Some((measured, millimetres)) = options.scale_from_mm_ref {
+        let factor =
+            crate::reconstruction::mesh::cleanup::scale_factor_from_mm_ref(measured, millimetres)
+                .ok_or_else(|| {
+                SplatError::Process("--scale-from-mm-ref 需要两个正数：<实测长度>:<毫米>".into())
+            })?;
+        mesh.scale_positions(factor);
+        scale_factor = factor;
+        units = "m";
+    } else if let Some(millimetres) = options.scale_mm {
         if !(millimetres.is_finite() && millimetres > 0.0) {
             return Err(SplatError::Process("--scale-mm 必须是正数".into()));
         }
         let edge = mesh.longest_edge();
         if edge > 0.0 {
-            mesh.scale_positions((millimetres / 1000.0) / edge);
+            scale_factor = (millimetres / 1000.0) / edge;
+            mesh.scale_positions(scale_factor);
+            units = "m";
         }
     }
 
@@ -248,6 +360,12 @@ pub fn build_object_mesh(
         voxels_fused,
         voxel_size,
         object_bounds: (min, max),
+        components: components_after,
+        components_removed: components_before.saturating_sub(components_after),
+        vertices_before_simplify,
+        triangles_before_simplify,
+        scale_factor,
+        units,
     })
 }
 
@@ -594,5 +712,188 @@ property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float
         )
         .unwrap_err();
         assert!(error.to_string().contains("体素尺寸"), "{error}");
+    }
+
+    fn sphere_options() -> MeshOptions {
+        MeshOptions {
+            voxel_size: Some(0.06),
+            min_observations: 1,
+            depth_scale: 2,
+            ..MeshOptions::default()
+        }
+    }
+
+    #[test]
+    fn reports_components_without_changing_the_default_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let model = root.join("work/colmap/sparse/0");
+        let plain = build_object_mesh(root, &model, &sphere_options()).unwrap();
+        // A component filter that cannot drop anything must be a no-op.
+        let filtered = build_object_mesh(
+            root,
+            &model,
+            &MeshOptions {
+                min_component_ratio: Some(0.0),
+                ..sphere_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(plain.mesh, filtered.mesh);
+        assert_eq!(plain.components, filtered.components);
+        assert_eq!(plain.components_removed, 0);
+        assert_eq!(filtered.components_removed, 0);
+        assert!(plain.components >= 1);
+        assert_eq!(plain.scale_factor, 1.0);
+        assert_eq!(plain.units, "scene");
+    }
+
+    #[test]
+    fn keep_largest_only_leaves_exactly_one_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let model = root.join("work/colmap/sparse/0");
+        let build = build_object_mesh(
+            root,
+            &model,
+            &MeshOptions {
+                keep_largest_only: true,
+                ..sphere_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(build.components, 1);
+        assert!(build.mesh.triangle_count() > 100);
+        let parts = crate::reconstruction::mesh::cleanup::components(&build.mesh);
+        assert_eq!(parts.len(), 1);
+        assert!((parts[0].ratio - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_component_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 2_000);
+        let error = build_object_mesh(
+            root,
+            &root.join("work/colmap/sparse/0"),
+            &MeshOptions {
+                min_component_ratio: Some(1.5),
+                ..sphere_options()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("min-component-ratio"), "{error}");
+    }
+
+    #[test]
+    fn target_triangles_simplifies_and_reports_the_previous_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let model = root.join("work/colmap/sparse/0");
+        let plain = build_object_mesh(root, &model, &sphere_options()).unwrap();
+        let before = plain.mesh.triangle_count();
+        assert!(before > 400, "need a mesh worth simplifying: {before}");
+        let target = before / 2;
+        let build = build_object_mesh(
+            root,
+            &model,
+            &MeshOptions {
+                target_triangles: Some(target),
+                ..sphere_options()
+            },
+        )
+        .unwrap();
+        assert!(
+            build.mesh.triangle_count() <= target,
+            "{} > {target}",
+            build.mesh.triangle_count()
+        );
+        assert!(build.mesh.triangle_count() > target / 2);
+        assert_eq!(build.triangles_before_simplify, Some(before));
+        assert_eq!(
+            build.vertices_before_simplify,
+            Some(plain.mesh.positions.len())
+        );
+        assert_eq!(build.mesh.colors.len(), build.mesh.positions.len());
+        assert_eq!(build.mesh.normals.len(), build.mesh.positions.len());
+        let (min, max) = build.mesh.bounds().unwrap();
+        for axis in 0..3 {
+            assert!(min[axis] > -1.2 && max[axis] < 1.2, "bbox {min:?} {max:?}");
+        }
+    }
+
+    #[test]
+    fn simplify_ratio_is_relative_to_the_extracted_triangles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 6_000);
+        let model = root.join("work/colmap/sparse/0");
+        let plain = build_object_mesh(root, &model, &sphere_options()).unwrap();
+        let before = plain.mesh.triangle_count();
+        let build = build_object_mesh(
+            root,
+            &model,
+            &MeshOptions {
+                simplify_ratio: Some(0.5),
+                ..sphere_options()
+            },
+        )
+        .unwrap();
+        let target = (before as f64 * 0.5).round() as usize;
+        assert!(build.mesh.triangle_count() <= target);
+        assert_eq!(build.triangles_before_simplify, Some(before));
+    }
+
+    #[test]
+    fn scale_from_mm_ref_makes_the_measured_span_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let model = root.join("work/colmap/sparse/0");
+        let plain = build_object_mesh(root, &model, &sphere_options()).unwrap();
+        let measured = plain.mesh.longest_edge();
+        assert!(measured > 1.5 && measured < 2.5, "measured {measured}");
+        let build = build_object_mesh(
+            root,
+            &model,
+            &MeshOptions {
+                scale_from_mm_ref: Some((measured, 1000.0)),
+                ..sphere_options()
+            },
+        )
+        .unwrap();
+        let expected = (1000.0 / 1000.0) / measured;
+        assert!((build.scale_factor - expected).abs() < 1e-12);
+        assert_eq!(build.units, "m");
+        assert!(
+            (build.mesh.longest_edge() - 1.0).abs() < 1e-3,
+            "longest edge {}",
+            build.mesh.longest_edge()
+        );
+        let summary = MeshSummary::from_build(&build, "out.glb");
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"scale_factor\""), "{json}");
+        assert!(json.contains("\"units\":\"m\""), "{json}");
+    }
+
+    #[test]
+    fn rejects_a_non_positive_mm_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 2_000);
+        let error = build_object_mesh(
+            root,
+            &root.join("work/colmap/sparse/0"),
+            &MeshOptions {
+                scale_from_mm_ref: Some((0.0, 500.0)),
+                ..sphere_options()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("scale-from-mm-ref"), "{error}");
     }
 }
