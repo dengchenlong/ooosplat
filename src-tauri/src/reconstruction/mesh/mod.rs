@@ -23,8 +23,8 @@ pub use depth::{
 };
 pub use glb::{encode_glb, split_glb, write_glb, GlbOutput};
 pub use pipeline::{
-    build_object_mesh, object_ply_path, write_mesh_glb, MeshBuild, MeshOptions, MeshSummary,
-    OBJECT_PLY_RELATIVE,
+    build_object_mesh, object_ply_path, publish_mesh_glb, write_mesh_glb, MeshBuild, MeshOptions,
+    MeshSummary, OBJECT_PLY_RELATIVE, OBJECT_PLY_RELATIVE_V2,
 };
 pub use surface::{assign_nearest_colors, extract_surface};
 pub use tsdf::{fuse_into, DepthFrame, FuseOptions, GridSpec, TsdfGrid};

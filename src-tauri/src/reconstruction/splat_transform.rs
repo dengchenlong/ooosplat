@@ -14,7 +14,14 @@ use uuid::Uuid;
 use crate::{
     error::{Result, SplatError},
     project::{GaussianCrop, GaussianTransform},
-    reconstruction::ply::{inspect_gaussian_ply, PlyInfo},
+    reconstruction::{
+        assets::{
+            object_ply_name, publish_file as publish_export, sha256_file, source_from_final_ply,
+            upsert_asset_entries, AssetEntry, AssetFormat, AssetKind, ASSETS_DIR, BACKGROUND_INDEX,
+            BACKGROUND_PLY_NAME, FIRST_OBJECT_INDEX,
+        },
+        ply::{inspect_gaussian_ply, PlyInfo},
+    },
 };
 
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
@@ -86,42 +93,6 @@ pub fn validate_training_ply(
     ))
 }
 pub mod export_view;
-
-#[cfg(windows)]
-fn publish_export(source: &Path, destination: &Path) -> Result<()> {
-    use std::{iter, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: Both paths are owned, NUL-terminated UTF-16 buffers that remain live for the call.
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn publish_export(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::rename(source, destination)?;
-    Ok(())
-}
 
 #[derive(Debug)]
 struct PlyLayout {
@@ -649,13 +620,27 @@ pub fn export_transformed_ply_to(
 pub struct InstanceAssetInfo {
     pub object: PlyInfo,
     pub background: PlyInfo,
+    /// 1-based object index the published cloud was named after.
+    pub object_index: usize,
+    /// `<project_root>/assets/object-01.ply`.
+    pub object_path: std::path::PathBuf,
+    /// `<project_root>/assets/background.ply`.
+    pub background_path: std::path::PathBuf,
+    /// `<project_root>/assets/manifest.json`, after the upsert.
+    pub manifest_path: std::path::PathBuf,
 }
 
-/// Splits `final.ply` into `assets/object.ply` (instance bit set) and
-/// `assets/background.ply` (bit clear) using `derived/instance.mask`.
+/// Splits `final.ply` into `assets/object-01.ply` (instance bit set) and
+/// `assets/background.ply` (bit clear) using `derived/instance.mask`, then
+/// records both in `assets/manifest.json` (issue #11).
 ///
 /// Both subsets are written to temporaries inside `assets/` and published
-/// only after each passes PLY validation and its splat count is checked.
+/// only after each passes PLY validation and its splat count is checked;
+/// the manifest is upserted last, so a failed split leaves no manifest entry
+/// pointing at a file that was never published. The manifest keeps entries a
+/// different stage published (e.g. a GLB), because the upsert is keyed by
+/// `(kind, index, format)`.
+///
 /// `final.ply` is opened read-only and is never overwritten, so the source
 /// bytes stay identical whether the split succeeds, fails or is cancelled.
 pub fn export_instance_assets(
@@ -663,7 +648,9 @@ pub fn export_instance_assets(
     check_cancelled: impl Fn() -> Result<()>,
 ) -> Result<InstanceAssetInfo> {
     check_cancelled()?;
-    let mut reader = BufReader::new(File::open(project_root.join("final.ply"))?);
+    let mut reader = BufReader::new(File::open(
+        project_root.join(super::assets::FINAL_PLY_NAME),
+    )?);
     let layout = parse_layout(&mut reader)?;
     let (revision, object_count, mask) = super::edit_mask::read_mask_container(
         &project_root.join("derived").join("instance.mask"),
@@ -682,10 +669,11 @@ pub fn export_instance_assets(
     }
     let is_object = |index: u64| mask[(index / 8) as usize] & (1 << (index % 8)) != 0;
 
-    let assets = project_root.join("assets");
+    let assets = project_root.join(ASSETS_DIR);
     std::fs::create_dir_all(&assets)?;
-    let object_path = assets.join("object.ply");
-    let background_path = assets.join("background.ply");
+    let object_index = FIRST_OBJECT_INDEX;
+    let object_path = assets.join(object_ply_name(object_index));
+    let background_path = assets.join(BACKGROUND_PLY_NAME);
     let object_temp = assets.join(format!(".object-{}.ply.tmp", Uuid::new_v4()));
     let background_temp = assets.join(format!(".background-{}.ply.tmp", Uuid::new_v4()));
 
@@ -738,9 +726,44 @@ pub fn export_instance_assets(
             return Err(SplatError::Process("拆分 PLY 的 Splat 数量校验失败".into()));
         }
         check_cancelled()?;
+        // Hash before publishing: the published name must describe the bytes
+        // that are now under it, not a temporary that has already moved.
+        let source = source_from_final_ply(project_root)?;
+        let object_entry = AssetEntry::new(
+            AssetKind::Object,
+            object_index,
+            AssetFormat::Ply,
+            object_ply_name(object_index),
+            object.file_size,
+            sha256_file(&object_temp)?,
+        )
+        .with_splat_count(object.splat_count);
+        let background_entry = AssetEntry::new(
+            AssetKind::Background,
+            BACKGROUND_INDEX,
+            AssetFormat::Ply,
+            BACKGROUND_PLY_NAME,
+            background.file_size,
+            sha256_file(&background_temp)?,
+        )
+        .with_splat_count(background.splat_count);
+
         publish_export(&object_temp, &object_path)?;
         publish_export(&background_temp, &background_path)?;
-        Ok(InstanceAssetInfo { object, background })
+        upsert_asset_entries(
+            &assets,
+            source,
+            vec![background_entry, object_entry],
+            super::assets::now_ms(),
+        )?;
+        Ok(InstanceAssetInfo {
+            object,
+            background,
+            object_index,
+            object_path,
+            background_path,
+            manifest_path: super::assets::manifest_path(&assets),
+        })
     })();
     if validated.is_err() {
         cleanup();
@@ -1292,18 +1315,195 @@ mod tests {
 
         assert_eq!(info.object.splat_count, 2);
         assert_eq!(info.background.splat_count, 2);
+        assert_eq!(info.object_index, 1);
         assert_eq!(
             std::fs::read(&source).unwrap(),
             original,
             "final.ply bytes changed"
         );
         let (object_count, object_x) =
-            read_x_values(&project.path().join("assets").join("object.ply"));
+            read_x_values(&project.path().join("assets").join("object-01.ply"));
         let (background_count, background_x) =
             read_x_values(&project.path().join("assets").join("background.ply"));
         assert_eq!((object_count, background_count), (2, 2));
         assert_eq!(object_x, vec![2.0, 6.0]);
         assert_eq!(background_x, vec![0.0, 4.0]);
+
+        // The published paths are the ones the split reports, and the legacy
+        // pre-#11 name is never written any more.
+        assert_eq!(
+            info.object_path.file_name().unwrap(),
+            std::ffi::OsStr::new("object-01.ply")
+        );
+        assert!(info.object_path.is_file());
+        assert!(info.background_path.is_file());
+        assert!(info.manifest_path.is_file());
+        assert!(!project.path().join("assets").join("object.ply").exists());
+    }
+
+    #[test]
+    fn split_publishes_a_manifest_holding_source_and_both_entries() {
+        use crate::reconstruction::assets::{
+            read_manifest, sha256_file, AssetFormat, AssetKind, BACKGROUND_INDEX,
+        };
+
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let info = export_instance_assets(project.path(), || Ok(())).unwrap();
+        let assets = project.path().join("assets");
+
+        let manifest = read_manifest(&assets).unwrap().expect("manifest written");
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.generated_at_ms > 1_600_000_000_000);
+        assert_eq!(manifest.source.final_ply, "final.ply");
+        assert_eq!(manifest.source.splat_count, 4);
+        assert_eq!(
+            manifest.source.final_ply_sha256,
+            sha256_file(&project.path().join("final.ply")).unwrap()
+        );
+
+        // Sorted by (kind, index, format): background first, then object.
+        let described = manifest
+            .assets
+            .iter()
+            .map(|entry| {
+                (
+                    entry.kind,
+                    entry.index,
+                    entry.format,
+                    entry.file.clone(),
+                    entry.splat_count,
+                    entry.sha256.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described
+                .iter()
+                .map(|entry| (entry.0, entry.1, entry.2, entry.3.clone(), entry.4))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    AssetKind::Background,
+                    BACKGROUND_INDEX,
+                    AssetFormat::Ply,
+                    "background.ply".to_string(),
+                    Some(2)
+                ),
+                (
+                    AssetKind::Object,
+                    1,
+                    AssetFormat::Ply,
+                    "object-01.ply".to_string(),
+                    Some(2)
+                ),
+            ]
+        );
+        // Each hash and size describes the file that is actually on disk.
+        for (_, _, _, file, _, sha256) in &described {
+            let path = assets.join(file);
+            assert_eq!(
+                manifest_file_size(&manifest, file),
+                path.metadata().unwrap().len()
+            );
+            assert_eq!(*sha256, sha256_file(&path).unwrap());
+        }
+        assert_eq!(info.manifest_path, assets.join("manifest.json"));
+    }
+
+    #[test]
+    fn split_keeps_a_glb_entry_a_mesh_stage_already_published() {
+        use crate::reconstruction::assets::{
+            read_manifest, upsert_asset_entry, AssetEntry, AssetFormat, AssetKind,
+        };
+
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let assets = project.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let glb = AssetEntry::new(
+            AssetKind::Object,
+            1,
+            AssetFormat::Glb,
+            "object-01.glb",
+            640,
+            "a".repeat(64),
+        )
+        .with_mesh(320, 640, "scene", 1.0);
+        upsert_asset_entry(
+            &assets,
+            crate::reconstruction::assets::source_from_final_ply(project.path()).unwrap(),
+            glb.clone(),
+            1,
+        )
+        .unwrap();
+
+        export_instance_assets(project.path(), || Ok(())).unwrap();
+
+        let manifest = read_manifest(&assets).unwrap().unwrap();
+        assert_eq!(manifest.assets.len(), 3, "{:?}", manifest.assets);
+        assert_eq!(
+            manifest
+                .assets
+                .iter()
+                .find(|entry| entry.format == AssetFormat::Glb),
+            Some(&glb)
+        );
+        assert!(manifest
+            .assets
+            .iter()
+            .any(|entry| entry.kind == AssetKind::Background));
+        assert!(manifest
+            .assets
+            .iter()
+            .any(|entry| entry.kind == AssetKind::Object && entry.format == AssetFormat::Ply));
+    }
+
+    #[test]
+    fn a_second_split_run_is_byte_identical_apart_from_the_timestamp() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        let assets = project.path().join("assets");
+        let first = export_instance_assets(project.path(), || Ok(())).unwrap();
+        let first_bytes = std::fs::read(&first.manifest_path).unwrap();
+        let first_object = std::fs::read(&first.object_path).unwrap();
+
+        let second = export_instance_assets(project.path(), || Ok(())).unwrap();
+        let second_bytes = std::fs::read(&second.manifest_path).unwrap();
+
+        assert_eq!(
+            std::fs::read(&second.object_path).unwrap(),
+            first_object,
+            "re-splitting the same source must reproduce the same bytes"
+        );
+        assert_eq!(
+            strip_generated_at(&first_bytes),
+            strip_generated_at(&second_bytes)
+        );
+        // The count never grows: the same triple is updated, not appended.
+        let manifest = crate::reconstruction::assets::read_manifest(&assets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.assets.len(), 2);
+    }
+
+    /// Compares manifests ignoring only the `generatedAtMs` line.
+    fn strip_generated_at(bytes: &[u8]) -> Vec<String> {
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("\"generatedAtMs\""))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn manifest_file_size(
+        manifest: &crate::reconstruction::assets::AssetsManifest,
+        file: &str,
+    ) -> u64 {
+        manifest
+            .assets
+            .iter()
+            .find(|entry| entry.file == file)
+            .unwrap_or_else(|| panic!("no entry for {file}"))
+            .file_size
     }
 
     #[test]
@@ -1318,7 +1518,7 @@ mod tests {
         .unwrap();
 
         assert!(export_instance_assets(project.path(), || Ok(())).is_err());
-        assert!(!project.path().join("assets").join("object.ply").exists());
+        assert!(!project.path().join("assets").join("object-01.ply").exists());
     }
 
     #[test]
@@ -1343,7 +1543,11 @@ mod tests {
         assert!(export_instance_assets(no_object.path(), || Ok(())).is_err());
         let no_background = instance_fixture(&[1, 1, 1, 1]);
         assert!(export_instance_assets(no_background.path(), || Ok(())).is_err());
-        assert!(!no_object.path().join("assets").join("object.ply").exists());
+        assert!(!no_object
+            .path()
+            .join("assets")
+            .join("object-01.ply")
+            .exists());
         assert!(!no_background
             .path()
             .join("assets")
@@ -1370,5 +1574,39 @@ mod tests {
             .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(leftovers, 0, "cancelled split left files in assets/");
+    }
+
+    #[test]
+    fn failed_asset_split_leaves_no_temporary_files_and_no_manifest() {
+        let project = instance_fixture(&[0, 1, 0, 1]);
+        // A missing mask fails the split after assets/ exists but before either
+        // cloud is written: nothing may be published, and no dot-temp survives.
+        std::fs::remove_file(project.path().join("derived").join("instance.mask")).unwrap();
+        let original = std::fs::read(project.path().join("final.ply")).unwrap();
+
+        assert!(export_instance_assets(project.path(), || Ok(())).is_err());
+
+        let assets = project.path().join("assets");
+        let leftovers: Vec<String> = std::fs::read_dir(&assets)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.iter().all(|name| !name.ends_with(".tmp")),
+            "temporary files left behind: {leftovers:?}"
+        );
+        assert!(
+            leftovers.iter().all(|name| name != "manifest.json"),
+            "a failed split published a manifest: {leftovers:?}"
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("final.ply")).unwrap(),
+            original,
+            "final.ply changed on the failure path"
+        );
     }
 }

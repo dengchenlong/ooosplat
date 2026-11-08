@@ -8,9 +8,10 @@
 //! the per-frame mask PNGs in `<masks_dir>`, clusters the candidates, filters
 //! whole clusters that are too small or too far from the largest one
 //! (`ClusterFilterConfig`, issue #15) and writes
-//! `<project_root>/derived/instance.mask` plus `<project_root>/assets/object.ply`
-//! / `background.ply`. Prints vote-ratio statistics and the per-cluster
-//! decisions for acceptance evidence.
+//! `<project_root>/derived/instance.mask` plus the published assets
+//! `<project_root>/assets/object-01.ply` / `background.ply` and their
+//! `assets/manifest.json` entry (issue #11). Prints vote-ratio statistics and
+//! the per-cluster decisions for acceptance evidence.
 
 use std::path::PathBuf;
 
@@ -102,12 +103,14 @@ fn main() {
     let matched = positions.len();
     let info = export_instance_assets(&project_root, || Ok(())).expect("export assets");
     println!(
-        "      object.ply: {} splats; background.ply: {} splats; sum = {} (final = {})",
+        "      object-{:02}.ply: {} splats; background.ply: {} splats; sum = {} (final = {})",
+        info.object_index,
         info.object.splat_count,
         info.background.splat_count,
         info.object.splat_count + info.background.splat_count,
         outcome.splat_count
     );
+    println!("      manifest: {}", info.manifest_path.display());
     assert_eq!(
         info.object.splat_count + info.background.splat_count,
         outcome.splat_count,

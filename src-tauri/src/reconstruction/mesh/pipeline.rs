@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::error::{Result, SplatError};
 use crate::reconstruction::backproject::CameraProjection;
@@ -23,7 +24,13 @@ use crate::reconstruction::ply::{
 };
 
 /// Relative path of the object splat cloud inside a SplatStudio project.
+///
+/// The pre-#11 name, kept as a fallback so projects published before the
+/// `object-XX.ply` layout still load.
 pub const OBJECT_PLY_RELATIVE: &str = "assets/object.ply";
+
+/// The numbered object cloud issue #11 publishes (`assets/object-01.ply`).
+pub const OBJECT_PLY_RELATIVE_V2: &str = "assets/object-01.ply";
 
 /// Mesh extraction parameters (one-to-one with the CLI flags).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,15 +167,28 @@ impl MeshSummary {
 }
 
 /// Reads and validates the object splat cloud for `project_root`.
+///
+/// Prefers the issue #11 layout (`assets/object-*.ply`, lowest index first)
+/// and falls back to the pre-#11 `assets/object.ply`, so both generations of
+/// projects load and a project that has both keeps using the numbered one.
 pub fn object_ply_path(project_root: &Path) -> Result<std::path::PathBuf> {
-    let path = project_root.join(OBJECT_PLY_RELATIVE);
-    if !path.is_file() {
-        return Err(SplatError::Process(format!(
-            "缺少物体泼溅 {OBJECT_PLY_RELATIVE}（{}）；先运行 objmesh_backproject 拆分物体",
-            path.display()
-        )));
+    if let Some((_, path)) = crate::reconstruction::assets::object_ply_assets(
+        &project_root.join(crate::reconstruction::assets::ASSETS_DIR),
+    )
+    .into_iter()
+    .next()
+    {
+        return Ok(path);
     }
-    Ok(path)
+    let legacy = project_root.join(OBJECT_PLY_RELATIVE);
+    if legacy.is_file() {
+        return Ok(legacy);
+    }
+    let path = project_root.join(OBJECT_PLY_RELATIVE_V2);
+    Err(SplatError::Process(format!(
+        "缺少物体泼溅 {OBJECT_PLY_RELATIVE_V2} 或 {OBJECT_PLY_RELATIVE}（{}）；先运行 objmesh_backproject 拆分物体",
+        path.display()
+    )))
 }
 
 fn bounds_of(splats: &[SplatCore]) -> Result<([f64; 3], [f64; 3])> {
@@ -375,6 +395,114 @@ pub fn write_mesh_glb(path: &Path, build: &MeshBuild) -> Result<MeshSummary> {
     Ok(MeshSummary::from_build(build, path.display().to_string()))
 }
 
+/// Publishes the build as `<project_root>/assets/object-01.glb` (issue #11).
+///
+/// The GLB goes through a temporary file inside `assets/` and an atomic
+/// replace, then `assets/manifest.json` records it with the mesh's vertex and
+/// triangle counts, unit and scale factor. The returned summary carries the
+/// published path in `out`, so the CLI's stdout contract is unchanged. A mesh
+/// stage that fails leaves neither a partial GLB nor a manifest entry.
+pub fn publish_mesh_glb(project_root: &Path, build: &MeshBuild) -> Result<MeshSummary> {
+    use crate::reconstruction::assets::{
+        manifest_path, object_glb_name, publish_file, sha256_file, source_from_final_ply,
+        upsert_asset_entry, AssetEntry, AssetFormat, AssetKind, ASSETS_DIR, FIRST_OBJECT_INDEX,
+    };
+
+    let assets = project_root.join(ASSETS_DIR);
+    std::fs::create_dir_all(&assets)?;
+    let index = FIRST_OBJECT_INDEX;
+    let destination = assets.join(object_glb_name(index));
+    let temporary = assets.join(format!(".{}.tmp", Uuid::new_v4()));
+
+    let output = (|| -> Result<_> {
+        let output = crate::reconstruction::mesh::glb::encode_glb(&build.mesh)?;
+        std::fs::write(&temporary, &output.bytes)?;
+        Ok(output)
+    })();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    // Resolve the manifest `source` before publishing anything: a project
+    // without a readable final.ply must fail with nothing published, not with
+    // a GLB on disk that no manifest entry describes.
+    let source = match source_from_final_ply(project_root) {
+        Ok(source) => source,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    // Validation of a produced artifact is not the process exit code: re-parse
+    // the container we are about to publish before publishing it.
+    let publish = (|| -> Result<()> {
+        let bytes = std::fs::read(&temporary)?;
+        let (json, bin) = crate::reconstruction::mesh::glb::split_glb(&bytes)?;
+        let accessors = json["accessors"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let counted = |position: usize| {
+            accessors
+                .get(position)
+                .and_then(|accessor| accessor["count"].as_u64())
+                .unwrap_or(0)
+        };
+        let declared = json["buffers"]
+            .get(0)
+            .and_then(|buffer| buffer["byteLength"].as_u64());
+        // POSITION count, index count (3 per triangle) and the BIN chunk must
+        // all agree with what the writer reported, otherwise the file that
+        // would be published is not the mesh this run measured.
+        if counted(0) != output.vertex_count as u64
+            || counted(3) != (output.triangle_count as u64) * 3
+            || declared != Some(bin.len() as u64)
+        {
+            return Err(SplatError::Process(
+                "GLB 重新解析后的顶点/三角形/缓冲长度与写出结果不一致".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    if let Err(error) = publish_file(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let entry = AssetEntry::new(
+        AssetKind::Object,
+        index,
+        AssetFormat::Glb,
+        object_glb_name(index),
+        destination.metadata()?.len(),
+        sha256_file(&destination)?,
+    )
+    .with_mesh(
+        output.vertex_count as u64,
+        output.triangle_count as u64,
+        build.units,
+        build.scale_factor,
+    );
+    upsert_asset_entry(
+        &assets,
+        source,
+        entry,
+        crate::reconstruction::assets::now_ms(),
+    )?;
+    debug_assert_eq!(manifest_path(&assets), assets.join("manifest.json"));
+    Ok(MeshSummary::from_build(
+        build,
+        destination.display().to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,8 +690,13 @@ property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float
     }
 
     /// Writes a synthetic project: unit sphere of splats + orbiting cameras.
+    ///
+    /// `final.ply` is written too (same splats), because issue #11 publishes the
+    /// mesh into a manifest whose `source` block hashes and counts it.
     fn sphere_project(root: &Path, splat_count: usize) {
-        write_object_ply(&root.join(OBJECT_PLY_RELATIVE), &sphere_splats(splat_count));
+        let splats = sphere_splats(splat_count);
+        write_object_ply(&root.join(OBJECT_PLY_RELATIVE_V2), &splats);
+        write_object_ply(&root.join("final.ply"), &splats);
         write_model(&root.join("work/colmap/sparse/0"));
     }
 
@@ -895,5 +1028,285 @@ property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float
         )
         .unwrap_err();
         assert!(error.to_string().contains("scale-from-mm-ref"), "{error}");
+    }
+
+    /// A project whose only object cloud is the pre-#11 name still loads.
+    #[test]
+    fn object_ply_path_falls_back_to_the_pre_11_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let legacy = root.join(OBJECT_PLY_RELATIVE);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        write_object_ply(&legacy, &sphere_splats(64));
+        assert_eq!(object_ply_path(root).unwrap(), legacy);
+
+        // Adding a numbered cloud switches to it, without touching the old file.
+        let numbered = root.join(OBJECT_PLY_RELATIVE_V2);
+        write_object_ply(&numbered, &sphere_splats(64));
+        assert_eq!(object_ply_path(root).unwrap(), numbered);
+    }
+
+    #[test]
+    fn object_ply_path_prefers_the_lowest_numbered_cloud() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in [3_usize, 1, 2] {
+            write_object_ply(
+                &root.join(format!("assets/object-{index:02}.ply")),
+                &sphere_splats(16),
+            );
+        }
+        assert_eq!(
+            object_ply_path(root).unwrap(),
+            root.join("assets/object-01.ply")
+        );
+    }
+
+    #[test]
+    fn object_ply_path_error_names_both_accepted_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = object_ply_path(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("assets/object-01.ply"), "{error}");
+        assert!(error.contains("assets/object.ply"), "{error}");
+    }
+
+    #[test]
+    fn publish_mesh_glb_writes_object_01_glb_and_its_manifest_entry() {
+        use crate::reconstruction::assets::{read_manifest, sha256_file, AssetFormat, AssetKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let build =
+            build_object_mesh(root, &root.join("work/colmap/sparse/0"), &sphere_options()).unwrap();
+
+        let summary = publish_mesh_glb(root, &build).unwrap();
+
+        let glb = root.join("assets").join("object-01.glb");
+        assert!(glb.is_file());
+        assert_eq!(summary.out, glb.display().to_string());
+        assert_eq!(summary.vertices, build.mesh.positions.len());
+        assert_eq!(summary.triangles, build.mesh.triangle_count());
+
+        // The published container re-parses as the mesh that was measured.
+        let (json, _) =
+            crate::reconstruction::mesh::glb::split_glb(&std::fs::read(&glb).unwrap()).unwrap();
+        assert_eq!(
+            json["accessors"][0]["count"].as_u64(),
+            Some(build.mesh.positions.len() as u64)
+        );
+        assert_eq!(
+            json["accessors"][3]["count"].as_u64(),
+            Some((build.mesh.triangle_count() * 3) as u64)
+        );
+
+        let manifest = read_manifest(&root.join("assets")).unwrap().unwrap();
+        let entry = manifest
+            .assets
+            .iter()
+            .find(|entry| entry.format == AssetFormat::Glb)
+            .expect("glb entry");
+        assert_eq!(entry.kind, AssetKind::Object);
+        assert_eq!(entry.index, 1);
+        assert_eq!(entry.file, "object-01.glb");
+        assert_eq!(entry.file_size, glb.metadata().unwrap().len());
+        assert_eq!(entry.sha256, sha256_file(&glb).unwrap());
+        assert_eq!(entry.vertex_count, Some(build.mesh.positions.len() as u64));
+        assert_eq!(
+            entry.triangle_count,
+            Some(build.mesh.triangle_count() as u64)
+        );
+        assert_eq!(entry.units.as_deref(), Some(build.units));
+        assert_eq!(entry.scale_factor, Some(build.scale_factor));
+        assert_eq!(manifest.source.splat_count, 8_000);
+
+        // No dot-temp survives a successful publish.
+        let leftovers: Vec<String> = std::fs::read_dir(root.join("assets"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn publish_mesh_glb_adds_to_a_manifest_the_split_already_wrote() {
+        use crate::reconstruction::assets::{
+            read_manifest, upsert_asset_entry, AssetEntry, AssetFormat, AssetKind, BACKGROUND_INDEX,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 4_000);
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let background = AssetEntry::new(
+            AssetKind::Background,
+            BACKGROUND_INDEX,
+            AssetFormat::Ply,
+            "background.ply",
+            128,
+            "a".repeat(64),
+        )
+        .with_splat_count(2_000);
+        upsert_asset_entry(
+            &assets,
+            crate::reconstruction::assets::source_from_final_ply(root).unwrap(),
+            background.clone(),
+            1,
+        )
+        .unwrap();
+
+        let build =
+            build_object_mesh(root, &root.join("work/colmap/sparse/0"), &sphere_options()).unwrap();
+        publish_mesh_glb(root, &build).unwrap();
+
+        let manifest = read_manifest(&assets).unwrap().unwrap();
+        assert_eq!(manifest.assets.len(), 2);
+        assert_eq!(manifest.assets[0], background);
+        assert_eq!(manifest.assets[1].format, AssetFormat::Glb);
+    }
+
+    /// The cross-stage acceptance for issue #11: the split publishes the two
+    /// PLY assets, the mesh stage publishes the GLB, and all three land in one
+    /// `assets/manifest.json` in the documented order.
+    #[test]
+    fn split_and_mesh_publish_into_one_manifest() {
+        use crate::reconstruction::assets::{read_manifest, AssetFormat, AssetKind};
+        use crate::reconstruction::splat_transform::export_instance_assets;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        let splat_count = 8_000_u64;
+        crate::reconstruction::backproject::write_instance_mask(
+            &root.join("derived").join("instance.mask"),
+            splat_count,
+            &(0..splat_count)
+                .map(|index| (index % 2) as i32)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let split = export_instance_assets(root, || Ok(())).unwrap();
+        assert_eq!(split.object_path, root.join("assets/object-01.ply"));
+        assert_eq!(split.background_path, root.join("assets/background.ply"));
+
+        let build =
+            build_object_mesh(root, &root.join("work/colmap/sparse/0"), &sphere_options()).unwrap();
+        let summary = publish_mesh_glb(root, &build).unwrap();
+        assert_eq!(
+            summary.out,
+            root.join("assets")
+                .join("object-01.glb")
+                .display()
+                .to_string()
+        );
+
+        let manifest = read_manifest(&root.join("assets")).unwrap().unwrap();
+        assert_eq!(
+            manifest
+                .assets
+                .iter()
+                .map(|entry| (
+                    entry.kind.as_str(),
+                    entry.index,
+                    entry.format.as_str(),
+                    entry.file.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("background", 0, "ply", "background.ply"),
+                ("object", 1, "glb", "object-01.glb"),
+                ("object", 1, "ply", "object-01.ply"),
+            ]
+        );
+        assert_eq!(manifest.source.splat_count, splat_count);
+        for entry in &manifest.assets {
+            let path = root.join("assets").join(&entry.file);
+            assert_eq!(
+                entry.file_size,
+                path.metadata().unwrap().len(),
+                "{}",
+                entry.file
+            );
+            assert_eq!(
+                entry.sha256,
+                crate::reconstruction::assets::sha256_file(&path).unwrap(),
+                "{}",
+                entry.file
+            );
+        }
+        assert_eq!(
+            manifest
+                .assets
+                .iter()
+                .find(|entry| entry.format == AssetFormat::Glb)
+                .and_then(|entry| entry.triangle_count),
+            Some(build.mesh.triangle_count() as u64)
+        );
+        assert!(
+            manifest
+                .assets
+                .iter()
+                .filter(|entry| entry.kind == AssetKind::Object)
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
+    fn publish_mesh_glb_refuses_a_project_without_final_ply_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 8_000);
+        std::fs::remove_file(root.join("final.ply")).unwrap();
+        let build =
+            build_object_mesh(root, &root.join("work/colmap/sparse/0"), &sphere_options()).unwrap();
+
+        // The manifest source cannot be resolved, so nothing may be published:
+        // no orphan GLB, no manifest entry, no dot-temp.
+        assert!(publish_mesh_glb(root, &build).is_err());
+        assert!(!root.join("assets/object-01.glb").exists());
+        assert!(!root.join("assets/manifest.json").exists());
+        let leftovers: Vec<String> = std::fs::read_dir(root.join("assets"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn publish_mesh_glb_refuses_an_empty_mesh_without_leaving_a_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sphere_project(root, 64);
+        let build = MeshBuild {
+            mesh: Mesh::default(),
+            splats: 0,
+            frames: 0,
+            voxels_fused: 0,
+            voxel_size: 0.1,
+            object_bounds: ([0.0; 3], [0.0; 3]),
+            components: 0,
+            components_removed: 0,
+            vertices_before_simplify: None,
+            triangles_before_simplify: None,
+            scale_factor: 1.0,
+            units: "scene",
+        };
+
+        assert!(publish_mesh_glb(root, &build).is_err());
+        assert!(!root.join("assets/object-01.glb").exists());
+        let leftovers: Vec<String> = std::fs::read_dir(root.join("assets"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }

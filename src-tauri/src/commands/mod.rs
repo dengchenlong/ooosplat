@@ -3170,7 +3170,7 @@ end_header
         let root = tempdir().expect("temporary project");
         write_minimal_gaussian_ply(&root.path().join("final.ply"), 2);
         fs::create_dir(root.path().join("assets")).unwrap();
-        write_minimal_gaussian_ply(&root.path().join("assets").join("object.ply"), 1);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object-01.ply"), 1);
         write_minimal_gaussian_ply(&root.path().join("assets").join("background.ply"), 1);
 
         let assets = collect_project_assets(root.path()).expect("asset list");
@@ -3185,6 +3185,75 @@ end_header
         assert_eq!(assets[1].splat_count, 1);
         assert_eq!(assets[2].splat_count, 1);
         assert!(assets[0].file_size > 0);
+        assert_eq!(
+            assets[1].path.file_name().unwrap(),
+            std::ffi::OsStr::new("object-01.ply")
+        );
+    }
+
+    #[test]
+    fn asset_list_still_recognises_the_pre_11_object_name() {
+        let root = tempdir().expect("temporary project");
+        write_minimal_gaussian_ply(&root.path().join("final.ply"), 2);
+        fs::create_dir(root.path().join("assets")).unwrap();
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object.ply"), 1);
+
+        let assets = collect_project_assets(root.path()).expect("asset list");
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["final", "object"]
+        );
+        assert_eq!(
+            assets[1].path.file_name().unwrap(),
+            std::ffi::OsStr::new("object.ply")
+        );
+    }
+
+    #[test]
+    fn asset_list_prefers_numbered_objects_and_never_lists_one_twice() {
+        let root = tempdir().expect("temporary project");
+        write_minimal_gaussian_ply(&root.path().join("final.ply"), 5);
+        fs::create_dir(root.path().join("assets")).unwrap();
+        // Both generations on disk, plus a higher index: the list is the legacy
+        // kind once, taken from the numbered file (never a duplicate "object").
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object.ply"), 1);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object-01.ply"), 2);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object-02.ply"), 3);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("background.ply"), 1);
+
+        let assets = collect_project_assets(root.path()).expect("asset list");
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["final", "object", "background"]
+        );
+        assert_eq!(
+            assets[1].splat_count, 2,
+            "object-01.ply must win over object.ply"
+        );
+        assert!(
+            assets.iter().filter(|asset| asset.kind == "object").count() == 1,
+            "the object asset must only be listed once"
+        );
+    }
+
+    #[test]
+    fn asset_list_ignores_a_malformed_numbered_object_name() {
+        let root = tempdir().expect("temporary project");
+        write_minimal_gaussian_ply(&root.path().join("final.ply"), 2);
+        fs::create_dir(root.path().join("assets")).unwrap();
+        // Not the canonical zero-padded spelling, so it is not a numbered asset.
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object-1.ply"), 1);
+        write_minimal_gaussian_ply(&root.path().join("assets").join("object.ply"), 3);
+
+        let assets = collect_project_assets(root.path()).expect("asset list");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[1].splat_count, 3);
     }
 
     #[test]
@@ -3376,13 +3445,30 @@ pub struct ProjectAssetDescriptor {
 }
 
 /// Candidates for the split-asset list, in display order.
+///
+/// The `kind` stays `"final"` / `"object"` / `"background"` because the
+/// frontend's `assetVisibilityStore` and `AssetVisibilityPanel` key visibility
+/// and labels on those strings; the numbered `object-XX.ply` files only change
+/// *which* file the `"object"` kind points at. GLB meshes are deliberately
+/// absent: the gsplat viewer cannot load them.
+///
+/// Numbered object clouds are enumerated in ascending index order and the
+/// lowest one is the project's object asset; the pre-#11 `assets/object.ply`
+/// is the fallback when no numbered file exists, so both layouts list exactly
+/// one `"object"` row and never the same asset twice.
 fn project_asset_candidates(project_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    let assets = project_root.join("assets");
+    let numbered = crate::reconstruction::assets::object_ply_assets(&assets);
+    let object = numbered
+        .first()
+        .map(|(_, path)| path.clone())
+        .unwrap_or_else(|| assets.join(crate::reconstruction::assets::LEGACY_OBJECT_PLY_NAME));
     vec![
         ("final", project_root.join("final.ply")),
-        ("object", project_root.join("assets").join("object.ply")),
+        ("object", object),
         (
             "background",
-            project_root.join("assets").join("background.ply"),
+            assets.join(crate::reconstruction::assets::BACKGROUND_PLY_NAME),
         ),
     ]
 }

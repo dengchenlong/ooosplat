@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod backproject;
 pub mod colmap_model;
 pub mod edit_mask;
