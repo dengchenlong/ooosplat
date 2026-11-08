@@ -1,13 +1,15 @@
 # M1 物体 mesh 提取（issue #10）
 
-`objmesh_mesh` 把 `<project>/assets/object.ply` 的物体泼溅 + COLMAP 相机
-→ 逐帧深度图 → TSDF 融合 → 零交叉提取 → 顶点色 `.glb`。纯 Rust，无新增依赖。
+`objmesh_mesh` 把项目里的物体泼溅（`assets/object-XX.ply`，旧工程回落到
+`assets/object.ply`）+ COLMAP 相机 → 逐帧深度图 → TSDF 融合 → 零交叉提取
+→ 顶点色 `.glb`。纯 Rust，无新增依赖。`--publish`（issue #11）把 GLB 直接
+发布进 `assets/` 并登记 `assets/manifest.json`。
 
 ## 用法
 
 ```bash
 cargo build --release --bin objmesh_mesh
-src-tauri/target/release/objmesh_mesh <project_root> <colmap_model_dir> --out <file.glb> \
+src-tauri/target/release/objmesh_mesh <project_root> <colmap_model_dir> (--out <file.glb> | --publish) \
     [--voxel-size S | --resolution N] [--truncation-voxels V] [--min-observations K] \
     [--depth-scale D] [--max-frames N] [--scale-mm F] [--color-cell-size C] \
     [--min-component-ratio R] [--keep-largest-only] \
@@ -16,6 +18,8 @@ src-tauri/target/release/objmesh_mesh <project_root> <colmap_model_dir> --out <f
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
+| `--out FILE.glb` | — | 写到你指定的路径；与 `--publish` 互斥 |
+| `--publish` | — | 原子写 `<project_root>/assets/object-01.glb` 并把 glb entry（含 `triangleCount`/`vertexCount`/`fileSize`/`sha256`/`units`/`scaleFactor`）登记进 `assets/manifest.json` |
 | `--voxel-size S` | — | TSDF 体素边长（场景单位）。省略时按「物体 AABB 最长边 / `--resolution`」推导 |
 | `--resolution N` | 256 | 未给 `--voxel-size` 时，最长边上的体素数 |
 | `--truncation-voxels V` | 4 | 融合带宽（体素），实际截断距离 = `V * voxel_size` |
@@ -27,10 +31,15 @@ src-tauri/target/release/objmesh_mesh <project_root> <colmap_model_dir> --out <f
 | `--min-component-ratio R` | 不带 | 丢弃三角形占比小于 R（0..1）的连通分量；不传＝保留全部分量，输出与 #10 逐字节一致 |
 | `--keep-largest-only` | 关 | 只保留最大连通分量（优先于 `--min-component-ratio`） |
 | `--target-triangles N` | 不带 | 简化到最多 N 个三角形 |
-| `--simplify-ratio R` | 不带 | 简化到提取结果的 R 倍（0..1]。与 `--target-triangles` 同时给时后者生效） |
+| `--simplify-ratio R` | 不带 | 简化到提取结果的 R 倍（0..1]。与 `--target-triangles` 同时给时后者生效 |
 | `--scale-from-mm-ref A:B` | 不带 | 尺度标定：mesh 上量得 A（场景单位）实际为 B 毫米，整体缩放到该长度＝B 毫米 |
 
-stdout 最后一行是 JSON 摘要，便于编排方校验：
+`--publish` 路径遵守仓库的两条硬规则：产物先落临时文件再原子替换（中途失败
+不留半截 GLB），发布前把 GLB 重新解析一遍核对顶点/三角形/缓冲长度（
+「校验不是退出码」）；`final.ply` 只读，发布的 GLB 全程不碰它。
+
+stdout 最后一行是 JSON 摘要，便于编排方校验（`out` 始终是实际落盘路径，
+`--publish` 时即 `<project_root>/assets/object-01.glb`）：
 
 ```json
 {"splats":6927,"frames":276,"voxels_fused":128662,"vertices":104231,
@@ -46,6 +55,53 @@ stdout 最后一行是 JSON 摘要，便于编排方校验：
 的分量数，`vertices_before_simplify` / `triangles_before_simplify` 只在简化
 跑过时非 `null`，`scale_factor` 是实际施加的等比缩放（不缩放为 `1.0`），
 `units` 为 `scene`（COLMAP 原尺度）或 `m`（已标定）。
+
+## assets/ 发布结构与 manifest（issue #11）
+
+`objmesh_backproject`（拆分）与 `objmesh_mesh --publish`（mesh）共同把项目产物
+收敛到 `<project_root>/assets/`：
+
+```
+assets/
+  object-01.ply    拆分出的物体泼溅（旧工程是 object.ply，读取时仍认）
+  background.ply   拆分出的背景泼溅（index 0，一个工程只有一份）
+  object-01.glb    M1 网格
+  manifest.json    上述产物的发布索引
+```
+
+`manifest.json`：
+
+```json
+{
+  "version": 1,
+  "generatedAtMs": 1794152880065,
+  "source": {
+    "finalPly": "final.ply",
+    "finalPlySha256": "0e2dbeb8…",
+    "splatCount": 40000
+  },
+  "assets": [
+    { "kind": "background", "index": 0, "format": "ply", "file": "background.ply",
+      "fileSize": 1958401, "sha256": "f04173d8…", "splatCount": 34965 },
+    { "kind": "object", "index": 1, "format": "glb", "file": "object-01.glb",
+      "fileSize": 1131508, "sha256": "b4cf0bd4…",
+      "vertexCount": 19876, "triangleCount": 34564, "units": "scene", "scaleFactor": 1.0 },
+    { "kind": "object", "index": 1, "format": "ply", "file": "object-01.ply",
+      "fileSize": 282320, "sha256": "f57b1c54…", "splatCount": 5035 }
+  ]
+}
+```
+
+约定：
+
+- `file` 是 `assets/` 内的文件名，不是绝对路径，工程目录整体搬走仍可用。
+- 每个 entry 由 `(kind, index, format)` 唯一确定；两个阶段各自 upsert 自己的
+  entry，互不覆盖（拆分不碰 glb entry，mesh 不碰 ply entry）。
+- `assets[]` 按 `(kind, index, format)` 稳定排序，所以同一份输入两次运行的
+  manifest 除 `generatedAtMs` 外逐字节相同。
+- 写盘一律「临时文件 + 原子替换」；`final.ply` 只读，`source` 里的哈希与
+  splat 数就是这次运行读到的源文件指纹。
+- 校验不是退出码：拆分的两个 PLY 与发布的 GLB 都要重新解析后再原子替换。
 
 ## 流水线
 

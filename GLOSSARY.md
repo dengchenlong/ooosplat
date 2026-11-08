@@ -33,10 +33,18 @@ gains a second meaning, split or disambiguate it here (see `docs/agents/domain.m
   all splits/edits derive from it (same philosophy as `edit.ply`).
 - **OOSMASK**: Instance bitmap over the splat's points marking object vs
   background; produced by B3 back-projection voting (issue #4).
-- **object.ply / background.ply**: Derived point-cloud splits of `final.ply`
-  by OOSMASK. Regenerable at any time.
-- **object.glb**: Vertex-colored mesh of the dynamic object (stage 1, issue
-  #10): per-frame depth → TSDF → marching cubes.
+- **object-XX.ply / background.ply**: Derived point-cloud splits of `final.ply`
+  by OOSMASK, published under `assets/` (object index starts at 01; a project
+  has at most one background). `assets/object.ply` is the pre-#11 name and is
+  still recognised on read. Regenerable at any time.
+- **object-XX.glb**: Vertex-colored mesh of the dynamic object (stage 1, issue
+  #10): per-frame depth → TSDF → marching cubes. Written to
+  `assets/object-01.glb` by `objmesh_mesh --publish`.
+- **assets/manifest.json**: Publication index of `assets/` (issue #11);
+  `version`, `generatedAtMs`, `source` (final.ply relative path, SHA-256,
+  splat count) and `assets[]` entries keyed by `(kind, index, format)` with
+  file name, size and SHA-256. Entries are sorted, so a re-run over the same
+  inputs differs only in `generatedAtMs`.
 - **masked dataset**: Brush training dataset built from frames + per-frame
   masks; object and background datasets come in pairs (`--invert-masks`).
 
