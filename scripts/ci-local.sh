@@ -48,6 +48,29 @@ if [[ -d "/d/deps/cargo/bin" ]]; then
   case ":$PATH:" in *":/d/deps/cargo/bin:"*) ;; *) PATH="/d/deps/cargo/bin:$PATH" ;; esac
 fi
 
+# ── why the rust gates are serialised and split ────────────────────────────
+# `cargo test` (all targets, default -j) is not reproducible on this host:
+# src-tauri has a 1.17 GB libooo_splat.rlib and links every one of the five
+# bins on top of it, so building everything at once makes rustc emit truncated
+# rmeta/rlib files under memory pressure. The failure is silent and random —
+# each run blames a different crate:
+#
+#   error[E0463]: can't find crate for `ooo_splat`
+#   error[E0786]: found invalid metadata files for crate `ooo_splat`
+#   error[E0462]: found staticlib `webview2_com_macros` instead of rlib or dylib
+#   error: crate `regex_syntax` required to be available in rlib format
+#
+# `cargo test --lib` alone is always green, and `cargo test --no-run` at -j1 is
+# green on both G: and a brand-new D: target dir — the concurrency is the only
+# variable. Corrupting-or-not is a coin flip, so the gate must not depend on it.
+#
+# Therefore: skip building x86_64-pc-windows-msvc's cdylib/staticlib retread
+# (--lib,plus bins, serially) and shrink debuginfo. Cargo's automatic `-j`
+# based on core count is wrong here because it budgets on cores, not on the
+# 16 GB of RAM this host has.
+# 16 GB total / 8 cores is the real constraint: four concurrent rustc processes
+# holding 1+ GB rlibs is already past comfortable.
+
 PASSED=(); FAILED=(); SKIPPED=()
 
 # gate <label> <command...>: run one gate, record the verdict, never abort.
@@ -101,8 +124,17 @@ fi
 
 # ── rust ──────────────────────────────────────────────────────────────────
 if want rust; then
+  # thread budget: see the comment above. Override with CI_LOCAL_JOBS when the
+  # host has more RAM than this one.
+  JOBS="${CI_LOCAL_JOBS:-2}"
   gate "cargo fmt --check"  cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-  gate "cargo test"         cargo test --manifest-path src-tauri/Cargo.toml
+  # CI runs a bare `cargo test`; locally we split it so a green verdict means
+  # something. `--lib` is the 681-test suite; `--bins` covers the CLI entry
+  # points that would otherwise never be compiled by a `--lib`-only gate.
+  gate "cargo test --lib (ser. -j$JOBS)" \
+       cargo test --manifest-path src-tauri/Cargo.toml --lib -j "$JOBS"
+  gate "cargo test --bins (ser. -j$JOBS)" \
+       cargo test --manifest-path src-tauri/Cargo.toml --bins -j "$JOBS"
   gate "cargo clippy"       cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 fi
 
