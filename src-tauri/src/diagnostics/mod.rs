@@ -1,5 +1,6 @@
 //! Explicit, one-shot diagnostic consent. Never uses the anonymous telemetry service.
 mod hardware;
+pub(crate) mod logs;
 pub(crate) mod redact;
 
 use crate::{
@@ -10,14 +11,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use hardware::Environment;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    future::Future,
-    io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, path::PathBuf, sync::Mutex, time::Duration};
 use tauri::State;
 use uuid::Uuid;
 
@@ -125,30 +119,6 @@ fn reason(kind: Option<&str>) -> &'static str {
     }
 }
 
-fn read_tail(path: &Path) -> std::io::Result<(String, bool)> {
-    let mut file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    let offset = size.saturating_sub(LOG_BYTES as u64);
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = Vec::new();
-    file.take(LOG_BYTES as u64).read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if offset > 0 {
-        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
-    } else {
-        &text
-    };
-    let lines = text.lines().collect::<Vec<_>>();
-    let truncated = offset > 0 || lines.len() > 200;
-    Ok((
-        redact::bounded(
-            &lines[lines.len().saturating_sub(200)..].join("\n"),
-            LOG_BYTES,
-        ),
-        truncated,
-    ))
-}
-
 impl DiagnosticService {
     pub async fn capture(
         &self,
@@ -163,6 +133,56 @@ impl DiagnosticService {
             .await
     }
 
+    /// Preparation can fail before project metadata or even its log directory
+    /// is readable. Its frozen, per-operation buffer is the authority here;
+    /// never reopen a catalog entry or follow a redirected on-disk log.
+    pub(crate) async fn capture_preparation(
+        &self,
+        message: &str,
+        context: &crate::pipeline::retry_preparation::PreparationDiagnosticContext,
+        paths: &[PathBuf],
+    ) -> Uuid {
+        let mut private_paths = paths.to_vec();
+        private_paths.extend(context.project_root.iter().cloned());
+        let private = redact::private_values(&private_paths);
+        let marker = format!("preparation_id={}", context.preparation_id);
+        let mut log = context
+            .operation_log
+            .lines()
+            .filter(|line| line.contains(&marker))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let details = context.safe_details().to_string();
+        if log.is_empty() {
+            log = format!("{marker} {details}");
+        }
+        // Keep the exact operation/OS context even if a long underlying error
+        // would otherwise consume the existing diagnostic detail budget.
+        let detail = format!("{details}\n{}", context.redacted_message(message, &private));
+        self.capture_with_log(
+            None,
+            Some(PipelineEngine::System),
+            context.classification_kind,
+            &detail,
+            &log,
+            log.len() > LOG_BYTES,
+            private,
+            &[],
+            None,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_report_for_test(&self, id: Uuid) -> Option<DiagnosticReport> {
+        self.reports
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .failures
+            .get(&id)
+            .map(|snapshot| snapshot.report.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn capture_with_executions(
         &self,
@@ -175,61 +195,78 @@ impl DiagnosticService {
         executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
         current: Option<usize>,
     ) -> Uuid {
+        self.capture_with_execution_log(
+            stage, engine, kind, message, project_id, paths, executions, current, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn capture_with_execution_log(
+        &self,
+        stage: Option<PipelineStage>,
+        engine: Option<PipelineEngine>,
+        kind: Option<&str>,
+        message: &str,
+        project_id: Option<Uuid>,
+        paths: &[PathBuf],
+        executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
+        current: Option<usize>,
+        log: Option<logs::FrozenLog>,
+    ) -> Uuid {
         let mut private_paths = paths.to_vec();
         let mut private_names = Vec::new();
-        let mut log = String::new();
-        let mut logs_truncated = false;
         if let Some(project_id) = project_id {
             if let Ok((root, metadata)) = catalog::load_registered_project(project_id).await {
                 private_names.push(metadata.name);
                 private_paths.extend([root.clone(), metadata.source_path]);
-                let names: &[&str] = match engine {
-                    Some(PipelineEngine::Brush) => &["brush.log", "brush-retry.log"],
-                    Some(PipelineEngine::Colmap) => &[
-                        "colmap.log",
-                        "colmap-bridge-features.log",
-                        "colmap-bridge-matching.log",
-                        "colmap-bridge-mapper.log",
-                    ],
-                    Some(PipelineEngine::Ffmpeg) => {
-                        &["ffmpeg.log", "ffprobe.log", "ffmpeg-bridge.log"]
-                    }
-                    _ => &[],
-                };
-                let names = names.iter().map(|v| v.to_string()).collect::<Vec<_>>();
-                if let Ok(Some((tail, truncated))) = tokio::task::spawn_blocking(move || {
-                    let root = std::fs::canonicalize(root).ok()?;
-                    let directory = std::fs::canonicalize(root.join("logs")).ok()?;
-                    if !directory.starts_with(&root) {
-                        return None;
-                    }
-                    let mut candidates = names
-                        .into_iter()
-                        .filter_map(|name| {
-                            let path = std::fs::canonicalize(directory.join(name)).ok()?;
-                            if !path.starts_with(&directory) {
-                                return None;
-                            }
-                            Some((std::fs::metadata(&path).ok()?.modified().ok()?, path))
-                        })
-                        .collect::<Vec<_>>();
-                    candidates.sort_by_key(|(modified, _)| *modified);
-                    read_tail(&candidates.last()?.1).ok()
-                })
-                .await
-                {
-                    log = tail;
-                    logs_truncated = truncated;
-                }
             }
         }
+        // Missing provenance is not permission to search an old run's files.
+        // Preparation failures use their separate bounded in-memory capture.
+        let (log, logs_truncated) = log.map(|log| (log.text, log.truncated)).unwrap_or_default();
         let mut private = redact::private_values(&private_paths);
         private.extend(private_names.into_iter().filter(|v| !v.is_empty()));
+        self.capture_with_log(
+            stage,
+            engine,
+            kind,
+            message,
+            &log,
+            logs_truncated,
+            private,
+            executions,
+            current,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_with_log(
+        &self,
+        stage: Option<PipelineStage>,
+        engine: Option<PipelineEngine>,
+        kind: Option<&str>,
+        message: &str,
+        log: &str,
+        logs_truncated: bool,
+        private: Vec<String>,
+        executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
+        current: Option<usize>,
+        preparation_text_is_safe: bool,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let actual_device = current
             .and_then(|i| executions.get(i))
             .and_then(|e| e.device.clone());
-        let mut detail = redact::sanitize(message, &private);
+        // Preparation has separately redacted its raw error and appended only
+        // typed, path-free context. Applying basename redaction again could
+        // corrupt labels when a project happens to be named "state"/"brush".
+        let mut detail = if preparation_text_is_safe {
+            message.to_owned()
+        } else {
+            redact::sanitize(message, &private)
+        };
         // The structured error starts with the final failure's root cause.
         // Keep its beginning, reserving separate space for the most recent attempts.
         let mut detail_budget = if executions.is_empty() {
@@ -274,7 +311,11 @@ impl DiagnosticService {
             error_code: kind.unwrap_or("pipeline_failed").into(),
             reason: reason(kind).into(),
             detail: redact::bounded(&detail, 16 * 1024),
-            log_tail: redact::bounded(&redact::sanitize(&log, &private), LOG_BYTES),
+            log_tail: if preparation_text_is_safe {
+                redact::bounded(log, LOG_BYTES)
+            } else {
+                redact::bounded(&redact::sanitize(log, &private), LOG_BYTES)
+            },
             logs_truncated,
             environment: blank_environment(),
         };
@@ -499,6 +540,289 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn frozen_operation_log_is_redacted_once_and_preview_never_reloads_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gps.log");
+        std::fs::write(&path, "current GPS attempt\nprivate-photo.png failed\n").unwrap();
+        let registered = crate::tasks::logs::register(root.path(), &path, 0).unwrap();
+        let (text, truncated) = crate::tasks::logs::diagnostic_tail(
+            &registered,
+            std::fs::metadata(&path).unwrap().len(),
+            LOG_BYTES,
+            200,
+        )
+        .unwrap();
+        let service = DiagnosticService::default();
+        let id = service
+            .capture_with_execution_log(
+                Some(PipelineStage::Reconstructing),
+                Some(PipelineEngine::Colmap),
+                Some("colmap_crash"),
+                "current attempt failed",
+                None,
+                &[],
+                &[],
+                None,
+                Some(logs::FrozenLog { text, truncated }),
+            )
+            .await;
+        std::fs::write(&path, "later unrelated output\n").unwrap();
+        let draft = service
+            .prepare_with(id, || async { blank_environment() })
+            .await
+            .unwrap();
+        assert!(draft.report.log_tail.contains("current GPS attempt"));
+        assert!(!draft.report.log_tail.contains("private-photo"));
+        assert!(!draft.report.log_tail.contains("unrelated"));
+        let preview = draft.report.clone();
+        service
+            .send_with(draft.draft_id, |sent| async move {
+                assert_eq!(
+                    serde_json::to_value(sent).unwrap(),
+                    serde_json::to_value(preview).unwrap()
+                );
+                Err(error("report_unavailable"))
+            })
+            .await
+            .unwrap_err();
+        let again = service
+            .prepare_with(id, || async { panic!("must not recollect") })
+            .await
+            .unwrap();
+        assert_eq!(again.draft_id, draft.draft_id);
+        assert_eq!(again.report.log_tail, draft.report.log_tail);
+        let unproven = service
+            .capture(
+                Some(PipelineStage::Reconstructing),
+                Some(PipelineEngine::Colmap),
+                None,
+                "unobserved process failed",
+                None,
+                &[],
+            )
+            .await;
+        assert!(service
+            .captured_report_for_test(unproven)
+            .unwrap()
+            .log_tail
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn preparation_capture_survives_unreadable_roots_metadata_and_unwritable_logs() {
+        use crate::pipeline::retry_preparation::{PreparationContext, RetryPreparationOperation};
+        for obstacle in [
+            "root_file",
+            "logs_file",
+            "log_directory",
+            "missing_metadata",
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let project = temporary.path().join("private-project-name");
+            if obstacle == "root_file" {
+                std::fs::write(&project, b"not a directory").unwrap();
+            } else {
+                std::fs::create_dir(&project).unwrap();
+                match obstacle {
+                    "logs_file" => {
+                        std::fs::write(project.join("logs"), b"not a directory").unwrap();
+                    }
+                    "log_directory" => {
+                        std::fs::create_dir_all(project.join("logs/retry-preparation.log"))
+                            .unwrap();
+                    }
+                    _ => (),
+                }
+            }
+            let context = PreparationContext::new(Some(Uuid::new_v4()), Some(project.clone()));
+            let failure = context
+                .step(
+                    RetryPreparationOperation::WriteRetryReuseBarrier,
+                    "project_state",
+                    Some("brush"),
+                    async {
+                        Err::<(), _>(
+                            crate::error::SplatError::Io(std::io::Error::from_raw_os_error(5))
+                                .with_io_diagnostic("io_substep=replace_state"),
+                        )
+                    },
+                )
+                .await
+                .unwrap_err();
+            let snapshot = context.snapshot();
+            let message = format!("{failure}\n{}", project.join("state.json").display());
+            let service = DiagnosticService::default();
+            let id = service.capture_preparation(&message, &snapshot, &[]).await;
+            let report = service.captured_report_for_test(id).unwrap();
+            assert_eq!(report.stage, None);
+            assert_eq!(report.engine, Some(PipelineEngine::System));
+            assert!(report.detail.contains("write_retry_reuse_barrier"));
+            assert!(report.detail.contains("replace_state"));
+            assert!(report.detail.contains("\"osError\":5"));
+            assert!(report
+                .log_tail
+                .contains(&snapshot.preparation_id.to_string()));
+            assert!(report.log_tail.contains("status=failed"));
+            let encoded = serde_json::to_string(&report).unwrap();
+            assert!(!encoded.contains("private-project-name"));
+            assert!(!encoded.contains(&project.to_string_lossy().replace('\\', "/")));
+            assert_eq!(report.schema_version, 1);
+            assert_eq!(
+                serde_json::to_value(&report)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                12
+            );
+            assert!(service.reports.lock().unwrap().drafts.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_capture_keeps_only_the_current_operation_and_does_not_reclassify_text() {
+        use crate::pipeline::retry_preparation::{PreparationContext, RetryPreparationOperation};
+        let previous = PreparationContext::new(None, None);
+        let current = PreparationContext::new(None, None);
+        for context in [&previous, &current] {
+            let _ = context
+                .step(
+                    RetryPreparationOperation::ReadRetryState,
+                    "project_state",
+                    None,
+                    async {
+                        Err::<(), _>(crate::error::SplatError::Io(
+                            std::io::Error::from_raw_os_error(5),
+                        ))
+                    },
+                )
+                .await;
+        }
+        let previous = previous.snapshot();
+        let mut current = current.snapshot();
+        current.operation_log.push_str(&previous.operation_log);
+        current.classification_kind = Some("disk_space_low");
+        let service = DiagnosticService::default();
+        let id = service
+            .capture_preparation(
+                "COLMAP mapper source text must not change typed classification",
+                &current,
+                &[],
+            )
+            .await;
+        let report = service.captured_report_for_test(id).unwrap();
+        assert_eq!(report.stage, None);
+        assert_eq!(report.engine, Some(PipelineEngine::System));
+        assert_eq!(report.error_code, "disk_space_low");
+        assert!(report
+            .log_tail
+            .contains(&current.preparation_id.to_string()));
+        assert!(!report
+            .log_tail
+            .contains(&previous.preparation_id.to_string()));
+        assert!(report.detail.contains("read_retry_state"));
+    }
+
+    #[tokio::test]
+    async fn preparation_context_stays_visible_inside_existing_report_limits() {
+        use crate::pipeline::retry_preparation::{PreparationContext, RetryPreparationOperation};
+        let context = PreparationContext::new(None, None);
+        let _ = context
+            .step(
+                RetryPreparationOperation::ArchiveRetryCache,
+                "cache_source",
+                Some("colmap"),
+                async {
+                    Err::<(), _>(crate::error::SplatError::Io(
+                        std::io::Error::from_raw_os_error(32),
+                    ))
+                },
+            )
+            .await;
+        let mut snapshot = context.snapshot();
+        snapshot.operation_log = snapshot.operation_log.repeat(500);
+        let service = DiagnosticService::default();
+        let id = service
+            .capture_preparation(&"long native context ".repeat(4000), &snapshot, &[])
+            .await;
+        let report = service.captured_report_for_test(id).unwrap();
+        assert!(report.detail.contains("archive_retry_cache"));
+        assert!(report.detail.len() <= 16 * 1024);
+        assert!(report.log_tail.len() <= LOG_BYTES);
+        assert!(report.logs_truncated);
+        assert!(serde_json::to_vec(&report).unwrap().len() <= REPORT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn preparation_private_basenames_do_not_redact_typed_operation_labels() {
+        use crate::pipeline::retry_preparation::{PreparationContext, RetryPreparationOperation};
+        for basename in ["state", "project", "brush"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let project = temporary.path().join(basename);
+            std::fs::create_dir(&project).unwrap();
+            let source = temporary.path().join("AliceSensitive/source.png");
+            let private_paths = vec![source.clone(), PathBuf::from("AliceSensitive")];
+            let context = PreparationContext::new(Some(Uuid::new_v4()), Some(project.clone()));
+            let failure = context
+                .step(
+                    RetryPreparationOperation::ReadRetryState,
+                    "project_state",
+                    Some("brush"),
+                    async {
+                        Err::<(), _>(
+                            crate::error::SplatError::Io(std::io::Error::from_raw_os_error(5))
+                                .with_io_diagnostic("io_substep=replace_state"),
+                        )
+                    },
+                )
+                .await
+                .unwrap_err();
+            let snapshot = context.snapshot();
+            let message = format!(
+                "Cannot read {} for AliceSensitive\n{}\n{failure}",
+                source.display(),
+                project.join("state.json").display(),
+            );
+            let service = DiagnosticService::default();
+            let id = service
+                .capture_preparation(&message, &snapshot, &private_paths)
+                .await;
+            let report = service.captured_report_for_test(id).unwrap();
+            assert!(report.detail.contains("\"operation\":\"read_retry_state\""));
+            assert!(report.detail.contains("\"pathRole\":\"project_state\""));
+            assert!(report.detail.contains("\"cache\":\"brush\""));
+            assert!(report
+                .detail
+                .contains("retry_preparation_operation=read_retry_state"));
+            assert!(report.detail.contains("path_role=project_state"));
+            assert!(report.detail.contains("io_substep=replace_state"));
+            assert!(report.log_tail.contains("operation=read_retry_state"));
+            assert!(report.log_tail.contains("path_role=project_state"));
+            assert!(report.log_tail.contains("cache=brush"));
+            assert!(report
+                .log_tail
+                .contains(&snapshot.preparation_id.to_string()));
+            for text in [&report.detail, &report.log_tail] {
+                assert!(!text.contains("AliceSensitive"));
+                assert!(!text.contains(&project.display().to_string()));
+                assert!(!text.contains(&source.display().to_string()));
+            }
+            let prepared = service
+                .prepare_with(id, || async {
+                    let mut environment = blank_environment();
+                    environment.system.name = "AliceSensitive".into();
+                    environment
+                })
+                .await
+                .unwrap()
+                .report;
+            assert_eq!(prepared.detail, report.detail);
+            assert_eq!(prepared.log_tail, report.log_tail);
+            assert!(!prepared.environment.system.name.contains("AliceSensitive"));
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_details_keep_the_root_cause_and_latest_attempts_in_order() {
         use crate::pipeline::{brush_execution::BrushExecutionSnapshot, runtime::RuntimeTracker};
         let service = DiagnosticService::default();
@@ -557,6 +881,21 @@ mod tests {
             .config
             .insert("directory".into(), "C:/private/GPU-secret-uuid".into());
         let mut first = BrushExecutionSnapshot::new(&runtime.snapshot, None);
+        // A later N/A resource sample must not erase evidence already known
+        // for this same execution before the report freezes it.
+        runtime.snapshot.resources = Some(crate::process::resources::ProcessResources {
+            process_id: 123,
+            sampled_at: Utc::now(),
+            cpu_percent: None,
+            memory_bytes: None,
+            gpus: vec![],
+            gpu_status: "unavailable".into(),
+        });
+        runtime.snapshot.config.remove("device_total_memory_mb");
+        runtime.snapshot.config.remove("device_driver_version");
+        first.update(&runtime.snapshot);
+        runtime.snapshot.resources = None;
+        first.update(&runtime.snapshot);
         first.finish(Some(101));
         let unknown = BrushExecutionSnapshot::new(&RuntimeTracker::new().snapshot, None);
         for current in [Some(0), Some(1), None] {
@@ -758,7 +1097,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("stage.log");
         std::fs::write(&path, "line\n".repeat(100_000)).unwrap();
-        let (text, truncated) = read_tail(&path).unwrap();
+        let registered = crate::tasks::logs::register(root.path(), &path, 0).unwrap();
+        let (text, truncated) = crate::tasks::logs::diagnostic_tail(
+            &registered,
+            std::fs::metadata(&path).unwrap().len(),
+            LOG_BYTES,
+            200,
+        )
+        .unwrap();
         assert_eq!(text.lines().count(), 200);
         assert!(truncated);
         assert!(text.len() <= LOG_BYTES);

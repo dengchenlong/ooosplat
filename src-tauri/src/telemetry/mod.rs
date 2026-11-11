@@ -37,6 +37,99 @@ mod failure_stage_tests {
     use super::*;
 
     #[tokio::test]
+    async fn mixed_inputs_keep_basic_events_without_a_fabricated_type_or_planner_summary() {
+        use crate::pipeline::inputs::{GenerationInputs, InputSource};
+        let root = tempfile::tempdir().unwrap();
+        let (service, captured) = TelemetryService::recording(root.path().join("telemetry.json"));
+        service.enable_for_test().await;
+        let inputs = |sources: Vec<InputSource>| GenerationInputs::Materials {
+            items: sources
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| crate::pipeline::inputs::MaterialInput {
+                    id: format!("input-{index}"),
+                    source,
+                    identity: None,
+                    projection: Default::default(),
+                    image_matching_strategy: Default::default(),
+                    camera_relation: None,
+                    confirmed_small_images: false,
+                    confirmed_image_order: false,
+                    frame_removal_fps: None,
+                })
+                .collect(),
+        };
+        let video = || InputSource::Video {
+            path: "unused.mp4".into(),
+        };
+        let images = || InputSource::ImageFolder {
+            path: "unused-images".into(),
+        };
+        assert_eq!(
+            material_input_type(&inputs(vec![video(), video()])),
+            Some(TelemetryInputType::Video)
+        );
+        assert_eq!(
+            material_input_type(&inputs(vec![images(), images()])),
+            Some(TelemetryInputType::Images)
+        );
+        let mixed = inputs(vec![video(), images()]);
+        assert_eq!(material_input_type(&mixed), None);
+        let failed = PipelineTelemetrySession::new_for_input(
+            service.clone(),
+            Quality::Balanced,
+            material_input_type(&mixed),
+        );
+        failed.generation_started();
+        failed.observe(&PipelineEvent::mapped(
+            PipelineStage::Matching,
+            0.0,
+            "fixture",
+        ));
+        failed.generation_failed(&SplatError::Process("fixture".into()));
+        failed.generation_failed(&SplatError::Process("duplicate".into()));
+        let completed = PipelineTelemetrySession::new_for_input(service, Quality::Balanced, None);
+        completed.generation_completed(100, 60, None);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let done = {
+                    let events = captured.lock().unwrap();
+                    events
+                        .iter()
+                        .any(|value| value["event"] == "generation_failed")
+                        && events
+                            .iter()
+                            .any(|value| value["event"] == "generation_completed")
+                        && events
+                            .iter()
+                            .any(|value| value["event"] == "pipeline_stage_completed")
+                };
+                if done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = captured.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|value| value["event"] == "generation_failed")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|value| matches!(
+            value["event"].as_str(),
+            Some("generation_started" | "planner_evaluation")
+        )));
+        assert!(events
+            .iter()
+            .all(|value| value["properties"].get("inputType").is_none()));
+    }
+
+    #[tokio::test]
     async fn completed_stage_does_not_erase_the_failure_location() {
         let root = tempfile::tempdir().unwrap();
         let (service, _) = TelemetryService::recording(root.path().join("telemetry.json"));
@@ -78,7 +171,7 @@ struct PlannerTelemetryRun {
 pub struct PipelineTelemetrySession {
     service: TelemetryService,
     quality: TelemetryQuality,
-    input_type: TelemetryInputType,
+    input_type: Option<TelemetryInputType>,
     started: Instant,
     timing: Mutex<StageTiming>,
     finished: AtomicBool,
@@ -90,6 +183,16 @@ impl PipelineTelemetrySession {
         service: TelemetryService,
         quality: Quality,
         input_type: TelemetryInputType,
+    ) -> Self {
+        Self::new_for_input(service, quality, Some(input_type))
+    }
+
+    /// Basic events do not need an accurately representable Planner source.
+    /// Truly mixed inputs omit only the started event; no new wire enum is sent.
+    pub(crate) fn new_for_input(
+        service: TelemetryService,
+        quality: Quality,
+        input_type: Option<TelemetryInputType>,
     ) -> Self {
         Self {
             service,
@@ -116,7 +219,7 @@ impl PipelineTelemetrySession {
         Self {
             service,
             quality: quality.into(),
-            input_type,
+            input_type: Some(input_type),
             started: Instant::now(),
             timing: Mutex::new(StageTiming {
                 active: None,
@@ -134,9 +237,12 @@ impl PipelineTelemetrySession {
     }
 
     pub fn generation_started(&self) {
+        let Some(input_type) = self.input_type else {
+            return;
+        };
         self.service.track(TelemetryEvent::GenerationStarted {
             quality_preset: self.quality,
-            input_type: self.input_type,
+            input_type,
         });
     }
 
@@ -210,7 +316,9 @@ impl PipelineTelemetrySession {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        if matches!(error, SplatError::Cancelled) {
+        // An unsupported new selection never started a generation attempt.
+        // Do not turn its UI/MCP admission rejection into a failed-task event.
+        if matches!(error, SplatError::Cancelled | SplatError::InputAdmission(_)) {
             return;
         }
         let stage = self.current_stage();
@@ -275,6 +383,9 @@ impl PipelineTelemetrySession {
         let Some(run) = &self.planner_run else {
             return;
         };
+        let Some(input_type) = self.input_type else {
+            return;
+        };
         if run
             .emitted
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -290,12 +401,37 @@ impl PipelineTelemetrySession {
             planner_enabled: run.planner_enabled,
             planner_version: run.planner_enabled.then_some(PLANNER_VERSION_V1),
             quality_preset: self.quality,
-            input_type: self.input_type,
+            input_type,
             total_duration_ms: self.elapsed_ms(),
             failure_stage,
             error_code,
             snapshot: Box::new(run.tracker.snapshot()),
         });
+    }
+}
+
+pub(crate) fn material_input_type(
+    inputs: &crate::pipeline::inputs::GenerationInputs,
+) -> Option<TelemetryInputType> {
+    use crate::pipeline::inputs::{GenerationInputs, InputSource};
+    let GenerationInputs::Materials { items } = inputs else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    if items
+        .iter()
+        .all(|item| matches!(item.source, InputSource::Video { .. }))
+    {
+        Some(TelemetryInputType::Video)
+    } else if items
+        .iter()
+        .all(|item| !matches!(item.source, InputSource::Video { .. }))
+    {
+        Some(TelemetryInputType::Images)
+    } else {
+        None
     }
 }
 
@@ -319,9 +455,9 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::EngineMissing(_)
         | SplatError::EngineStart { .. }
         | SplatError::UnsupportedEngine(_) => TelemetryErrorCode::EngineUnavailable,
-        SplatError::InvalidVideo(_) | SplatError::InvalidPath(_) => {
-            TelemetryErrorCode::InvalidInput
-        }
+        SplatError::InputAdmission(_)
+        | SplatError::InvalidVideo(_)
+        | SplatError::InvalidPath(_) => TelemetryErrorCode::InvalidInput,
         SplatError::Io(io_error) => {
             if io_error.raw_os_error() == Some(112) {
                 TelemetryErrorCode::DiskSpaceLow
@@ -394,6 +530,43 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
 mod tests {
     use super::*;
     use crate::pipeline::{EventLevel, PipelineEngine};
+
+    #[tokio::test]
+    async fn input_admission_does_not_emit_generation_failure_or_planner_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, events) = TelemetryService::recording(root.path().join("telemetry.json"));
+        service.enable_for_test().await;
+        for reason in [
+            crate::error::InputAdmissionReason::ColmapDisabled,
+            crate::error::InputAdmissionReason::UnsupportedInput,
+        ] {
+            let session = PipelineTelemetrySession::new_with_planner_evaluation(
+                service.clone(),
+                Quality::Balanced,
+                TelemetryInputType::Images,
+                TelemetryRunKind::New,
+                true,
+                PlannerEffectivenessTracker::default(),
+            );
+            let error = SplatError::InputAdmission(reason);
+            assert_eq!(
+                safe_error_code(&error, None),
+                TelemetryErrorCode::InvalidInput
+            );
+            session.generation_failed(&error);
+            assert!(session.finished.load(Ordering::Acquire));
+            assert!(!session
+                .planner_run
+                .as_ref()
+                .unwrap()
+                .emitted
+                .load(Ordering::Acquire));
+            session.generation_failed(&SplatError::Process("late failure".into()));
+            session.generation_completed(1, 30, None);
+        }
+        tokio::task::yield_now().await;
+        assert!(events.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn engine_failure_telemetry_keeps_existing_codes_without_cross_engine_oom_guesses() {
@@ -469,6 +642,20 @@ mod tests {
         assert_eq!(
             safe_error_code(&error, Some(TelemetryStage::ExtractingFeatures)),
             TelemetryErrorCode::ColmapFeatureFailed
+        );
+    }
+
+    #[test]
+    fn retry_preparation_context_preserves_io_telemetry_codes() {
+        let denied = SplatError::Io(std::io::Error::from_raw_os_error(5))
+            .with_io_diagnostic("retry_preparation_operation=archive_retry_cache");
+        assert_eq!(safe_error_code(&denied, None), TelemetryErrorCode::IoFailed);
+
+        let full = SplatError::Io(std::io::Error::from_raw_os_error(112))
+            .with_io_diagnostic("retry_preparation_operation=write_retry_archive_progress");
+        assert_eq!(
+            safe_error_code(&full, None),
+            TelemetryErrorCode::DiskSpaceLow
         );
     }
 
