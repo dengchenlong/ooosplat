@@ -462,6 +462,10 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_hardware: Option<crate::engines::gpu_selection::ResolvedHardwarePlan>,
     /// Frozen SfM image derivation. Missing means historical prepared pixels
     /// and masks must retain their original interpretation on continuation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,6 +596,8 @@ impl PipelineStateFile {
 
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
+            gpu_selection: None,
+            resolved_hardware: None,
             validated_output: None,
             ordinary_image_preparation_version: None,
             camera_grouping_policy_version: None,
@@ -657,7 +663,10 @@ mod tests {
             Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
         let restored: super::PipelineStateFile =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(restored.camera_grouping_policy_version, Some(1));
+        assert_eq!(
+            restored.camera_grouping_policy_version,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        );
     }
 
     #[test]

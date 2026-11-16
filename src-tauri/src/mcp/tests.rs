@@ -205,7 +205,7 @@ async fn continuation_defers_original_reads_and_uses_the_current_callers_scope()
     let tools = McpTools {
         app: None,
         tasks: reloaded.clone(),
-        engines: crate::pipeline::runner::default_engine_paths(None),
+        engines: crate::engines::EnginePaths::from_root(root.path().join("missing-engines")),
         settings: McpSettings {
             input_roots: vec![],
             ..Default::default()
@@ -263,7 +263,7 @@ async fn resume_and_legacy_retry_tool_aliases_share_continuation_without_new_con
     let tools = McpTools {
         app: None,
         tasks: tasks.clone(),
-        engines: crate::pipeline::runner::default_engine_paths(None),
+        engines: crate::engines::EnginePaths::from_root(temp.path().join("missing-engines")),
         settings: McpSettings {
             input_roots: vec![std::fs::canonicalize(temp.path()).unwrap()],
             ..Default::default()
@@ -826,6 +826,7 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
         error: None,
         brush_executions: vec![execution; 10],
         current_brush_execution: Some(9),
+        resolved_hardware: None,
     });
     let public = public_task(task).unwrap();
     let text = public.to_string();

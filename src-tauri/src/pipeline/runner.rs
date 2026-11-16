@@ -45,12 +45,28 @@ mod mapper_progress_tests;
 #[path = "prepared_recovery.rs"]
 mod prepared_recovery;
 #[cfg(test)]
+#[path = "recovery_8016f801.rs"]
+mod recovery_8016f801;
+#[cfg(test)]
 #[path = "repeated_reshoot_validation.rs"]
 mod repeated_reshoot_validation;
 #[path = "reshoot_runner.rs"]
 mod reshoot_runner;
 #[path = "retry_archive.rs"]
 mod retry_archive;
+pub(crate) async fn rename_initialization_entry(
+    source: &Path,
+    destination: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    retry_archive::rename_entry(source, destination, cancel, |_| async {}).await?;
+    Ok(())
+}
+#[path = "terminal_persistence.rs"]
+mod terminal_persistence;
+pub(crate) use terminal_persistence::TerminalSaveContext;
+#[path = "training_initialization.rs"]
+mod training_initialization;
 #[path = "working_database.rs"]
 mod working_database;
 
@@ -663,7 +679,11 @@ pub struct PipelineRunner {
     diagnostic_logs: Arc<std::sync::Mutex<crate::diagnostics::logs::ExecutionLogs>>,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     preparation_context: std::sync::Mutex<Option<PreparationContext>>,
+    terminal_save_diagnostics: terminal_persistence::Diagnostics,
     current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
+    resolved_hardware:
+        Arc<std::sync::Mutex<Option<crate::engines::gpu_selection::ResolvedHardwarePlan>>>,
     automatic_retry_this_run: AtomicBool,
     elapsed_offset_ms: AtomicU64,
     workspace_task_id: Option<uuid::Uuid>,
@@ -769,7 +789,10 @@ impl PipelineRunner {
             active_project: Arc::new(std::sync::Mutex::new(None)),
             diagnostic_logs: Default::default(),
             preparation_context: std::sync::Mutex::new(None),
+            terminal_save_diagnostics: Default::default(),
             current_acceleration: Arc::new(std::sync::Mutex::new(None)),
+            gpu_selection: None,
+            resolved_hardware: Arc::new(std::sync::Mutex::new(None)),
             automatic_retry_this_run: AtomicBool::new(false),
             elapsed_offset_ms: AtomicU64::new(0),
             workspace_task_id: None,
@@ -785,6 +808,28 @@ impl PipelineRunner {
     ) -> Self {
         self.invocation_access = access;
         self
+    }
+
+    pub fn with_gpu_selection(
+        mut self,
+        selection: Option<crate::engines::gpu_selection::GpuSelection>,
+    ) -> Self {
+        self.gpu_selection = selection;
+        self
+    }
+
+    pub fn resolved_hardware(&self) -> Option<crate::engines::gpu_selection::ResolvedHardwarePlan> {
+        self.resolved_hardware
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn save_hardware_plan(&self, state: &mut PipelineStateFile) {
+        if let Some(plan) = self.resolved_hardware() {
+            state.gpu_selection = Some(plan.selection.clone());
+            state.resolved_hardware = Some(plan);
+        }
     }
 
     fn invocation_input_access(&self) -> Option<super::access::InvocationAccess> {
@@ -1413,6 +1458,9 @@ impl PipelineRunner {
     }
 
     pub fn with_execution_run_id(mut self, execution_run_id: Option<uuid::Uuid>) -> Self {
+        if self.execution_run_id != execution_run_id {
+            self.terminal_save_diagnostics.clear();
+        }
         self.execution_run_id = execution_run_id;
         self
     }
@@ -1594,15 +1642,26 @@ impl PipelineRunner {
         }
         colmap::require_verified_cli(&self.engines.colmap)?;
         brush::require_verified_cli(&self.engines.brush)?;
-        let acceleration = statuses
+        let automatic = statuses
             .into_iter()
             .find(|status| status.kind == EngineKind::Colmap)
             .and_then(|status| status.acceleration)
             .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))?;
+        let (acceleration, hardware) = if let Some(selection) = self.gpu_selection.as_ref() {
+            let (hardware, acceleration) =
+                crate::engines::gpu_selection::resolve(&self.engines, selection).await?;
+            (acceleration, Some(hardware))
+        } else {
+            (automatic, None)
+        };
         *self
             .current_acceleration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(acceleration.clone());
+        *self
+            .resolved_hardware
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hardware;
         Ok(acceleration)
     }
 
@@ -2115,6 +2174,7 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
+        self.save_hardware_plan(&mut state);
         state.video_projection = self.video_projection;
         if state.input_type == ProjectInputType::Images {
             state.image_matching_strategy = self.image_matching_strategy;
@@ -2512,6 +2572,7 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
+        self.save_hardware_plan(&mut state);
         if source_metadata.imported.is_some() {
             state.planner_enabled = self.planner_enabled;
         } else {
@@ -3429,6 +3490,11 @@ impl PipelineRunner {
                 &detected
             }
         };
+        let previous_hardware = state.resolved_hardware.clone();
+        self.save_hardware_plan(&mut state);
+        if state.resolved_hardware != previous_hardware {
+            project_manager.write_state(&paths.state, &state).await?;
+        }
         if let Some(observer) = &self.lifecycle {
             observer(RunnerUpdate::Configuration(
                 crate::tasks::checkpoint_snapshot(&state),
@@ -3492,15 +3558,8 @@ impl PipelineRunner {
             metadata.duration_ms =
                 Some(previous_duration.saturating_add(started.elapsed().as_millis() as u64));
             metadata.failure_message = Some(error.to_string());
-            let _ = project_manager
-                .write_metadata(&paths.metadata, metadata)
+            self.persist_terminal_records(&project_manager, &paths, metadata, cancelled)
                 .await;
-            // A failed read is not an empty work order. Never overwrite a
-            // damaged or temporarily inaccessible checkpoint with defaults.
-            if let Ok(state) = project_manager.read_state(&paths.state).await {
-                let state = mark_state_terminal(state, cancelled);
-                let _ = project_manager.write_state(&paths.state, &state).await;
-            }
         }
         result
     }
@@ -5090,6 +5149,7 @@ impl PipelineRunner {
         quality: Quality,
         acceleration: &crate::engines::ColmapAccelerationStatus,
         dataset: &Path,
+        initialization: &crate::pipeline::brush_initialization::InitializationContract,
         initial_sfm_points: u64,
         resolved: ResolvedBrushTrainingPreset,
         _estimated_duration_ms: u64,
@@ -5121,6 +5181,7 @@ impl PipelineRunner {
             .reshoot
             .as_ref()
             .and_then(|r| r.recipe.as_ref())
+            .filter(|r| r.actual.training == crate::pipeline::reshoot::TrainingMode::Warm)
             .and_then(|r| r.warm_parameters);
         let alpha_mode = state.brush_training.alpha_mode(
             state
@@ -5129,7 +5190,10 @@ impl PipelineRunner {
                 .and_then(|r| r.recipe.as_ref())
                 .is_some(),
         )?;
-        let gpu_launch_policy = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
+        let gpu_launch_policy = brush::BrushGpuLaunchPolicy::from_hardware_plan(
+            acceleration,
+            self.resolved_hardware().as_ref(),
+        );
         self.events.send(
             PipelineStage::TrainingSplats,
             Some(PipelineEngine::Brush),
@@ -5153,6 +5217,13 @@ impl PipelineRunner {
             Some(resolved.preset.total_steps as u64),
             ObserverMode::Brush,
         ));
+        training_initialization::verify_start(
+            paths,
+            dataset,
+            initialization,
+            &self.process_manager.child_token(),
+        )
+        .await?;
         let first = brush::train(
             &self.engines.brush,
             dataset,
@@ -5270,6 +5341,16 @@ impl PipelineRunner {
                     Some(downgraded.preset.total_steps as u64),
                     ObserverMode::Brush,
                 ));
+                if let Err(check_error) = training_initialization::verify_start(
+                    paths,
+                    dataset,
+                    initialization,
+                    &self.process_manager.child_token(),
+                )
+                .await
+                {
+                    return Err(check_error.with_previous_attempt(error));
+                }
                 let retried = brush::train(
                     &self.engines.brush,
                     dataset,

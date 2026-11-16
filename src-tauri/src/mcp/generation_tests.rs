@@ -229,7 +229,7 @@ async fn scalar_and_ordered_admission_share_inspection_without_repeated_headers(
     })).await.unwrap_err();
     assert!(rejected.message.contains("图片序列分辨率不一致"));
     assert!(tools.tasks.all().await.unwrap().is_empty());
-    image::RgbImage::new(4, 3)
+    image::RgbImage::new(3, 4)
         .save(directory.join("2.png"))
         .unwrap();
     let scalar = inspect(
@@ -440,6 +440,15 @@ fn reshoot_question_order_and_retry_authorization_share_existing_options() {
             .map(|q| q["key"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["model_condition", "camera_relation", "image_order"]
+    );
+    assert_eq!(
+        questions[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["appearance", "geometry", "unsure", "good"]
     );
     for option in questions[0]["options"].as_array().unwrap() {
         for locale in ["zh-CN", "en"] {

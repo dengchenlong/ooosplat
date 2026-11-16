@@ -161,15 +161,16 @@ async fn ba_scope_is_frozen_before_project_creation_and_old_reservations_keep_th
 #[tokio::test]
 async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_policy() {
     let (root, service, task) = fixture().await;
-    assert_eq!(task.camera_grouping_policy_version, Some(1));
+    let current = crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION;
+    assert_eq!(task.camera_grouping_policy_version, Some(current));
     assert_eq!(task.ordinary_image_preparation_version, Some(1));
     assert_eq!(
         task.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
-        1
+        crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION
     );
     assert_eq!(
         task.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
-        1
+        current
     );
     let mut request = task.request_parameters.clone().unwrap();
     request["cameraGroupingPolicyVersion"] = Value::from(999);
@@ -188,7 +189,7 @@ async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_p
         .await
         .unwrap();
     assert_eq!(same.task_id, task.task_id);
-    assert_eq!(same.camera_grouping_policy_version, Some(1));
+    assert_eq!(same.camera_grouping_policy_version, Some(current));
     assert_eq!(same.ordinary_image_preparation_version, Some(1));
 
     let new = service
@@ -204,15 +205,15 @@ async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_p
         )
         .await
         .unwrap();
-    assert_eq!(new.camera_grouping_policy_version, Some(1));
+    assert_eq!(new.camera_grouping_policy_version, Some(current));
     assert_eq!(new.ordinary_image_preparation_version, Some(1));
     assert_eq!(
         new.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
-        1
+        crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION
     );
     assert_eq!(
         new.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
-        1
+        current
     );
 
     let legacy = {
@@ -305,6 +306,52 @@ async fn new_camera_policy_rejects_mixed_image_dimensions_before_registering_a_t
         assert!(error.message.contains("b.png"));
         assert!(error.message.contains("8×3"));
         assert!(service.all().await.unwrap().is_empty());
+        assert!(!root.path().join("projects").exists());
+    }
+}
+
+#[tokio::test]
+async fn new_camera_policy_accepts_orientation_swapped_dimensions_for_all_image_inputs() {
+    use crate::pipeline::inputs::{GenerationInputs, InputSource, MaterialInput};
+    for explicit_inputs in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        image::RgbImage::new(4, 3)
+            .save(images.join("landscape.png"))
+            .unwrap();
+        image::RgbImage::new(3, 4)
+            .save(images.join("portrait.png"))
+            .unwrap();
+        let parameters = explicit_inputs.then(|| serde_json::json!({
+            "inputs": GenerationInputs::Materials { items: vec![MaterialInput {
+                id: "photos".into(), source: InputSource::Images { paths: vec![
+                    images.join("landscape.png"), images.join("portrait.png")
+                ] },
+                identity: None, projection: crate::video::panorama::VideoProjection::Perspective,
+                image_matching_strategy: Default::default(), camera_relation: None,
+                confirmed_small_images: true, confirmed_image_order: true, frame_removal_fps: None,
+            }] }
+        }));
+        let service = TaskService::at(root.path().join("registry"));
+        let task = service
+            .create(
+                None,
+                images,
+                Quality::Fast,
+                root.path().join("projects"),
+                true,
+                "gui",
+                None,
+                parameters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            task.camera_grouping_policy_version,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        );
+        assert_eq!(service.all().await.unwrap().len(), 1);
         assert!(!root.path().join("projects").exists());
     }
 }
@@ -1412,6 +1459,7 @@ fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     run
 }
@@ -3155,6 +3203,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -3240,6 +3289,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -3766,6 +3816,7 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
         last_exit_code: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -4457,4 +4508,202 @@ fn real_activity_journal_count_redaction_read_only_regression() {
         }
     }
     panic!("no existing mis-redacted application count found in the bounded recent activity tails");
+}
+
+struct CommittedTaskFixture {
+    root: tempfile::TempDir,
+    service: TaskService,
+    task: TaskRecord,
+    other: TaskRecord,
+    project: PathBuf,
+    final_ply: PathBuf,
+    transaction: PathBuf,
+    model: Vec<u8>,
+}
+
+async fn committed_task_fixture() -> CommittedTaskFixture {
+    use crate::pipeline::publication::{self, PublicationIdentity, PublicationPhase};
+
+    let (root, service, task) = fixture().await;
+    let other = service
+        .create(
+            None,
+            task.input_path.clone(),
+            Quality::Balanced,
+            root.path().join("projects"),
+            false,
+            "gui",
+            Some("request-2".into()),
+            Some(serde_json::json!({"quality":"balanced"})),
+        )
+        .await
+        .unwrap();
+    assert_ne!(other.task_id, task.task_id);
+
+    // A finished generation: committed publication, project.json, task record.
+    let project = root.path().join("projects").join("committed");
+    let candidate = project.join("work/brush/final.ply.tmp");
+    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    std::fs::write(
+        &candidate,
+        "ply\nformat binary_little_endian 1.0\nelement vertex 5\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n",
+    )
+    .unwrap();
+    let final_ply = project.join("final.ply");
+    let transaction = project
+        .join("work")
+        .join(publication::TRANSACTION_FILE_NAME);
+    let published = publication::publish_candidate(
+        &project,
+        &transaction,
+        &candidate,
+        &final_ply,
+        Default::default(),
+        PublicationIdentity {
+            attempt_id: "brush-0".into(),
+            ..Default::default()
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(published.transaction.phase, PublicationPhase::Committed);
+    {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.project_id = Some(Uuid::new_v4());
+        saved.project_path = Some(project.clone());
+        saved.status = TaskStatus::Completed;
+    }
+    persist_bound_project_metadata(&service, task.task_id).await;
+    service.persist().await.unwrap();
+
+    CommittedTaskFixture {
+        root,
+        service,
+        task,
+        other,
+        project,
+        final_ply,
+        transaction,
+        model: std::fs::read(&published.output.final_ply).unwrap(),
+    }
+}
+
+/// A committed project's final.ply deleted outside the app used to make
+/// `load_locked` fail, so the whole task list stayed unloadable until the file
+/// was restored. Only the affected task may report the missing artifact.
+#[tokio::test]
+async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_loadable() {
+    use crate::pipeline::publication::{self, PublicationPhase};
+
+    let fixture = committed_task_fixture().await;
+
+    // Control: with final.ply intact, a restart loads and reconciles everything.
+    let healthy = TaskService::at(fixture.root.path().join("registry"));
+    let tasks = healthy.all().await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    let completed = healthy.get(fixture.task.task_id).await.unwrap();
+    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(
+        publication::load_transaction(&fixture.project, &fixture.transaction)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        PublicationPhase::Reconciled
+    );
+    drop(healthy);
+
+    // Someone deletes the published model outside the app, then the app restarts.
+    std::fs::remove_file(&fixture.final_ply).unwrap();
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    assert_eq!(restarted.all().await.unwrap().len(), 2);
+    let unavailable = restarted.get(fixture.task.task_id).await.unwrap();
+    assert_eq!(unavailable.status, TaskStatus::Interrupted);
+    assert!(unavailable.result.is_none());
+    assert_eq!(unavailable.error.unwrap().code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(
+        restarted.get(fixture.other.task_id).await.unwrap().status,
+        TaskStatus::Created
+    );
+    drop(restarted);
+
+    // Restoring the file and restarting brings the committed result back.
+    std::fs::write(&fixture.final_ply, &fixture.model).unwrap();
+    let recovered = TaskService::at(fixture.root.path().join("registry"));
+    let task = recovered.get(fixture.task.task_id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert!(task.error.is_none());
+}
+
+#[tokio::test]
+async fn invalid_or_mismatched_committed_final_ply_only_interrupts_its_task() {
+    for invalid_ply in [true, false] {
+        let fixture = committed_task_fixture().await;
+        if invalid_ply {
+            std::fs::write(&fixture.final_ply, b"not a ply").unwrap();
+        } else {
+            let mut changed = fixture.model.clone();
+            changed.push(b'\n');
+            std::fs::write(&fixture.final_ply, changed).unwrap();
+        }
+
+        let restarted = TaskService::at(fixture.root.path().join("registry"));
+        assert_eq!(restarted.all().await.unwrap().len(), 2);
+        let unavailable = restarted.get(fixture.task.task_id).await.unwrap();
+        assert_eq!(unavailable.status, TaskStatus::Interrupted);
+        assert!(unavailable.result.is_none());
+        assert_eq!(unavailable.error.unwrap().code, "ARTIFACT_UNAVAILABLE");
+        assert_eq!(
+            restarted.get(fixture.other.task_id).await.unwrap().status,
+            TaskStatus::Created
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_publication_transaction_is_not_reported_as_an_unavailable_artifact() {
+    let fixture = committed_task_fixture().await;
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(&fixture.transaction, b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_ne!(error.code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
+}
+
+#[tokio::test]
+async fn invalid_project_state_is_not_reported_as_an_unavailable_artifact() {
+    let fixture = committed_task_fixture().await;
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(fixture.project.join("project.json"), b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_eq!(error.code, "INVALID_DATA");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
+}
+
+#[tokio::test]
+async fn reconciliation_errors_for_non_completed_tasks_are_not_silently_ignored() {
+    let fixture = committed_task_fixture().await;
+    {
+        let mut records = fixture.service.records();
+        let task = records.tasks.get_mut(&fixture.task.task_id).unwrap();
+        task.status = TaskStatus::Failed;
+        task.result = None;
+    }
+    fixture.service.persist().await.unwrap();
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(&fixture.transaction, b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_ne!(error.code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
 }

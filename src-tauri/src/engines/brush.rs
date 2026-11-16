@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::Deserialize;
+
 use crate::{
     engines::ColmapAccelerationStatus,
     error::{Result, SplatError},
@@ -17,7 +19,10 @@ const BRUSH_GPU_LOG_FILTER: &str =
 /// Its COLMAP reader and renderer both apply these distortion models. A matching
 /// name/version string is not sufficient: custom runtimes retain conversion.
 pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
-    if !matches!(model_id, 0 | 1 | 2 | 3 | 4 | 6) {
+    let Some(capability) = native_colmap_capability() else {
+        return false;
+    };
+    if !capability.native_colmap_model_ids.contains(&model_id) {
         return false;
     }
     type Identity = (PathBuf, u64, std::time::SystemTime);
@@ -45,25 +50,71 @@ pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
             return *verified;
         }
     }
-    let verified = verified_native_binary(&path);
+    let verified = verified_native_binary(&path, &capability.runtime_binary_sha256);
     *cache = Some((identity, verified));
     verified
 }
 
-fn verified_native_binary(path: &Path) -> bool {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeColmapCapability {
+    runtime_binary_sha256: String,
+    native_colmap_model_ids: Vec<u32>,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.json");
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.linux.json");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.macos.json");
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+const PLATFORM_ENGINE_MANIFEST: &str = "{}";
+
+fn parse_native_colmap_capability(manifest: &str) -> Option<NativeColmapCapability> {
+    let manifest = serde_json::from_str::<serde_json::Value>(manifest).ok()?;
+    let brush =
+        manifest.get("brush").or_else(|| {
+            manifest.get("engines")?.as_array()?.iter().find(|engine| {
+                engine.get("name").and_then(serde_json::Value::as_str) == Some("Brush")
+            })
+        })?;
+    let capability = serde_json::from_value::<NativeColmapCapability>(brush.clone()).ok()?;
+    if capability.runtime_binary_sha256.len() != 64
+        || !capability
+            .runtime_binary_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || capability.native_colmap_model_ids.is_empty()
+    {
+        return None;
+    }
+    let mut models = capability.native_colmap_model_ids.clone();
+    models.sort_unstable();
+    models.dedup();
+    if models != capability.native_colmap_model_ids {
+        return None;
+    }
+    Some(capability)
+}
+
+fn native_colmap_capability() -> Option<&'static NativeColmapCapability> {
+    static CAPABILITY: std::sync::OnceLock<Option<NativeColmapCapability>> =
+        std::sync::OnceLock::new();
+    CAPABILITY
+        .get_or_init(|| parse_native_colmap_capability(PLATFORM_ENGINE_MANIFEST))
+        .as_ref()
+}
+
+fn verified_native_binary(path: &Path, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     // Do not automatically widen capability claims when runtime manifests are
     // updated. Review the exact reader/renderer before adding another digest.
-    let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "f65bba1c7fcbdbb13e9299897ecb885f90f30555bee9452a526e372eacf338df"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "ca819f94716c04add531e69e5f6812a2d1e9a8cefbc2803da000d905d4fccb0a"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "da613b4ed1c551f41e448d8ab0dc9caf0f80bfd9f6943542e1b02c93d19ca74a"
-    } else {
-        return false;
-    };
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -76,7 +127,7 @@ fn verified_native_binary(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
-    format!("{:x}", hash.finalize()) == expected
+    format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected)
 }
 pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--total-train-iters",
@@ -97,6 +148,8 @@ pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
 pub struct BrushGpuLaunchPolicy {
     expected_device_name: Option<String>,
     force_first_discrete_gpu: bool,
+    explicit_cubecl_device: Option<String>,
+    known_memory_mb: Option<u64>,
     disable_amd_switchable_graphics: bool,
     selection_reason: &'static str,
 }
@@ -116,10 +169,33 @@ impl BrushGpuLaunchPolicy {
         Self::resolve(cfg!(windows), acceleration)
     }
 
+    pub fn from_hardware_plan(
+        acceleration: &ColmapAccelerationStatus,
+        hardware: Option<&crate::engines::gpu_selection::ResolvedHardwarePlan>,
+    ) -> Self {
+        let Some(hardware) = hardware else {
+            return Self::from_acceleration(acceleration);
+        };
+        Self {
+            expected_device_name: Some(hardware.device_name.clone()),
+            force_first_discrete_gpu: false,
+            explicit_cubecl_device: Some(hardware.brush_device.clone()),
+            known_memory_mb: hardware.brush_total_memory_mb,
+            // Inventory probing does not hide adapters. Preserve that exact
+            // set and ordering for execution; the explicit CubeCL selector
+            // chooses the requested device.
+            disable_amd_switchable_graphics: false,
+            selection_reason: "explicit_user_selection",
+        }
+    }
+
     /// COLMAP's selected GPU is not necessarily Brush's default adapter in a
     /// multi-GPU topology. Do not give panoramas a large VRAM budget when the
     /// launch policy cannot identify the training device.
     pub fn known_training_memory_mb(&self, acceleration: &ColmapAccelerationStatus) -> Option<u64> {
+        if self.explicit_cubecl_device.is_some() {
+            return self.known_memory_mb;
+        }
         self.expected_device_name.as_ref().and_then(|expected| {
             acceleration
                 .device
@@ -152,6 +228,8 @@ impl BrushGpuLaunchPolicy {
                 None
             },
             force_first_discrete_gpu: unambiguous_single_nvidia,
+            explicit_cubecl_device: None,
+            known_memory_mb: None,
             disable_amd_switchable_graphics: unambiguous_single_nvidia,
             selection_reason,
         }
@@ -166,7 +244,12 @@ impl BrushGpuLaunchPolicy {
         existing_rust_log: Option<OsString>,
     ) -> Vec<(OsString, OsString)> {
         let mut environment = Vec::new();
-        if self.force_first_discrete_gpu {
+        if let Some(device) = self.explicit_cubecl_device.as_ref() {
+            environment.push((
+                OsString::from("CUBECL_WGPU_DEFAULT_DEVICE"),
+                OsString::from(device),
+            ));
+        } else if self.force_first_discrete_gpu {
             environment.push((
                 OsString::from("CUBECL_WGPU_DEFAULT_DEVICE"),
                 OsString::from("DiscreteGpu(0)"),
@@ -199,14 +282,44 @@ impl BrushGpuLaunchPolicy {
             "backend=Vulkan selection={} expectedDevice={} cubeclDevice={} amdSwitchableLayerDisabled={}",
             self.selection_reason,
             self.expected_device_name.as_deref().unwrap_or("unverified"),
-            if self.force_first_discrete_gpu {
+            self.explicit_cubecl_device.as_deref().unwrap_or(if self.force_first_discrete_gpu {
                 "DiscreteGpu(0)"
             } else {
                 "automatic"
-            },
+            }),
             self.disable_amd_switchable_graphics
         )
     }
+
+    fn expected_device_name(&self) -> Option<&str> {
+        self.explicit_cubecl_device
+            .as_ref()
+            .and(self.expected_device_name.as_deref())
+    }
+}
+
+fn observed_wgpu_device(line: &str) -> Option<String> {
+    // The locked OOOBrush build emits this only after CubeCL has created the
+    // compute server on the adapter that will actually train. Do not parse a
+    // generic AdapterInfo entry: startup diagnostics may enumerate adapters
+    // that were considered but not selected.
+    if !line.contains("Created wgpu compute server on device AdapterInfo") {
+        return None;
+    }
+    let marker = "AdapterInfo { name: \"";
+    let value = line.split_once(marker)?.1;
+    value.split_once('"').map(|(name, _)| name.to_owned())
+}
+
+fn same_device_name(left: &str, right: &str) -> bool {
+    let normalized = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    normalized(left) == normalized(right)
 }
 
 fn train_args(
@@ -350,10 +463,19 @@ pub async fn train(
     }
     let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
     let evidence = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::failure::EngineFailureEvidence::default(),
+        crate::failure::EngineFailureEvidence::brush_training(options.preset.total_steps as u64),
     ));
     let live_evidence = evidence.clone();
     let counts = last_splat_count.clone();
+    let observed_device = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let live_device = observed_device.clone();
+    let expected_device = options
+        .gpu_launch_policy
+        .expected_device_name()
+        .map(str::to_owned);
+    let device_mismatch = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let live_mismatch = device_mismatch.clone();
+    let cancellation = manager.clone();
     let observer: ProcessObserver = std::sync::Arc::new(move |update| {
         if let crate::process::ProcessUpdate::Line { line, .. } = &update {
             live_evidence
@@ -363,12 +485,23 @@ pub async fn train(
             if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
                 *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
             }
+            if let Some(name) = observed_wgpu_device(line) {
+                *live_device.lock().unwrap_or_else(|p| p.into_inner()) = Some(name.clone());
+                if let Some(expected) = expected_device.as_deref() {
+                    if !same_device_name(expected, &name) {
+                        *live_mismatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(name);
+                        // Stop before the expensive training loop. The custom
+                        // mismatch below takes precedence over Cancelled.
+                        cancellation.cancel();
+                    }
+                }
+            }
         }
         if let Some(observer) = &observer {
             observer(update);
         }
     });
-    let output = manager
+    let output_result = manager
         .run_with_environment(
             ProcessSpec {
                 executable: executable.to_path_buf(),
@@ -379,16 +512,48 @@ pub async fn train(
             },
             &environment,
         )
-        .await.map_err(|error| error.with_io_diagnostic(
-            "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
-        ))?;
-    resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
+        .await;
+    if let Some(observed) = device_mismatch
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        let expected = options
+            .gpu_launch_policy
+            .expected_device_name()
+            .unwrap_or("unknown");
+        return Err(SplatError::Process(format!(
+            "Brush started on a different graphics device (expected {expected}, actual {observed})"
+        )));
+    }
+    let output = output_result.map_err(|error| error.with_io_diagnostic(
+        "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
+    ))?;
+    if let Some(expected) = options.gpu_launch_policy.expected_device_name() {
+        let observed = observed_device
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                SplatError::Process(
+                    "Brush did not report the selected graphics device; generation was stopped"
+                        .into(),
+                )
+            })?;
+        if !same_device_name(expected, &observed) {
+            return Err(SplatError::Process(format!(
+                "Brush started on a different graphics device (expected {expected}, actual {observed})"
+            )));
+        }
+    }
+    let evidence = evidence.lock().unwrap_or_else(|p| p.into_inner());
+    resolve_train_output(&output, candidate, alternate, &evidence).map_err(|mut error| {
         if let SplatError::EngineProcess(failure) = &mut error {
             **failure = crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Brush,
                 "train",
                 &output,
-                &evidence.lock().unwrap_or_else(|p| p.into_inner()),
+                &evidence,
             );
             failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
         }
@@ -400,13 +565,15 @@ fn resolve_train_output(
     output: &ProcessOutput,
     candidate: PathBuf,
     alternate: PathBuf,
+    evidence: &crate::failure::EngineFailureEvidence,
 ) -> Result<PathBuf> {
-    if !output.success {
+    if !output.success || evidence.brush_final_export_failed() {
         return Err(SplatError::EngineProcess(Box::new(
-            crate::failure::EngineProcessFailure::from_output(
+            crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Brush,
                 "train",
                 output,
+                evidence,
             ),
         )));
     }
@@ -521,6 +688,42 @@ mod tests {
         assert!(!supports_native_colmap(&binary, 1));
         assert!(!supports_native_colmap(&binary, 17));
         assert!(!supports_native_colmap(&temp.path().join("missing"), 1));
+    }
+
+    #[test]
+    fn native_camera_capability_is_loaded_from_reviewed_platform_manifests() {
+        let cases = [
+            (
+                include_str!("../../../engines/manifest.json"),
+                "f65bba1c7fcbdbb13e9299897ecb885f90f30555bee9452a526e372eacf338df",
+            ),
+            (
+                include_str!("../../../engines/manifest.linux.json"),
+                "ca819f94716c04add531e69e5f6812a2d1e9a8cefbc2803da000d905d4fccb0a",
+            ),
+            (
+                include_str!("../../../engines/manifest.macos.json"),
+                "081678076dd31e7d211edf87f9d1619be4953fb6e1ad8a54afcd86f9cd543c82",
+            ),
+        ];
+        for (manifest, digest) in cases {
+            let capability = parse_native_colmap_capability(manifest).unwrap();
+            assert!(capability
+                .runtime_binary_sha256
+                .eq_ignore_ascii_case(digest));
+            assert_eq!(capability.native_colmap_model_ids, [0, 1, 2, 3, 4, 6]);
+        }
+    }
+
+    #[test]
+    fn native_binary_verification_uses_the_runtime_digest() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("brush_app");
+        std::fs::write(&binary, b"signed runtime bytes").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"signed runtime bytes"));
+        assert!(verified_native_binary(&binary, &expected));
+        assert!(!verified_native_binary(&binary, &"0".repeat(64)));
     }
 
     fn args_as_strings(args: Vec<OsString>) -> Vec<String> {
@@ -642,6 +845,50 @@ mod tests {
     }
 
     #[test]
+    fn explicit_selection_uses_exact_cubecl_device_without_reordering_adapters() {
+        let acceleration = acceleration(ColmapBackend::Cpu, 2, None);
+        let hardware = crate::engines::gpu_selection::ResolvedHardwarePlan {
+            selection: crate::engines::gpu_selection::GpuSelection {
+                local_device_id: "opaque".into(),
+                device_kind: crate::engines::gpu_selection::BrushDeviceKind::IntegratedGpu,
+                selection_confidence: crate::engines::gpu_selection::SelectionConfidence::Ordered,
+            },
+            device_name: "AMD Radeon".into(),
+            device_vendor: "AMD".into(),
+            brush_device: "IntegratedGpu(1)".into(),
+            brush_total_memory_mb: None,
+            colmap_backend: ColmapBackend::Cpu,
+            colmap_gpu_index: None,
+            ba_backend: crate::engines::gpu_selection::BaBackendPlan::Ceres,
+            device_summary: "AMD Radeon · AMD · IntegratedGpu(1)".into(),
+            selection_confidence: crate::engines::gpu_selection::SelectionConfidence::Ordered,
+        };
+        let policy = BrushGpuLaunchPolicy::from_hardware_plan(&acceleration, Some(&hardware));
+        let environment = policy.environment_with_rust_log(None);
+        assert_eq!(
+            environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
+            Some("IntegratedGpu(1)")
+        );
+        assert_eq!(
+            environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+            None
+        );
+        assert_eq!(policy.expected_device_name(), Some("AMD Radeon"));
+        assert_eq!(
+            observed_wgpu_device(
+                "Created wgpu compute server on device AdapterInfo { name: \"AMD Radeon\", vendor: 4098 }"
+            ),
+            Some("AMD Radeon".into())
+        );
+        assert_eq!(
+            observed_wgpu_device("Enumerated AdapterInfo { name: \"AMD Radeon\" }"),
+            None
+        );
+        assert!(same_device_name("AMD Radeon (TM)", "amd-radeon-tm"));
+        assert!(!same_device_name("AMD Radeon", "NVIDIA RTX"));
+    }
+
+    #[test]
     fn new_cli_preserves_iterations_exports_and_unicode_paths() {
         let dataset = Path::new("中文 数据集");
         let output = Path::new("中文 导出目录");
@@ -695,14 +942,41 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
-            termination: crate::process::ProcessTermination::default(),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0),
+                ..Default::default()
+            },
             stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
             stderr: "Export at iteration 4 failed".into(),
         };
-        assert!(resolve_train_output(&output, candidate.clone(), alternate.clone()).is_err());
-        std::fs::write(&candidate, "candidate is validated as PLY by the pipeline").unwrap();
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
+        for contents in [None, Some(""), Some("nonempty but incomplete PLY")] {
+            if let Some(contents) = contents {
+                std::fs::write(&candidate, contents).unwrap();
+            }
+            assert!(matches!(
+                resolve_train_output(&output, candidate.clone(), alternate.clone(), &evidence),
+                Err(SplatError::EngineProcess(ref failure))
+                    if failure.termination.exit_code == Some(0)
+                    && matches!(failure.brush_failure_reason,
+                        Some(crate::failure::BrushFailureReason::FinalExport { iteration: 4, .. }))
+            ));
+        }
+        let successful = ProcessOutput {
+            stderr: "unrelated optional feature failed; continuing".into(),
+            ..output.clone()
+        };
         assert_eq!(
-            resolve_train_output(&output, candidate.clone(), alternate.clone()).unwrap(),
+            resolve_train_output(
+                &successful,
+                candidate.clone(),
+                alternate.clone(),
+                &crate::failure::EngineFailureEvidence::brush_training(4)
+            )
+            .unwrap(),
             candidate
         );
         let failed = ProcessOutput {
@@ -711,8 +985,10 @@ mod tests {
             stderr: "VK_ERROR_DEVICE_LOST".into(),
             ..output
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        evidence.observe(&failed.stderr);
         assert!(matches!(
-            resolve_train_output(&failed, candidate, alternate),
+            resolve_train_output(&failed, candidate, alternate, &evidence),
             Err(SplatError::EngineProcess(ref failure)) if failure.classification.kind == Some("brush_device_lost")
         ));
     }
@@ -842,11 +1118,16 @@ mod tests {
             stdout: "Refine iter 41001, 3476124 splats.".into(),
             stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(45_000);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
         assert!(matches!(
             resolve_train_output(
                 &output,
                 PathBuf::from("absent.ply"),
-                PathBuf::from("absent.tmp.ply")
+                PathBuf::from("absent.tmp.ply"),
+                &evidence
             ),
             Err(ref error) if error.is_brush_oom()
         ));
